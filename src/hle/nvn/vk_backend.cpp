@@ -1824,7 +1824,8 @@ private:
         VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         bool use_indices = false, fast = false;
         VkIndexType index_type = VK_INDEX_TYPE_UINT32;
-        uint32_t index_count = 0;
+        uint32_t index_count = 0, first_vertex = 0;
+        int32_t vertex_offset = 0;
         VkDeviceSize vb_offsets[16] = {};
         VkDeviceSize index_off = 0;
         {
@@ -1834,23 +1835,47 @@ private:
                 -1, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN,
                 VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY,
                 VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY};
-            constexpr uint64_t kFastBufferMax = 6ull << 20;
             fast = p.mode >= 0 && p.mode < 14 && kTopology[p.mode] >= 0 && (p.index_type < 0 || p.index_type == 1 || p.index_type == 2);
+            const uint32_t isz = p.index_type == 1 ? 2 : 4;
+            if (fast && p.index_type >= 0 && !GuestRangeValid(p.index_address, size_t(p.count) * isz)) fast = false;
+            // Vertex range the draw reads: from the (cached) index scan, or first..first+count.
+            int64_t vmin = p.first, vmax = int64_t(p.first) + p.count - 1;
+            if (fast && p.index_type >= 0) {
+                uint32_t lo, hi;
+                IndexRange(p.index_address, uint32_t(p.count), isz, &lo, &hi);
+                vmin = int64_t(lo) + p.base_vertex;
+                vmax = int64_t(hi) + p.base_vertex;
+                if (vmin < 0 || vmax - vmin > (8 << 20)) fast = false;
+            }
             for (const VkVertexInputBindingDescription& b : vin.bindings) {
                 if (!fast) break;
                 const BufferRange& r = st_.vertex_buffers[b.binding];
-                if (!r.address || !r.size || r.size > kFastBufferMax || !GuestRangeValid(r.address, size_t(r.size))) fast = false;
+                const VertexStreamObj so = b.binding < st_.streams.size() ? st_.streams[b.binding] : VertexStreamObj{};
+                const int64_t first = so.divisor ? p.base_instance : vmin;
+                const int64_t n = so.divisor ? (int64_t(p.instances) + so.divisor - 1) / so.divisor : vmax - vmin + 1;
+                const uint64_t start = uint64_t(first) * b.stride;
+                const uint64_t bytes = uint64_t(std::max<int64_t>(0, n - 1)) * b.stride + vin.extent[b.binding];
+                if (!r.address || start + bytes > r.size || !GuestRangeValid(r.address + start, size_t(bytes))) {
+                    fast = false;
+                    break;
+                }
             }
-            const uint32_t isz = p.index_type == 1 ? 2 : 4;
-            if (fast && p.index_type >= 0 && !GuestRangeValid(p.index_address, size_t(p.count) * isz)) fast = false;
             if (fast) {
                 topology = VkPrimitiveTopology(kTopology[p.mode]);
                 for (const VkVertexInputBindingDescription& b : vin.bindings) {
                     const BufferRange& r = st_.vertex_buffers[b.binding];
-                    VkDeviceSize off = UploadCached(reinterpret_cast<const uint8_t*>(r.address), size_t(r.size), 16);
+                    const VertexStreamObj so = b.binding < st_.streams.size() ? st_.streams[b.binding] : VertexStreamObj{};
+                    const int64_t first = so.divisor ? p.base_instance : vmin;
+                    const int64_t n = so.divisor ? (int64_t(p.instances) + so.divisor - 1) / so.divisor : vmax - vmin + 1;
+                    const uint64_t start = uint64_t(first) * b.stride;
+                    const uint64_t bytes = uint64_t(std::max<int64_t>(0, n - 1)) * b.stride + vin.extent[b.binding];
+                    VkDeviceSize off = UploadCached(reinterpret_cast<const uint8_t*>(r.address + start), size_t(bytes), 16);
                     if (off == VK_WHOLE_SIZE) return Skip("vertex data too large");
+                    // Instanced streams start at base_instance: the draw then uses firstInstance 0.
                     vb_offsets[b.binding] = off;
                 }
+                vertex_offset = int32_t(int64_t(p.base_vertex) - vmin);  // indexed: index + base - vmin
+                first_vertex = uint32_t(int64_t(p.first) - vmin);        // non-indexed: 0
                 if (p.index_type >= 0) {
                     use_indices = true;
                     index_type = p.index_type == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
@@ -2004,9 +2029,9 @@ private:
         if (fast) {
             if (use_indices) {
                 vkCmdBindIndexBuffer(cmd_, stream_, index_off, index_type);
-                vkCmdDrawIndexed(cmd_, index_count, uint32_t(p.instances), 0, p.base_vertex, uint32_t(p.base_instance));
+                vkCmdDrawIndexed(cmd_, index_count, uint32_t(p.instances), 0, vertex_offset, uint32_t(p.base_instance));
             } else {
-                vkCmdDraw(cmd_, uint32_t(p.count), uint32_t(p.instances), uint32_t(p.first), uint32_t(p.base_instance));
+                vkCmdDraw(cmd_, uint32_t(p.count), uint32_t(p.instances), first_vertex, uint32_t(p.base_instance));
             }
         } else if (use_indices) {
             vkCmdBindIndexBuffer(cmd_, stream_, index_off, VK_INDEX_TYPE_UINT32);
@@ -2221,6 +2246,35 @@ private:
         *size = code.constants.size();
     }
 
+    // Smallest and largest index of an index buffer. Scanned once and remembered across frames: index
+    // buffers are almost always static. The key includes a sparse checksum so a rewritten buffer is rescanned.
+    void IndexRange(uint64_t addr, uint32_t count, uint32_t isz, uint32_t* lo, uint32_t* hi) {
+        const uint8_t* ib = reinterpret_cast<const uint8_t*>(addr);
+        auto at = [&](uint32_t i) -> uint32_t {
+            return isz == 2 ? reinterpret_cast<const uint16_t*>(ib)[i] : reinterpret_cast<const uint32_t*>(ib)[i];
+        };
+        uint64_t key = (addr * 0x9E3779B97F4A7C15ull) ^ (uint64_t(count) << 32) ^ isz;
+        const uint32_t step = std::max<uint32_t>(1, count / 16);
+        for (uint32_t i = 0; i < count; i += step) key = (key ^ at(i)) * 0x100000001B3ull;
+        key = (key ^ at(count - 1)) * 0x100000001B3ull;
+        auto it = index_ranges_.find(key);
+        if (it != index_ranges_.end()) {
+            *lo = it->second.first;
+            *hi = it->second.second;
+            return;
+        }
+        uint32_t mn = UINT32_MAX, mx = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            const uint32_t v = at(i);
+            mn = std::min(mn, v);
+            mx = std::max(mx, v);
+        }
+        if (index_ranges_.size() > 200000) index_ranges_.clear();
+        index_ranges_[key] = {mn, mx};
+        *lo = mn;
+        *hi = mx;
+    }
+
     // Copies guest data into the stream once per list: the same range bound by several draws (UBOs reused
     // across passes, a mesh drawn into depth, shadow and color) is uploaded once. Guest memory only changes
     // during a list through UpdateUniform, which clears the cache.
@@ -2333,6 +2387,7 @@ private:
     int viewports_logged_ = 0;
     int image_binds_logged_ = 0;
     uint64_t fast_draws_ = 0;
+    std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> index_ranges_;
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     int new_pipelines_ = 0;
     double compile_ms_ = 0;

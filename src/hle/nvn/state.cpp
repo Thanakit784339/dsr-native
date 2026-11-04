@@ -270,7 +270,10 @@ TexRef TextureById(int id) {
 TexRef ImageById(int id) {
     std::lock_guard<std::mutex> lk(g_pool_mutex);
     auto it = g_image_ids.find(id);
-    return it == g_image_ids.end() ? TexRef{} : it->second;
+    if (it != g_image_ids.end()) return it->second;
+    // This game never registers images: its image handles are ids of textures registered as textures.
+    auto t = g_texture_ids.find(id);
+    return t == g_texture_ids.end() ? TexRef{} : t->second;
 }
 SamplerObj SamplerById(int id) {
     std::lock_guard<std::mutex> lk(g_pool_mutex);
