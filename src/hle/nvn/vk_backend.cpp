@@ -850,7 +850,12 @@ private:
     Image* CreateImage(const TexRef& t) {
         VkFormatFeatureFlags feats = 0;
         VkFormat vf = PickFormat(t.tex.format, &feats);
-        if (vf == VK_FORMAT_UNDEFINED) return nullptr;
+        if (vf == VK_FORMAT_UNDEFINED) {
+            if (unknown_formats_.insert(t.tex.format).second)
+                LOGW(kTag, "first texture with unsupported NVN format %d: %dx%dx%d, target %d, %d levels", t.tex.format,
+                     t.tex.width, t.tex.height, t.tex.depth, t.tex.target, t.tex.levels);
+            return nullptr;
+        }
         auto old = images_.find(t.addr);
         if (old != images_.end()) {
             if (recording_) Flush();  // the old image may be referenced by recorded work
@@ -1380,6 +1385,24 @@ private:
     // ======================================================================================================
     // draws
     // ======================================================================================================
+    // This game does not bind textures through NVN: it writes texture handles (from
+    // nvnDeviceGetTextureHandle) into its own uniform buffer at binding 10, which shaders read as
+    // c[13][0x20 + 8 * slot]. Read the handle from there and resolve it like a bind would.
+    BoundTexture HandleFromUniforms(int stage, uint32_t slot) {
+        BoundTexture bt;
+        const BufferRange& r = st_.uniforms[stage][13 - kCbufBase];
+        const uint64_t off = 0x20 + 8ull * slot;
+        if (!r.address || off + 4 > r.size || !GuestRangeValid(r.address + off, 4)) return bt;
+        uint32_t handle;
+        memcpy(&handle, reinterpret_cast<const void*>(r.address + off), 4);
+        bt.texture = TextureById(int(handle & 0xFFFFF));
+        bt.sampler = SamplerById(int(handle >> 20));
+        bt.valid = bt.texture.valid;
+        if (!bt.valid && handles_logged_++ < 8)
+            LOGW(kTag, "texture handle 0x%08x (stage %d slot %u) does not name a registered texture", handle, stage, slot);
+        return bt;
+    }
+
     void Skip(const char* reason) {
         auto& n = skipped_[reason];
         if (n++ == 0) LOGW(kTag, "draw skipped: %s", reason);
@@ -1453,8 +1476,9 @@ private:
             for (uint32_t slot = 0; slot < 32; slot++) {
                 const bool plain = info.texture_mask >> slot & 1, shadow = info.shadow_mask >> slot & 1;
                 if (!plain && !shadow) continue;
-                const BoundTexture& bt = st_.textures[stage][slot];
-                if (!bt.valid) return Skip("texture slot not bound");
+                BoundTexture bt = st_.textures[stage][slot];
+                if (!bt.valid) bt = HandleFromUniforms(stage, slot);
+                if (!bt.valid) return Skip("texture handle not found");
                 Image* img = GetImage(bt.texture, true);
                 if (!img) return Skip("texture format not supported");
                 for (Image* c : colors)
@@ -1958,9 +1982,10 @@ private:
     uint64_t presented_ = 0, drawn_ = 0;
     int swapchains_created_ = 0, images_created_ = 0, clear_colors_logged_ = 0, copies_logged_ = 0,
         target_sets_logged_ = 0, shaders_translated_ = 0, shader_failures_logged_ = 0, uploads_ = 0, flushes_ = 0,
-        b2t_logged_ = 0, constants_logged_ = 0;
+        b2t_logged_ = 0, constants_logged_ = 0, handles_logged_ = 0;
     bool logged_first_image_ = false;
     std::map<std::string, uint64_t> skipped_;
+    std::set<int> unknown_formats_;
     std::set<uint64_t> logged_clears_, logged_targets_;
     std::set<std::string> logged_once_, missing_ubo_logged_, ubo_binds_logged_;
     std::chrono::steady_clock::time_point last_report_ = std::chrono::steady_clock::now();
