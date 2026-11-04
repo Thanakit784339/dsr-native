@@ -100,6 +100,7 @@ bool LoadGame(const RuntimeConfig& cfg, std::string* err) {
         *err = "main does not export malloc/free/aligned_alloc";
         return false;
     }
+    InstallGameHooks();
     return true;
 }
 

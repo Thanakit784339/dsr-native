@@ -40,6 +40,9 @@ bool LoadGame(const RuntimeConfig& cfg, std::string* err);
 // thread sized like the Switch main thread. Blocks until nnMain returns.
 int RunGame();
 
+// Patches engine functions of this game build (log/panic output). Called by LoadGame.
+void InstallGameHooks();
+
 // Prints an import binding summary (implemented / unimplemented / data) to the log.
 void LogImportReport(bool list_unimplemented);
 

@@ -51,6 +51,11 @@ public:
     // Exported symbol lookup (image-relative value → absolute).
     uintptr_t Export(const std::string& name) const;
 
+    // Overwrites the start of the guest function at `image_offset` with a jump to `host_fn` (through an
+    // x18-restoring thunk), so the host function replaces it entirely. Must be called before guest code
+    // runs. The host function must have the guest function's exact AAPCS64 signature.
+    bool HookFunction(uint64_t image_offset, void* host_fn, std::string* err);
+
 private:
     bool MapAndCopy(std::string* err);
     bool Relocate(const ImportResolver& resolver, std::string* err);

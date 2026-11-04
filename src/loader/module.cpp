@@ -9,6 +9,7 @@
 
 #include "arch/arch.h"
 #include "common/log.h"
+#include "loader/dynamic_thunks.h"
 #include "loader/thunks.h"
 
 namespace dsr::loader {
@@ -34,6 +35,35 @@ Module::~Module() {
 uintptr_t Module::Export(const std::string& name) const {
     uint64_t v = nso_->FindExport(name);
     return v ? base_ + v : 0;
+}
+
+bool Module::HookFunction(uint64_t off, void* host_fn, std::string* err) {
+    if (off % 4 || off + 16 > nso_->text.size) {
+        *err = "hook offset outside .text";
+        return false;
+    }
+    void* thunk = MakeDynamicThunk(host_fn, 0);
+    // ldr x16, #8 ; br x16 ; .quad thunk   (x16/x17 are free at a function entry)
+    uint8_t patch[16];
+    const uint32_t ldr = 0x58000050, br = 0xD61F0200;
+    const uint64_t target = reinterpret_cast<uint64_t>(thunk);
+    memcpy(patch, &ldr, 4);
+    memcpy(patch + 4, &br, 4);
+    memcpy(patch + 8, &target, 8);
+    uintptr_t addr = base_ + off;
+    uintptr_t page_lo = addr & ~(host_page_ - 1);
+    uintptr_t page_hi = (addr + sizeof(patch) + host_page_ - 1) & ~(host_page_ - 1);
+    if (mprotect(reinterpret_cast<void*>(page_lo), page_hi - page_lo, PROT_READ | PROT_WRITE) != 0) {
+        *err = "mprotect(RW) for hook failed";
+        return false;
+    }
+    memcpy(reinterpret_cast<void*>(addr), patch, sizeof(patch));
+    if (mprotect(reinterpret_cast<void*>(page_lo), page_hi - page_lo, PROT_READ | PROT_EXEC) != 0) {
+        *err = "mprotect(RX) after hook failed";
+        return false;
+    }
+    arch::FlushICache(reinterpret_cast<void*>(addr), sizeof(patch));
+    return true;
 }
 
 bool Module::Load(const NsoImage& nso, const ImportResolver& resolver, std::string* err) {

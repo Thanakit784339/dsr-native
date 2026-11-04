@@ -25,11 +25,18 @@
 #include "runtime/runtime.h"
 
 extern "C" {
-// compiler-rt / libgcc soft-float quad helpers (long double is IEEE binary128 on AArch64).
-void __addtf3() __attribute__((weak));
-void __floatditf() __attribute__((weak));
-void __lttf2() __attribute__((weak));
-void __multf3() __attribute__((weak));
+// compiler-rt / libgcc soft-float quad helpers (long double is IEEE binary128 on AArch64). On arm64 they
+// always exist and must be strong references: a weak reference does not pull them out of the static
+// builtins archive, so they would silently resolve to null. Elsewhere (x86 dry runs) keep them weak.
+#if defined(__aarch64__)
+#define DSR_QUAD_ATTR
+#else
+#define DSR_QUAD_ATTR __attribute__((weak))
+#endif
+void __addtf3() DSR_QUAD_ATTR;
+void __floatditf() DSR_QUAD_ATTR;
+void __lttf2() DSR_QUAD_ATTR;
+void __multf3() DSR_QUAD_ATTR;
 int __cxa_guard_acquire(uint64_t*);
 void __cxa_guard_release(uint64_t*);
 #if defined(__BIONIC__)
