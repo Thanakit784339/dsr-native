@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "arch/arch.h"
+#include "hle/nvn.h"
 #include "hle/registry.h"
 #include "loader/dynamic_thunks.h"
 #include "loader/nso.h"
@@ -176,6 +177,58 @@ static void TestOsSync() {
     CHECK(got == 500);
 }
 
+// ---- null NVN driver ---------------------------------------------------------------------------
+template <typename F>
+F Nvn(const char* name) {
+    void* p = dsr::hle::nvn::FindNvnImpl(name);
+    if (!p) {
+        fprintf(stderr, "  missing NVN proc %s\n", name);
+        exit(1);
+    }
+    return reinterpret_cast<F>(p);
+}
+
+static void TestNullNvn() {
+    // Version check the game performs before anything else.
+    auto get_int = Nvn<void (*)(const void*, int, int*)>("nvnDeviceGetInteger");
+    int major = 0, minor = 0, ubo = 0, unknown = 1234;
+    get_int(nullptr, 0, &major);
+    get_int(nullptr, 1, &minor);
+    get_int(nullptr, 4, &ubo);
+    get_int(nullptr, 9999, &unknown);
+    CHECK(major == 53 && minor > 104 && ubo == 256);
+    CHECK(unknown == 1234);  // unknown queries keep the caller's default
+
+    // Memory pool -> buffer: mapped pointer and GPU address must follow pool storage + offset.
+    alignas(16) static uint8_t storage[0x4000];
+    uint8_t pool_builder[64], pool[256], buf_builder[64], buf[64];
+    Nvn<void (*)(void*)>("nvnMemoryPoolBuilderSetDefaults")(pool_builder);
+    Nvn<void (*)(void*, void*, size_t)>("nvnMemoryPoolBuilderSetStorage")(pool_builder, storage, sizeof(storage));
+    CHECK(Nvn<bool (*)(void*, const void*)>("nvnMemoryPoolInitialize")(pool, pool_builder));
+    CHECK(Nvn<void* (*)(const void*)>("nvnMemoryPoolMap")(pool) == storage);
+    Nvn<void (*)(void*)>("nvnBufferBuilderSetDefaults")(buf_builder);
+    Nvn<void (*)(void*, const void*, int64_t, size_t)>("nvnBufferBuilderSetStorage")(buf_builder, pool, 0x100, 0x200);
+    CHECK(Nvn<bool (*)(void*, const void*)>("nvnBufferInitialize")(buf, buf_builder));
+    CHECK(Nvn<void* (*)(const void*)>("nvnBufferMap")(buf) == storage + 0x100);
+    CHECK(Nvn<uint64_t (*)(const void*)>("nvnBufferGetAddress")(buf) == reinterpret_cast<uint64_t>(storage) + 0x100);
+
+    // Texture builder -> texture: dimensions read back, storage estimate covers the data.
+    uint8_t tb[128], tex[192];
+    Nvn<void (*)(void*)>("nvnTextureBuilderSetDefaults")(tb);
+    Nvn<void (*)(void*, int, int)>("nvnTextureBuilderSetSize2D")(tb, 1280, 720);
+    Nvn<void (*)(void*, int)>("nvnTextureBuilderSetFormat")(tb, 37);  // RGBA8
+    Nvn<void (*)(void*, int)>("nvnTextureBuilderSetLevels")(tb, 1);
+    size_t sz = Nvn<size_t (*)(const void*)>("nvnTextureBuilderGetStorageSize")(tb);
+    CHECK(sz >= size_t(1280) * 720 * 4);
+    CHECK(Nvn<bool (*)(void*, const void*)>("nvnTextureInitialize")(tex, tb));
+    CHECK(Nvn<int (*)(const void*)>("nvnTextureGetWidth")(tex) == 1280);
+    CHECK(Nvn<int (*)(const void*)>("nvnTextureGetHeight")(tex) == 720);
+
+    // Prefix fallback covers command-buffer setters; creation calls report success.
+    CHECK(dsr::hle::nvn::FindNvnImpl("nvnCommandBufferSetViewport") != nullptr);
+    CHECK(Nvn<bool (*)(void*, const void*)>("nvnSamplerPoolInitialize")(pool, nullptr));
+}
+
 // ---- arm64 ABI glue ----------------------------------------------------------------------------
 #if defined(__aarch64__)
 extern "C" {
@@ -252,6 +305,7 @@ int main() {
         {"sha256", TestSha256},
         {"standard_allocator", TestStandardAllocator},
         {"os_sync", TestOsSync},
+        {"null_nvn", TestNullNvn},
 #if defined(__aarch64__)
         {"abi_arm64", TestAbi},
 #endif

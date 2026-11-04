@@ -30,4 +30,12 @@ extern "C" uint64_t dsr_hle_unimplemented(uint64_t import_index) {
     return Report(imp ? imp->name : "import#" + std::to_string(import_index));
 }
 
-extern "C" uint64_t dsr_hle_unimplemented_named(const char* name) { return Report(name ? name : "(unnamed)"); }
+// Named stubs are NVN entry points. Object creation calls (`...Initialize`, `...SetShaders`) return an
+// NVNboolean; report success so the game keeps going, everything else returns 0.
+extern "C" uint64_t dsr_hle_unimplemented_named(const char* name) {
+    std::string n = name ? name : "(unnamed)";
+    Report(n);
+    const bool creates = n.find("Initialize") != std::string::npos ||
+                         (n.size() >= 10 && n.compare(n.size() - 10, 10, "SetShaders") == 0);
+    return creates ? 1 : 0;
+}

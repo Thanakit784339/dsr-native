@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "arch/arch.h"
 #include "common/log.h"
@@ -23,6 +24,10 @@ std::unordered_map<std::string, void*>& Impls() {
     static auto* m = new std::unordered_map<std::string, void*>;
     return *m;
 }
+std::vector<std::pair<std::string, void*>>& Prefixes() {
+    static auto* v = new std::vector<std::pair<std::string, void*>>;
+    return *v;
+}
 std::unordered_map<std::string, void*>& Handed() {  // name -> thunk given to the guest
     static auto* m = new std::unordered_map<std::string, void*>;
     return *m;
@@ -34,6 +39,25 @@ void RegisterNvnProc(const char* name, void* host_fn) {
     Impls()[name] = host_fn;
 }
 
+void RegisterNvnPrefix(const char* prefix, void* host_fn) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    Prefixes().emplace_back(prefix, host_fn);
+}
+
+void* FindNvnImpl(const char* name) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    auto impl = Impls().find(name);
+    if (impl != Impls().end()) return impl->second;
+    void* fn = nullptr;
+    size_t best = 0;
+    for (const auto& [prefix, f] : Prefixes())
+        if (prefix.size() > best && strncmp(name, prefix.c_str(), prefix.size()) == 0) {
+            best = prefix.size();
+            fn = f;
+        }
+    return fn;
+}
+
 void* GetProc(const char* name) {
     if (!name) return nullptr;
     std::lock_guard<std::mutex> lk(g_mutex);
@@ -42,8 +66,19 @@ void* GetProc(const char* name) {
     if (it != handed.end()) return it->second;
     void* thunk;
     auto impl = Impls().find(name);
+    void* prefix_fn = nullptr;
+    size_t best = 0;
+    if (impl == Impls().end()) {
+        for (const auto& [prefix, fn] : Prefixes())
+            if (prefix.size() > best && strncmp(name, prefix.c_str(), prefix.size()) == 0) {
+                best = prefix.size();
+                prefix_fn = fn;
+            }
+    }
     if (impl != Impls().end()) {
         thunk = loader::MakeDynamicThunk(impl->second, 0);
+    } else if (prefix_fn) {
+        thunk = loader::MakeDynamicThunk(prefix_fn, 0);
     } else {
         // The name string must outlive the thunk; keep a private copy.
         const char* copy = strdup(name);
