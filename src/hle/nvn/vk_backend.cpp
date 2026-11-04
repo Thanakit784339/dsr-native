@@ -702,6 +702,7 @@ public:
         capture_items_.push_back(it);
     }
     void FinishCapture() {
+        WaitGpuIdle();  // the readback buffers are written by the submission that just went out
         capture_active_ = false;
         captures_done_++;
         if (query_pool_ && !query_pass_.empty()) {
@@ -934,17 +935,25 @@ private:
         pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         pci.queueFamilyIndex = family_;
         vkCreateCommandPool(device_, &pci, nullptr, &pool_);
-        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cai.commandPool = pool_;
-        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cai.commandBufferCount = 1;
-        vkAllocateCommandBuffers(device_, &cai, &cmd_);
-        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        vkCreateFence(device_, &fci, nullptr, &fence_);
+        // Two sets of per-submission resources: the GPU executes one while the next is recorded.
+        for (Slot& sl : slots_) {
+            VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            cai.commandPool = pool_;
+            cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cai.commandBufferCount = 1;
+            vkAllocateCommandBuffers(device_, &cai, &sl.cmd);
+            VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            vkCreateFence(device_, &fci, nullptr, &sl.fence);
+            if (!CreateStream() || !CreateDescriptorPool()) return false;
+            sl.stream = stream_;
+            sl.mem = stream_memory_;
+            sl.ptr = stream_ptr_;
+            sl.pool = desc_pool_;
+        }
+        UseSlot(0);
         VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         vkCreateSemaphore(device_, &sci, nullptr, &acquire_sem_);
         vkCreateSemaphore(device_, &sci, nullptr, &render_sem_);
-        if (!CreateStream() || !CreateDescriptorPool()) return false;
         LoadPipelineCache();
         init_failed_ = false;
         LOGI(kTag, "device ready (queue family %u)", family_);
@@ -1046,7 +1055,7 @@ private:
                                         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}};
         VkDescriptorPoolCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         ci.maxSets = 4096;
-        ci.poolSizeCount = 2;
+        ci.poolSizeCount = 3;
         ci.pPoolSizes = sizes;
         return vkCreateDescriptorPool(device_, &ci, nullptr, &desc_pool_) == VK_SUCCESS;
     }
@@ -1526,6 +1535,8 @@ private:
         vkBeginCommandBuffer(cmd_, &bi);
     }
 
+    // Submits the current slot's commands and moves to the other slot. The CPU waits only if that slot's
+    // previous submission is still running (so CPU recording and GPU execution overlap by one submission).
     void SubmitAndWait(VkSemaphore wait, VkSemaphore signal) {
         vkEndCommandBuffer(cmd_);
         VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -1546,12 +1557,43 @@ private:
             LogOnce("submit", "vkQueueSubmit failed: %d", r);
             return;
         }
-        {
+        slots_[slot_].pending = true;
+        NextSlot();
+    }
+    void UseSlot(int i) {
+        slot_ = i;
+        cmd_ = slots_[i].cmd;
+        fence_ = slots_[i].fence;
+        desc_pool_ = slots_[i].pool;
+        stream_ = slots_[i].stream;
+        stream_memory_ = slots_[i].mem;
+        stream_ptr_ = slots_[i].ptr;
+    }
+    void NextSlot() {
+        const int n = (slot_ + 1) % kSlots;
+        Slot& sl = slots_[n];
+        if (sl.pending) {
             MsTimer wait_timer(wait_ms_);
-            r = vkWaitForFences(device_, 1, &fence_, VK_TRUE, 5000000000ull);
+            VkResult r = vkWaitForFences(device_, 1, &sl.fence, VK_TRUE, 5000000000ull);
+            if (r != VK_SUCCESS) LogOnce("fence", "GPU did not finish within 5 s (%d)", r);
+            vkResetFences(device_, 1, &sl.fence);
+            sl.pending = false;
         }
-        if (r != VK_SUCCESS) LogOnce("fence", "GPU did not finish within 5 s (%d)", r);
-        vkResetFences(device_, 1, &fence_);
+        UseSlot(n);
+        ResetTransient();
+        bound_pipeline_ = VK_NULL_HANDLE;
+        bound_layout_ = VK_NULL_HANDLE;
+        bound_sets_[0] = bound_sets_[1] = VK_NULL_HANDLE;
+    }
+    // Waits for all submitted work (CPU readback of GPU results).
+    void WaitGpuIdle() {
+        MsTimer wait_timer(wait_ms_);
+        vkQueueWaitIdle(queue_);
+        for (Slot& sl : slots_)
+            if (sl.pending) {
+                vkResetFences(device_, 1, &sl.fence);
+                sl.pending = false;
+            }
     }
 
     void RawBarrier(VkImage image, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to,
@@ -2949,6 +2991,18 @@ private:
     std::unordered_map<std::vector<uint32_t>, VkPipelineLayout, VecHash> pipeline_layouts_;
     std::unordered_map<std::vector<uint32_t>, VkPipeline, VecHash> pipelines_;
     std::map<std::vector<uint32_t>, VkSampler> samplers_;
+    struct Slot {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        bool pending = false;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkBuffer stream = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        uint8_t* ptr = nullptr;
+    };
+    static constexpr int kSlots = 2;
+    Slot slots_[kSlots];
+    int slot_ = 0;
     // Hashed fronts of the caches above (no allocation per lookup).
     std::unordered_map<uint64_t, VkSampler> samplers_fast_;
     std::unordered_map<uint64_t, Shader*> shaders_fast_;

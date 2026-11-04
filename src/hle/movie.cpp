@@ -110,6 +110,7 @@ struct BufferState {
     int offset = 0;
     int size = 0;
     bool owned = false;
+    bool from_game = false;  // memory supplied by the game (SetDataAndCapacity): decoders write into it
 };
 std::mutex g_buf_mutex;
 std::unordered_map<const void*, BufferState> g_buffers;
@@ -315,6 +316,9 @@ struct Decoder {
     std::unordered_map<int, OutputItem> held;  // output buffers handed to the game
     uint64_t produced = 0, acquired = 0, released = 0, polls_empty = 0;  // statistics (logged)
     int64_t last_pts = 0;
+    // Decoded picture geometry (from the codec's output format).
+    int width = 0, height = 0, stride = 0, slice_height = 0, crop_left = 0, crop_top = 0;
+    bool logged_convert = false;
     std::chrono::steady_clock::time_point last_report = std::chrono::steady_clock::now();
 #if defined(__ANDROID__)
     AMediaCodec* codec = nullptr;
@@ -351,6 +355,23 @@ void OnOutput(AMediaCodec*, void* ud, int32_t index, AMediaCodecBufferInfo* info
 void OnFormat(AMediaCodec*, void* ud, AMediaFormat* fmt) {
     auto* d = static_cast<Decoder*>(ud);
     LOGI(kTag, "decoder output format: %s", AMediaFormat_toString(fmt));
+    {
+        std::lock_guard<std::mutex> lk(d->m);
+        int32_t v;
+        if (AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, &v)) d->width = v;
+        if (AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, &v)) d->height = v;
+        d->stride = AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_STRIDE, &v) ? v : d->width;
+        d->slice_height = AMediaFormat_getInt32(fmt, "slice-height", &v) ? v : d->height;
+        int32_t l, t, r, b;
+        if (AMediaFormat_getRect(fmt, "crop", &l, &t, &r, &b)) {
+            d->crop_left = l;
+            d->crop_top = t;
+            d->width = r - l + 1;
+            d->height = b - t + 1;
+        }
+        if (d->stride < d->width) d->stride = d->width;
+        if (d->slice_height < d->height) d->slice_height = d->height;
+    }
     dsr::hle::os::SignalGuestEvent(d->events.format_changed);
 }
 void OnError(AMediaCodec*, void* ud, media_status_t err, int32_t code, const char* detail) {
@@ -524,6 +545,56 @@ int DecGetOutputBuffer(void* self, int index, void* buffer) {
         auto it = d->held.find(index);
         if (it != d->held.end()) o = it->second;
     }
+    // Video into memory the game supplied (output format 3: RGBA, e.g. a texture's storage): convert the
+    // decoded NV12 picture (BT.709, limited range) into it. Otherwise hand out the decoder's own buffer.
+    BufferState& gb = Buf(buffer);
+    if (d->type == 1 && gb.from_game && gb.data && d->width > 0 && d->height > 0) {
+        int w, h, stride, slice, cl, ct;
+        {
+            std::lock_guard<std::mutex> lk(d->m);
+            w = d->width;
+            h = d->height;
+            stride = d->stride;
+            slice = d->slice_height;
+            cl = d->crop_left;
+            ct = d->crop_top;
+        }
+        const size_t pitch = size_t(w) * 4;
+        const size_t need_src = size_t(o.offset) + size_t(stride) * size_t(slice) * 3 / 2;
+        if (gb.capacity >= pitch * size_t(h) && size_t(cap) >= need_src) {
+            const uint8_t* y_plane = p + o.offset;
+            const uint8_t* uv_plane = y_plane + size_t(stride) * size_t(slice);
+            for (int yy = 0; yy < h; yy++) {
+                const uint8_t* yr = y_plane + size_t(yy + ct) * size_t(stride) + cl;
+                const uint8_t* uvr = uv_plane + size_t((yy + ct) / 2) * size_t(stride) + (cl & ~1);
+                uint8_t* out = gb.data + size_t(yy) * pitch;
+                for (int xx = 0; xx < w; xx++) {
+                    const int c = 298 * (int(yr[xx]) - 16);
+                    const int u = int(uvr[xx & ~1]) - 128, v = int(uvr[(xx & ~1) + 1]) - 128;
+                    int r = (c + 459 * v + 128) >> 8;              // 1.793
+                    int g = (c - 55 * u - 136 * v + 128) >> 8;     // 0.213, 0.533
+                    int b = (c + 541 * u + 128) >> 8;              // 2.112
+                    out[xx * 4 + 0] = uint8_t(r < 0 ? 0 : r > 255 ? 255 : r);
+                    out[xx * 4 + 1] = uint8_t(g < 0 ? 0 : g > 255 ? 255 : g);
+                    out[xx * 4 + 2] = uint8_t(b < 0 ? 0 : b > 255 ? 255 : b);
+                    out[xx * 4 + 3] = 255;
+                }
+            }
+            gb.offset = 0;
+            gb.size = int(pitch * size_t(h));
+            if (!d->logged_convert) {
+                d->logged_convert = true;
+                LOGI(kTag, "video frame %dx%d (stride %d, slice height %d) converted to RGBA into the game's buffer "
+                     "(%zu bytes)", w, h, stride, slice, gb.capacity);
+            }
+            return kOk;
+        }
+        if (!d->logged_convert) {
+            d->logged_convert = true;
+            LOGW(kTag, "game buffer of %zu bytes too small for a %dx%d frame; handing out the decoder's buffer",
+                 gb.capacity, w, h);
+        }
+    }
     SetBuffer(buffer, p, cap, o.offset, o.size);
     return kOk;
 #else
@@ -689,6 +760,7 @@ HLE_FUNC(_ZN5movie6BufferD1Ev, void, movie_BufferDtor, (void* self)) {
 }
 HLE_FUNC(_ZN5movie6Buffer18SetDataAndCapacityEPvm, void, movie_BufferSetData, (void* self, void* data, size_t cap)) {
     SetBuffer(self, static_cast<uint8_t*>(data), cap, 0, 0);
+    Buf(self).from_game = data != nullptr;
 }
 HLE_FUNC(_ZN5movie6Buffer8SetRangeEii, void, movie_BufferSetRange, (void* self, int offset, int size)) {
     BufferState& s = Buf(self);
