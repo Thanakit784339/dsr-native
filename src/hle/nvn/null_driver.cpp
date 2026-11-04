@@ -14,6 +14,7 @@
 
 #include "common/log.h"
 #include "hle/nvn.h"
+#include "hle/nvn/backend.h"
 #include "hle/nvn/nvn_types.h"
 #include "hle/os/os.h"
 
@@ -53,7 +54,6 @@ Table<BufferState> g_buffer_builders, g_buffers;
 Table<TextureState> g_texture_builders, g_textures;
 Table<WindowState> g_window_builders, g_windows;
 Table<QueueBuilderState> g_queue_builders;
-std::atomic<uint64_t> g_command_handle{1};
 
 size_t AlignUp(size_t v, size_t a) { return (v + a - 1) / a * a; }
 
@@ -250,12 +250,14 @@ bool QueueInitialize(void* q, const void* b) {
     return true;
 }
 
-// Frame pacing for the null renderer: Dark Souls Remastered runs at 30 fps on Switch.
+// Present: pace to 30 fps (Dark Souls Remastered's rate on Switch), then let the backend show the window
+// texture. Every 10 s, report what the game submitted per frame.
 void QueuePresentTexture(void* queue, void* window, int index) {
     using clock = std::chrono::steady_clock;
     static thread_local clock::time_point next = clock::now();
     static std::atomic<uint64_t> frames{0};
     static clock::time_point report = clock::now();
+    static GpuStats last{};
     const auto frame = std::chrono::microseconds(33333);
     auto now = clock::now();
     if (next > now)
@@ -263,19 +265,30 @@ void QueuePresentTexture(void* queue, void* window, int index) {
     else if (now - next > frame * 4)
         next = now;  // fell behind (loading): resync instead of bursting
     next += frame;
+
+    TexRef tex = WindowTexture(window, index);
+    GetBackend().Present(tex);
+
+    static uint64_t frames_at_report = 0;
     uint64_t n = ++frames;
-    if (n == 1) LOGI(kTag, "first frame presented (window %p, texture %d)", window, index);
+    if (n == 1)
+        LOGI(kTag, "first frame presented (window %p, texture %d: %dx%d format %d)", window, index, tex.tex.width,
+             tex.tex.height, tex.tex.format);
     if (clock::now() - report > std::chrono::seconds(10)) {
         report = clock::now();
-        LOGI(kTag, "%llu frames presented", (unsigned long long)n);
+        GpuStats s = Stats();
+        double f = double(std::max<uint64_t>(1, n - frames_at_report));
+        LOGI(kTag, "%llu frames presented | per frame: %.1f submits, %.1f draws, %.1f clears, %.1f copies, %.1f target binds",
+             (unsigned long long)n, (s.submits - last.submits) / f, (s.draws - last.draws) / f,
+             (s.clears - last.clears) / f, (s.copies - last.copies) / f, (s.rt_binds - last.rt_binds) / f);
+        last = s;
+        frames_at_report = n;
     }
 }
 
 // ---- command buffers -----------------------------------------------------------------------------------------
-uint64_t CmdEndRecording(void*) { return g_command_handle.fetch_add(1); }
 size_t CmdZero(const void*) { return 0; }
 size_t CmdPlenty(const void*) { return 16u << 20; }
-bool CmdIsRecording(const void*) { return false; }
 
 // ---- sync ------------------------------------------------------------------------------------------------------
 int SyncWait(const void*, uint64_t timeout) { return 0; /* already signaled */ }
@@ -305,6 +318,23 @@ int WindowAcquireTexture(void* w, void* sync, int* index) {
 }
 int WindowGetNumTextures(const void* w) { return g_windows.Copy(w).num_textures; }
 
+}  // namespace
+
+TexRef MakeTexRef(const void* nvn_texture) {
+    TexRef r;
+    if (!nvn_texture) return r;
+    r.tex = g_textures.Copy(nvn_texture);
+    r.addr = PoolBase(r.tex.pool) + uint64_t(r.tex.offset);
+    r.valid = r.tex.pool != nullptr;
+    return r;
+}
+TexRef WindowTexture(const void* nvn_window, int index) {
+    WindowState w = g_windows.Copy(nvn_window);
+    if (index < 0 || index >= w.num_textures) return {};
+    return MakeTexRef(w.textures[index]);
+}
+
+namespace {
 struct Proc {
     const char* name;
     void* fn;
@@ -370,17 +400,14 @@ const Proc kProcs[] = {
     P("nvnQueueBuilderSetComputeMemorySize", QueueBuilderSetComputeMemorySize),
     P("nvnQueueBuilderSetCommandFlushThreshold", Nop), P("nvnQueueBuilderSetQueueMemory", Nop),
     P("nvnQueueBuilderGetQueueMemorySize", QueueBuilderGetQueueMemorySize),
-    P("nvnQueueInitialize", QueueInitialize), P("nvnQueueFinalize", Nop), P("nvnQueueSubmitCommands", Nop),
-    P("nvnQueueFlush", Nop), P("nvnQueueFinish", Nop), P("nvnQueueFenceSync", Nop), P("nvnQueueWaitSync", Nop),
+    P("nvnQueueInitialize", QueueInitialize), P("nvnQueueFinalize", Nop), P("nvnQueueFlush", Nop), P("nvnQueueFinish", Nop), P("nvnQueueFenceSync", Nop), P("nvnQueueWaitSync", Nop),
     P("nvnQueuePresentTexture", QueuePresentTexture),
     // command buffers (recording is a no-op)
     P("nvnCommandBufferInitialize", True), P("nvnCommandBufferFinalize", Nop),
     P("nvnCommandBufferAddCommandMemory", Nop), P("nvnCommandBufferAddControlMemory", Nop),
-    P("nvnCommandBufferBeginRecording", Nop), P("nvnCommandBufferEndRecording", CmdEndRecording),
     P("nvnCommandBufferGetCommandMemoryUsed", CmdZero), P("nvnCommandBufferGetControlMemoryUsed", CmdZero),
     P("nvnCommandBufferGetCommandMemoryFree", CmdPlenty), P("nvnCommandBufferGetControlMemoryFree", CmdPlenty),
     P("nvnCommandBufferGetCommandMemorySize", CmdPlenty), P("nvnCommandBufferGetControlMemorySize", CmdPlenty),
-    P("nvnCommandBufferIsRecording", CmdIsRecording),
     // sync
     P("nvnSyncInitialize", True), P("nvnSyncFinalize", Nop), P("nvnSyncWait", SyncWait),
     // window

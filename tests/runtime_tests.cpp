@@ -10,6 +10,7 @@
 
 #include "arch/arch.h"
 #include "hle/nvn.h"
+#include "hle/nvn/backend.h"
 #include "hle/registry.h"
 #include "loader/dynamic_thunks.h"
 #include "loader/nso.h"
@@ -229,6 +230,93 @@ static void TestNullNvn() {
     CHECK(Nvn<bool (*)(void*, const void*)>("nvnSamplerPoolInitialize")(pool, nullptr));
 }
 
+// Command recording: what the game records must reach the backend in order, with textures resolved.
+namespace {
+struct RecordingBackend final : dsr::hle::nvn::Backend {
+    std::vector<dsr::hle::nvn::CmdList> executed;
+    int presents = 0;
+    dsr::hle::nvn::TexRef last_present;
+    void Execute(const dsr::hle::nvn::CmdList& c) override { executed.push_back(c); }
+    void Present(const dsr::hle::nvn::TexRef& t) override {
+        presents++;
+        last_present = t;
+    }
+    const char* Name() const override { return "test"; }
+};
+}  // namespace
+
+static void TestNvnCommands() {
+    using namespace dsr::hle::nvn;
+    RecordingBackend be;
+    SetBackendForTesting(&be);
+
+    alignas(16) static uint8_t storage[0x400000];
+    uint8_t pool_builder[64], pool[256], tb[128], color[192], depth[192], cb[256], wb[64], window[128];
+    Nvn<void (*)(void*)>("nvnMemoryPoolBuilderSetDefaults")(pool_builder);
+    Nvn<void (*)(void*, void*, size_t)>("nvnMemoryPoolBuilderSetStorage")(pool_builder, storage, sizeof(storage));
+    CHECK(Nvn<bool (*)(void*, const void*)>("nvnMemoryPoolInitialize")(pool, pool_builder));
+    auto make_tex = [&](void* t, int w, int h, int fmt, int64_t off) {
+        Nvn<void (*)(void*)>("nvnTextureBuilderSetDefaults")(tb);
+        Nvn<void (*)(void*, int, int)>("nvnTextureBuilderSetSize2D")(tb, w, h);
+        Nvn<void (*)(void*, int)>("nvnTextureBuilderSetFormat")(tb, fmt);
+        Nvn<void (*)(void*, const void*, int64_t)>("nvnTextureBuilderSetStorage")(tb, pool, off);
+        CHECK(Nvn<bool (*)(void*, const void*)>("nvnTextureInitialize")(t, tb));
+    };
+    make_tex(color, 1280, 720, 37, 0);
+    make_tex(depth, 1280, 720, 53, 0x200000);
+
+    const void* colors[1] = {color};
+    const float red[4] = {1, 0, 0, 1};
+    Nvn<void (*)(void*)>("nvnCommandBufferBeginRecording")(cb);
+    CHECK(Nvn<bool (*)(const void*)>("nvnCommandBufferIsRecording")(cb));
+    Nvn<void (*)(void*, int, const void* const*, const void* const*, const void*, const void*)>(
+        "nvnCommandBufferSetRenderTargets")(cb, 1, colors, nullptr, depth, nullptr);
+    Nvn<void (*)(void*, int, const float*, int)>("nvnCommandBufferClearColor")(cb, 0, red, 0xF);
+    Nvn<void (*)(void*, float, bool, int, int)>("nvnCommandBufferClearDepthStencil")(cb, 1.0f, true, 0, 0xFF);
+    Nvn<void (*)(void*)>("nvnCommandBufferDrawArrays")(cb);
+    uint64_t h = Nvn<uint64_t (*)(void*)>("nvnCommandBufferEndRecording")(cb);
+    CHECK(h != 0);
+    CHECK(!Nvn<bool (*)(const void*)>("nvnCommandBufferIsRecording")(cb));
+
+    // A second buffer that inlines the first one.
+    uint8_t cb2[256];
+    Nvn<void (*)(void*)>("nvnCommandBufferBeginRecording")(cb2);
+    Nvn<void (*)(void*, int, const uint64_t*)>("nvnCommandBufferCallCommands")(cb2, 1, &h);
+    uint64_t h2 = Nvn<uint64_t (*)(void*)>("nvnCommandBufferEndRecording")(cb2);
+
+    uint64_t handles[2] = {h, h2};
+    Nvn<void (*)(void*, int, const uint64_t*)>("nvnQueueSubmitCommands")(nullptr, 2, handles);
+    CHECK(be.executed.size() == 2);
+    if (be.executed.size() == 2) {
+        const CmdList& l = be.executed[0];
+        CHECK(l.size() == 4);
+        CHECK(l.size() == 4 && l[0].type == CmdType::SetRenderTargets && l[0].num_rt == 1);
+        if (l.size() == 4 && l[0].rts && l[0].rts->size() == 2) {
+            CHECK((*l[0].rts)[0].valid && (*l[0].rts)[0].tex.width == 1280 && (*l[0].rts)[0].tex.format == 37);
+            CHECK((*l[0].rts)[0].addr == reinterpret_cast<uint64_t>(storage));
+            CHECK((*l[0].rts)[1].addr == reinterpret_cast<uint64_t>(storage) + 0x200000 && (*l[0].rts)[1].tex.format == 53);
+        } else {
+            CHECK(!"render targets not captured");
+        }
+        float got[4];
+        if (l.size() == 4) memcpy(got, l[1].color, sizeof(got));
+        CHECK(l.size() == 4 && l[1].type == CmdType::ClearColor && got[0] == 1.0f && got[1] == 0.0f && l[1].mask == 0xF);
+        CHECK(l.size() == 4 && l[2].type == CmdType::ClearDepthStencil && l[2].depth == 1.0f && l[2].depth_mask);
+        CHECK(l.size() == 4 && l[3].type == CmdType::Draw);
+        CHECK(be.executed[1].size() == 4);  // inlined copy
+    }
+
+    // Presenting window texture 0 resolves to the color texture.
+    const void* wtex[2] = {color, depth};
+    Nvn<void (*)(void*)>("nvnWindowBuilderSetDefaults")(wb);
+    Nvn<void (*)(void*, int, const void* const*)>("nvnWindowBuilderSetTextures")(wb, 2, wtex);
+    CHECK(Nvn<bool (*)(void*, const void*)>("nvnWindowInitialize")(window, wb));
+    Nvn<void (*)(void*, void*, int)>("nvnQueuePresentTexture")(nullptr, window, 0);
+    CHECK(be.presents == 1 && be.last_present.valid && be.last_present.addr == reinterpret_cast<uint64_t>(storage));
+
+    SetBackendForTesting(nullptr);
+}
+
 // ---- arm64 ABI glue ----------------------------------------------------------------------------
 #if defined(__aarch64__)
 extern "C" {
@@ -306,6 +394,7 @@ int main() {
         {"standard_allocator", TestStandardAllocator},
         {"os_sync", TestOsSync},
         {"null_nvn", TestNullNvn},
+        {"nvn_commands", TestNvnCommands},
 #if defined(__aarch64__)
         {"abi_arm64", TestAbi},
 #endif
