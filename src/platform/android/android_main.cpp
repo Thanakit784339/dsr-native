@@ -14,7 +14,12 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <jni.h>
+
 #include <atomic>
+#include <cerrno>
+#include <cstring>
+#include <vector>
 #include <cmath>
 #include <string>
 #include <thread>
@@ -42,8 +47,81 @@ std::string Prop(const char* name) {
     return v;
 }
 
-// Opens the log file: Download/DSRNative/ first (reachable with a file manager on Android 11+), then
-// the app's own external folder as a fallback.
+// ---- log file ------------------------------------------------------------------------------------
+// Android 13 restricts writing to shared folders by plain file path, so the primary route is MediaStore
+// (the supported, permission-free way for an app to add a file to Download/). Fallbacks: plain path in
+// Download/, Android/media/<package>/ (browsable with file managers), then the app's private folder.
+
+// Clears and describes a pending Java exception.
+bool JniFailed(JNIEnv* env, std::string* why, const char* step) {
+    if (!env->ExceptionCheck()) return false;
+    env->ExceptionClear();
+    *why = std::string("exception in ") + step;
+    return true;
+}
+
+// Creates Download/DSRNative/<name> through MediaStore and returns a writable fd, or -1.
+int CreateDownloadViaMediaStore(android_app* app, const char* name, std::string* why) {
+    JavaVM* vm = app->activity->vm;
+    JNIEnv* env = nullptr;
+    if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) {
+        *why = "AttachCurrentThread failed";
+        return -1;
+    }
+    int fd = -1;
+    jobject activity = app->activity->clazz;
+    do {
+        jclass cv_cls = env->FindClass("android/content/ContentValues");
+        if (JniFailed(env, why, "FindClass ContentValues") || !cv_cls) break;
+        jmethodID cv_ctor = env->GetMethodID(cv_cls, "<init>", "()V");
+        jmethodID cv_put = env->GetMethodID(cv_cls, "put", "(Ljava/lang/String;Ljava/lang/String;)V");
+        if (JniFailed(env, why, "ContentValues methods")) break;
+        jobject values = env->NewObject(cv_cls, cv_ctor);
+        if (JniFailed(env, why, "new ContentValues")) break;
+        const char* kv[][2] = {{"_display_name", name}, {"mime_type", "text/plain"}, {"relative_path", "Download/DSRNative"}};
+        for (auto& p : kv) {
+            jstring k = env->NewStringUTF(p[0]);
+            jstring v = env->NewStringUTF(p[1]);
+            env->CallVoidMethod(values, cv_put, k, v);
+            env->DeleteLocalRef(k);
+            env->DeleteLocalRef(v);
+        }
+        if (JniFailed(env, why, "ContentValues.put")) break;
+
+        jclass dl_cls = env->FindClass("android/provider/MediaStore$Downloads");
+        if (JniFailed(env, why, "FindClass MediaStore.Downloads") || !dl_cls) break;
+        jfieldID uri_field = env->GetStaticFieldID(dl_cls, "EXTERNAL_CONTENT_URI", "Landroid/net/Uri;");
+        if (JniFailed(env, why, "EXTERNAL_CONTENT_URI")) break;
+        jobject collection = env->GetStaticObjectField(dl_cls, uri_field);
+
+        jclass act_cls = env->GetObjectClass(activity);
+        jmethodID get_cr = env->GetMethodID(act_cls, "getContentResolver", "()Landroid/content/ContentResolver;");
+        jobject resolver = env->CallObjectMethod(activity, get_cr);
+        if (JniFailed(env, why, "getContentResolver") || !resolver) break;
+        jclass cr_cls = env->GetObjectClass(resolver);
+        jmethodID insert = env->GetMethodID(cr_cls, "insert",
+                                            "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;");
+        jobject item = env->CallObjectMethod(resolver, insert, collection, values);
+        if (JniFailed(env, why, "ContentResolver.insert")) break;
+        if (!item) {
+            *why = "ContentResolver.insert returned null";
+            break;
+        }
+        jmethodID open_fd = env->GetMethodID(cr_cls, "openFileDescriptor",
+                                             "(Landroid/net/Uri;Ljava/lang/String;)Landroid/os/ParcelFileDescriptor;");
+        jstring mode = env->NewStringUTF("w");
+        jobject pfd = env->CallObjectMethod(resolver, open_fd, item, mode);
+        env->DeleteLocalRef(mode);
+        if (JniFailed(env, why, "openFileDescriptor") || !pfd) break;
+        jclass pfd_cls = env->GetObjectClass(pfd);
+        jmethodID detach = env->GetMethodID(pfd_cls, "detachFd", "()I");
+        fd = env->CallIntMethod(pfd, detach);
+        if (JniFailed(env, why, "detachFd")) fd = -1;
+    } while (false);
+    vm->DetachCurrentThread();
+    return fd;
+}
+
 void SetupLogFile(android_app* app) {
     time_t now = time(nullptr);
     tm t;
@@ -51,20 +129,35 @@ void SetupLogFile(android_app* app) {
     char name[64];
     strftime(name, sizeof(name), "dsr_%Y%m%d_%H%M%S.txt", &t);
 
-    std::string candidates[2];
-    const std::string shared_dir = "/storage/emulated/0/Download/DSRNative";
-    mkdir(shared_dir.c_str(), 0775);
-    candidates[0] = shared_dir + "/" + name;
-    std::string app_dir = app->activity->externalDataPath ? app->activity->externalDataPath : "";
-    if (!app_dir.empty()) candidates[1] = app_dir + "/" + name;
+    std::vector<std::string> failures;
+    std::string why;
+    int fd = CreateDownloadViaMediaStore(app, name, &why);
+    if (fd >= 0) {
+        dsr::SetLogFileFd(fd);
+        LOGI(kTag, "log file: Download/DSRNative/%s (via MediaStore)", name);
+        return;
+    }
+    failures.push_back("MediaStore Download/DSRNative: " + why);
 
-    for (const std::string& path : candidates) {
-        if (path.empty()) continue;
+    std::string app_dir = app->activity->externalDataPath ? app->activity->externalDataPath : "";
+    const std::string package = "com.dsrnative.app";
+    const std::string paths[] = {
+        "/storage/emulated/0/Download/DSRNative",
+        "/storage/emulated/0/Android/media/" + package,
+        app_dir,
+    };
+    for (const std::string& dir : paths) {
+        if (dir.empty()) continue;
+        mkdir(dir.c_str(), 0775);
+        std::string path = dir + "/" + name;
         if (dsr::OpenLogFile(path.c_str())) {
             LOGI(kTag, "log file: %s", path.c_str());
+            for (const auto& f : failures) LOGW(kTag, "log location skipped: %s", f.c_str());
             return;
         }
+        failures.push_back(path + ": " + strerror(errno));
     }
+    for (const auto& f : failures) LOGW(kTag, "log location failed: %s", f.c_str());
     LOGW(kTag, "could not create a log file (logcat only)");
 }
 

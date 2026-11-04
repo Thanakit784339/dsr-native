@@ -30,6 +30,11 @@ bool OpenLogFile(const char* path) {
     return true;
 }
 
+void SetLogFileFd(int fd) {
+    int old = g_file_fd.exchange(fd);
+    if (old >= 0) close(old);
+}
+
 int LogFileFd() { return g_file_fd.load(std::memory_order_relaxed); }
 
 static void WriteFileLine(LogLevel lvl, const char* tag, const char* msg) {

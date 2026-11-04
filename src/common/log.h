@@ -14,6 +14,8 @@ void SetLogLevel(LogLevel lvl);
 
 // Mirror every log line into a file (truncates it). Each line is written immediately (no buffering).
 bool OpenLogFile(const char* path);
+// Same, but with a file descriptor that is already open for writing (takes ownership).
+void SetLogFileFd(int fd);
 // File descriptor of the log file, or -1 (used by the crash handler, which must not allocate).
 int LogFileFd();
 
