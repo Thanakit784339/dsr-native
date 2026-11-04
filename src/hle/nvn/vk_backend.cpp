@@ -43,7 +43,7 @@
 namespace dsr::hle::nvn {
 namespace {
 constexpr const char* kTag = "vulkan";
-constexpr VkDeviceSize kStreamSize = 64ull << 20;
+constexpr VkDeviceSize kStreamSize = 48ull << 20;  // per slot (four slots)
 constexpr VkDeviceSize kMaxUniformRange = 65536;
 constexpr uint32_t kCbufBase = 3;      // NVN uniform-buffer binding b is read by shaders as c[b + 3]
 constexpr uint32_t kCompilerConstants = 1;  // c[1]: literal constants from the shader's control section
@@ -2146,7 +2146,7 @@ private:
 
         Begin();
         // Keep enough streaming space for this draw so nothing allocated below is lost to a flush.
-        if (StreamRemaining() < (24ull << 20)) Flush();
+        if (StreamRemaining() < (16ull << 20)) Flush();
 
         Phase(1);
         // ---- textures (uploads and layout changes happen outside rendering) ---------------------------------
@@ -2183,6 +2183,12 @@ private:
                     if (!img) return Skip("texture is also the depth target");
                 }
                 if (img->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+                    if (rendering_) {
+                        char k[96];
+                        snprintf(k, sizeof(k), "fmt %d %dx%d from layout %d%s", img->nvn_format, img->width,
+                                 img->height, int(img->layout), img == depth ? " (depth target)" : "");
+                        sampled_breaks_[k]++;
+                    }
                     EndRendering();
                     Transition(*img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 }
@@ -2933,6 +2939,15 @@ private:
             LOGI(kTag, "render passes ended by (source line: count):%s", top.c_str());
             pass_breaks_.clear();
         }
+        if (!sampled_breaks_.empty()) {
+            std::vector<std::pair<uint64_t, std::string>> v;
+            for (auto& [k, n] : sampled_breaks_) v.push_back({n, k});
+            std::sort(v.rbegin(), v.rend());
+            std::string top;
+            for (size_t i = 0; i < v.size() && i < 8; i++) top += " [" + v[i].second + "]: " + std::to_string(v[i].first) + ";";
+            LOGI(kTag, "textures that broke a render pass to become readable:%s", top.c_str());
+            sampled_breaks_.clear();
+        }
         LOGI(kTag, "last 10 s: %.0f ms executing lists (%.0f ms of it waiting for the GPU), %.1f MB streamed, %llu cached uploads",
              exec_ms_, wait_ms_, upload_bytes_ / 1048576.0, (unsigned long long)upload_hits_);
         std::string phases;
@@ -3024,6 +3039,7 @@ private:
     uint32_t ts_count_ = 0, ts_pass_[kMaxTimestamps] = {};
     uint64_t render_passes_ = 0, barriers_ = 0;
     std::map<int, uint64_t> pass_breaks_;
+    std::map<std::string, uint64_t> sampled_breaks_;
     std::vector<uint32_t> query_pass_;
     uint64_t ubo_desc_draw_ = ~0ull;
     uint64_t tex_desc_draw_ = ~0ull;
@@ -3065,7 +3081,9 @@ private:
         VkDeviceMemory mem = VK_NULL_HANDLE;
         uint8_t* ptr = nullptr;
     };
-    static constexpr int kSlots = 2;
+    // Each frame makes two submissions (its command list, then the present): four slots let the next frame
+    // record while the previous frame is still on the GPU (with two, it waited for the frame just submitted).
+    static constexpr int kSlots = 4;
     Slot slots_[kSlots];
     int slot_ = 0;
     // Hashed fronts of the caches above (no allocation per lookup).
