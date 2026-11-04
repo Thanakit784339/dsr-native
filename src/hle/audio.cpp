@@ -2,7 +2,9 @@
 // thread; finished buffers move to a "released" list and the game's SystemEvent is signaled.
 //
 // Backends: AAudio on Android (blocking writes), or a real-time "null" sink elsewhere.
+#include <algorithm>
 #include <condition_variable>
+#include <vector>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -41,7 +43,7 @@ struct AudioOutParameter {
 
 class AudioOut {
 public:
-    explicit AudioOut(void* system_event) : event_(system_event) {}
+    AudioOut(void* system_event, int channels) : event_(system_event), channels_(channels > 0 ? channels : 2) {}
     ~AudioOut() { Stop(); }
 
     bool Open() {
@@ -114,7 +116,8 @@ private:
                 if (!running_) return;
                 b = queued_.front();
             }
-            Play(static_cast<const int16_t*>(b->data), b->data_size / (sizeof(int16_t) * kChannels));
+            const size_t frames = b->data_size / (sizeof(int16_t) * size_t(channels_));
+            Play(ToStereo(static_cast<const int16_t*>(b->data), frames), frames);
             {
                 std::lock_guard<std::mutex> lk(m_);
                 queued_.pop_front();
@@ -122,6 +125,30 @@ private:
             }
             if (event_) dsr::hle::os::SignalSystemEvent(event_);
         }
+    }
+
+    // The game may open the output with 1, 2 or 6 (5.1: FL FR FC LFE BL BR) channels; the host stream is
+    // always stereo.
+    const int16_t* ToStereo(const int16_t* in, size_t frames) {
+        if (channels_ == 2) return in;
+        stereo_.resize(frames * 2);
+        for (size_t i = 0; i < frames; i++) {
+            const int16_t* f = in + i * size_t(channels_);
+            int l, r;
+            if (channels_ == 1) {
+                l = r = f[0];
+            } else if (channels_ >= 6) {
+                const float c = 0.7071f * f[2], lfe = 0.5f * f[3];
+                l = int(f[0] + c + 0.7071f * f[4] + lfe);
+                r = int(f[1] + c + 0.7071f * f[5] + lfe);
+            } else {
+                l = f[0];
+                r = f[1];
+            }
+            stereo_[2 * i] = int16_t(std::clamp(l, -32768, 32767));
+            stereo_[2 * i + 1] = int16_t(std::clamp(r, -32768, 32767));
+        }
+        return stereo_.data();
     }
 
     void Play(const int16_t* pcm, size_t frames) {
@@ -145,6 +172,8 @@ private:
     }
 
     void* event_;
+    int channels_;
+    std::vector<int16_t> stereo_;
     std::mutex m_;
     std::condition_variable cv_;
     std::deque<GuestBuffer*> queued_, released_;
@@ -171,7 +200,7 @@ HLE_FUNC(_ZN2nn5audio19OpenDefaultAudioOutEPNS0_8AudioOutEPNS_2os11SystemEventER
          audio_OpenDefaultAudioOut, (void* out, void* system_event, const AudioOutParameter* p)) {
     LOGI(kTag, "OpenDefaultAudioOut(rate=%d ch=%u)", p->sample_rate, p->channel_count);
     if (system_event) dsr::hle::os::InitSystemEvent(system_event, true, false);
-    auto* ao = new AudioOut(system_event);
+    auto* ao = new AudioOut(system_event, p->channel_count);
     ao->Open();
     *static_cast<AudioOut**>(out) = ao;
     return kOk;
