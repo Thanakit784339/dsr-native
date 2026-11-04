@@ -267,7 +267,14 @@ int32_t OnInput(android_app*, AInputEvent* ev) {
     using namespace dsr::input;
     const int32_t type = AInputEvent_getType(ev);
     if (type == AINPUT_EVENT_TYPE_KEY) {
-        uint64_t b = KeyToButton(AKeyEvent_getKeyCode(ev));
+        static int logged = 0;
+        const int32_t code = AKeyEvent_getKeyCode(ev);
+        uint64_t b = KeyToButton(code);
+        if (logged < 40 && AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_DOWN) {
+            logged++;
+            LOGI(kTag, "input: key %d down (source 0x%x) -> %s", code, AInputEvent_getSource(ev),
+                 b ? "mapped" : "not mapped");
+        }
         if (!b) return 0;
         if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_DOWN)
             g_pad.buttons |= b;

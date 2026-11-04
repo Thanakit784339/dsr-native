@@ -4,6 +4,9 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
 
 #include "common/log.h"
 #include "hle/registry.h"
@@ -203,17 +206,50 @@ HLE_FUNC(_ZN2nn4util9VSNPrintfEPcmPKcSt9__va_list, int, util_VSNPrintf,
 HLE_FUNC(_ZN2nn4util11ReferSymbolEPKv, void, util_ReferSymbol, (const void*)) {}
 
 // ===== nn::err =====================================================================================
+// ErrorResultVariant (12 bytes, copied by value by the game): we store {kind, a, b}:
+//   kind 1 = nn::Result (a = result), kind 2 = ErrorCode (a = category, b = number).
+// Each distinct error is logged once (with a repeat count every 10th time) and reported with the guest
+// address that raised it; on a real console these are modal error dialogs.
+namespace {
+std::mutex g_err_mutex;
+std::map<std::string, int> g_err_counts;
+
+void ReportError(const char* what, uintptr_t caller) {
+    int n;
+    {
+        std::lock_guard<std::mutex> lk(g_err_mutex);
+        n = ++g_err_counts[what];
+    }
+    const auto& m = dsr::GetRuntime().main;
+    unsigned long off = m.Contains(caller) ? (unsigned long)(caller - m.base()) : 0;
+    if (n == 1 || n % 10 == 0)
+        LOGW("err", "guest error dialog: %s (shown %d time%s, from main+0x%lx)", what, n, n == 1 ? "" : "s", off);
+}
+}  // namespace
+
 HLE_FUNC(_ZN2nn3err9ShowErrorENS_6ResultE, void, err_ShowError, (uint32_t r)) {
-    LOGW("err", "guest ShowError(result 0x%x: module %u desc %u)", r, r & 0x1FF, (r >> 9) & 0x1FFF);
+    char buf[96];
+    snprintf(buf, sizeof(buf), "result 0x%x (module %u, description %u)", r, r & 0x1FF, (r >> 9) & 0x1FFF);
+    ReportError(buf, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
 }
-HLE_FUNC(_ZN2nn3err9ShowErrorERKNS0_18ErrorResultVariantE, void, err_ShowErrorVariant, (const void*)) {
-    LOGW("err", "guest ShowError(ErrorResultVariant)");
+HLE_FUNC(_ZN2nn3err9ShowErrorERKNS0_18ErrorResultVariantE, void, err_ShowErrorVariant, (const uint32_t* v)) {
+    char buf[96];
+    if (v[0] == 1)
+        snprintf(buf, sizeof(buf), "result 0x%x (module %u, description %u)", v[1], v[1] & 0x1FF, (v[1] >> 9) & 0x1FFF);
+    else if (v[0] == 2)
+        snprintf(buf, sizeof(buf), "error code %04u-%04u", v[1], v[2]);
+    else
+        snprintf(buf, sizeof(buf), "empty error");
+    ReportError(buf, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
 }
-HLE_FUNC(_ZN2nn3err18ErrorResultVariantC1Ev, void, err_ERV_ctor, (uint32_t * self)) { self[0] = 0; }
+HLE_FUNC(_ZN2nn3err18ErrorResultVariantC1Ev, void, err_ERV_ctor, (uint32_t * self)) {
+    self[0] = self[1] = self[2] = 0;
+}
 HLE_FUNC(_ZN2nn3err18ErrorResultVariantC1ERKNS_6ResultE, void, err_ERV_ctor_result,
          (uint32_t * self, const uint32_t* r)) {
     self[0] = 1;
     self[1] = *r;
+    self[2] = 0;
 }
 HLE_FUNC(_ZN2nn3err18ErrorResultVariantC1ERKNS0_9ErrorCodeE, void, err_ERV_ctor_code,
          (uint32_t * self, const uint32_t* code)) {

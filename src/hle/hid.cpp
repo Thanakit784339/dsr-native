@@ -1,6 +1,9 @@
 // nn::hid — one virtual controller fed by the platform layer (dsr::input). It is reported both as
 // player 1 (Pro Controller style) and as the handheld console, whichever the game polls.
+#include <atomic>
 #include <cstring>
+
+#include "common/log.h"
 #include <mutex>
 
 #include "hle/input.h"
@@ -42,6 +45,13 @@ void FillNpad(NpadState* out, uint32_t id) {
     memset(out, 0, sizeof(*out));
     if (id != kNpadNo1 && id != kNpadHandheld) return;
     dsr::input::PadState s = dsr::input::GetPad(&out->sampling_number);
+    // Diagnostics: first poll, and button changes as the game sees them (first 40).
+    static std::atomic<bool> first{true};
+    static std::atomic<uint64_t> last{0};
+    static std::atomic<int> changes{0};
+    if (first.exchange(false)) LOGI("hid", "game polls controller (npad id 0x%x)", id);
+    if (s.buttons != last.exchange(s.buttons) && changes.fetch_add(1) < 40)
+        LOGI("hid", "game sees buttons 0x%llx (npad id 0x%x)", (unsigned long long)s.buttons, id);
     out->buttons = s.buttons;
     out->lx = s.lx;
     out->ly = s.ly;
