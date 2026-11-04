@@ -1536,7 +1536,24 @@ private:
         if (n++ == 0) LOGW(kTag, "draw skipped: %s", reason);
     }
 
+    // Draw-path profile: time spent per phase (reported with the 10 s stats).
+    static constexpr const char* kPhaseNames[7] = {"setup", "targets", "textures", "uniforms", "vertices",
+                                                   "pipeline", "descriptors+record"};
+    double phase_ms_[7] = {};
+    std::chrono::steady_clock::time_point phase_t_;
+    void Phase(int finished) {
+        auto now = std::chrono::steady_clock::now();
+        if (finished >= 0) phase_ms_[finished] += std::chrono::duration<double, std::milli>(now - phase_t_).count();
+        phase_t_ = now;
+    }
+    struct PhaseEnd {
+        VulkanBackend* self;
+        ~PhaseEnd() { self->Phase(6); }
+    };
+
     void Draw(const DrawParams& p) {
+        Phase(-1);
+        PhaseEnd phase_end{this};
         if (p.count <= 0 || p.instances <= 0) return;
         if (!begin_rendering_) return Skip("no dynamic rendering");
         if (!st_.program[0]) return Skip("no vertex program bound");
@@ -1580,6 +1597,7 @@ private:
                                     vs_.divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
         }
 
+        Phase(0);
         // ---- render targets ----------------------------------------------------------------------------------
         std::vector<Image*> colors(size_t(std::max(0, st_.num_rt)), nullptr);
         for (int i = 0; i < st_.num_rt; i++) {
@@ -1594,6 +1612,7 @@ private:
         // Keep enough streaming space for this draw so nothing allocated below is lost to a flush.
         if (StreamRemaining() < (24ull << 20)) Flush();
 
+        Phase(1);
         // ---- textures (uploads and layout changes happen outside rendering) ---------------------------------
         struct TexWrite {
             uint32_t set, binding;
@@ -1647,6 +1666,7 @@ private:
             }
         }
 
+        Phase(2);
         // ---- uniform data ------------------------------------------------------------------------------------
         struct UboWrite {
             uint32_t set, binding;
@@ -1697,6 +1717,7 @@ private:
             }
         }
 
+        Phase(3);
         // ---- vertex + index data -------------------------------------------------------------------------------
         int topology_mode = p.mode;
         std::vector<uint32_t> expanded;  // converted index list (quads, line loops, u8 indices)
@@ -1782,6 +1803,7 @@ private:
             memcpy(stream_ptr_ + index_off, expanded.data(), expanded.size() * 4);
         }
 
+        Phase(4);
         // ---- pipeline ----------------------------------------------------------------------------------------
         VkExtent2D extent;
         // Formats the pipeline renders to (dynamic rendering).
@@ -1795,6 +1817,7 @@ private:
                                           depth_format, layout);
         if (!pipeline) return Skip("pipeline creation failed");
 
+        Phase(5);
         // ---- descriptors -------------------------------------------------------------------------------------
         VkDescriptorSet sets[2] = {};
         VkDescriptorSetLayout layouts[2] = {vsl, fsl};
@@ -1850,21 +1873,34 @@ private:
     }
 
     void SetDynamicState(VkExtent2D extent, const DeviceModes& modes) {
-        // NVN viewports/scissors are in window coordinates; with the OpenGL-style lower-left origin, flip Y
-        // with a negative-height viewport so the image ends up upright in Vulkan's top-left space.
-        const bool flip = modes.origin_mode == 0;
+        // Y direction. In NVN's upper-left origin mode (Direct3D style), clip-space +Y is the top of the target
+        // (row 0); in Vulkan it is the bottom. A negative-height viewport makes the two agree, so images land in
+        // memory the way the game expects, and front faces keep their winding as seen on screen. Without it,
+        // every rasterised image is mirrored and every full-screen pass mirrors it again (the parity decides
+        // what ends up upside down), and back-face culling is inverted.
+        // In the OpenGL-style lower-left mode, row 0 is the bottom and clip +Y the highest row: as in Vulkan.
+        const bool flip = modes.origin_mode == 1;
         float vx = 0, vy = 0, vw = float(extent.width), vh = float(extent.height);
-        if (st_.viewport_set && st_.viewport[2] > 0 && st_.viewport[3] > 0) {
+        // A negative height (the game flipping Y itself) is kept: Vulkan accepts it the same way.
+        if (st_.viewport_set && st_.viewport[2] > 0 && st_.viewport[3] != 0) {
             vx = st_.viewport[0];
             vy = st_.viewport[1];
             vw = st_.viewport[2];
             vh = st_.viewport[3];
         }
+        if (st_.viewport_set && viewports_logged_ < 12) {
+            char key[96];
+            snprintf(key, sizeof(key), "%g,%g,%g,%g", st_.viewport[0], st_.viewport[1], st_.viewport[2], st_.viewport[3]);
+            if (viewport_keys_.insert(key).second) {
+                viewports_logged_++;
+                LOGI(kTag, "viewport (%s) on a %ux%u target", key, extent.width, extent.height);
+            }
+        }
         VkViewport vp;
         vp.x = vx;
         vp.width = vw;
         if (flip) {
-            vp.y = float(extent.height) - vy;
+            vp.y = vy + vh;
             vp.height = -vh;
         } else {
             vp.y = vy;
@@ -1876,7 +1912,6 @@ private:
         VkRect2D sc{{0, 0}, extent};
         if (st_.scissor_set && st_.scissor[2] > 0 && st_.scissor[3] > 0) {
             int x = int(st_.scissor[0]), y = int(st_.scissor[1]), w = int(st_.scissor[2]), h = int(st_.scissor[3]);
-            if (flip) y = int(extent.height) - (y + h);
             x = std::max(0, x);
             y = std::max(0, y);
             w = std::max(0, std::min(w, int(extent.width) - x));
@@ -2078,6 +2113,12 @@ private:
              pipelines_.size(), shaders_translated_, uploads_, flushes_, skipped.c_str());
         LOGI(kTag, "last 10 s: %.0f ms executing lists (%.0f ms of it waiting for the GPU), %.1f MB streamed, %llu cached uploads",
              exec_ms_, wait_ms_, upload_bytes_ / 1048576.0, (unsigned long long)upload_hits_);
+        std::string phases;
+        for (int i = 0; i < 7; i++) {
+            phases += " " + std::string(kPhaseNames[i]) + "=" + std::to_string(int(phase_ms_[i]));
+            phase_ms_[i] = 0;
+        }
+        LOGI(kTag, "draw time by phase (ms):%s", phases.c_str());
         exec_ms_ = wait_ms_ = 0;
         upload_bytes_ = upload_hits_ = 0;
     }
@@ -2134,7 +2175,9 @@ private:
     VkDeviceSize stream_off_ = 0, zero_offset_ = 0;
     std::unordered_map<uint64_t, VkDeviceSize> stream_cache_;
     uint64_t upload_hits_ = 0, upload_bytes_ = 0;
-    uint64_t depth_gen_ = 0;  // bumped by every depth write (draw or clear)
+    uint64_t depth_gen_ = 0;
+    int viewports_logged_ = 0;
+    std::set<std::string> viewport_keys_;  // bumped by every depth write (draw or clear)
     std::unordered_map<uint64_t, uint64_t> snapshot_gen_;
     double exec_ms_ = 0, wait_ms_ = 0;
     VkDescriptorPool desc_pool_ = VK_NULL_HANDLE;
