@@ -27,6 +27,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "hle/nvn/backend.h"
 #include "common/log.h"
@@ -561,38 +562,53 @@ int DecGetOutputBuffer(void* self, int index, void* buffer) {
         }
         const size_t pitch = size_t(w) * 4;
         const size_t need_src = size_t(o.offset) + size_t(stride) * size_t(slice) * 3 / 2;
-        if (gb.capacity >= pitch * size_t(h) && size_t(cap) >= need_src) {
-            const uint8_t* y_plane = p + o.offset;
-            const uint8_t* uv_plane = y_plane + size_t(stride) * size_t(slice);
-            for (int yy = 0; yy < h; yy++) {
-                const uint8_t* yr = y_plane + size_t(yy + ct) * size_t(stride) + cl;
-                const uint8_t* uvr = uv_plane + size_t((yy + ct) / 2) * size_t(stride) + (cl & ~1);
-                uint8_t* out = gb.data + size_t(yy) * pitch;
-                for (int xx = 0; xx < w; xx++) {
-                    const int c = 298 * (int(yr[xx]) - 16);
-                    const int u = int(uvr[xx & ~1]) - 128, v = int(uvr[(xx & ~1) + 1]) - 128;
-                    int r = (c + 459 * v + 128) >> 8;              // 1.793
-                    int g = (c - 55 * u - 136 * v + 128) >> 8;     // 0.213, 0.533
-                    int b = (c + 541 * u + 128) >> 8;              // 2.112
-                    out[xx * 4 + 0] = uint8_t(r < 0 ? 0 : r > 255 ? 255 : r);
-                    out[xx * 4 + 1] = uint8_t(g < 0 ? 0 : g > 255 ? 255 : g);
-                    out[xx * 4 + 2] = uint8_t(b < 0 ? 0 : b > 255 ? 255 : b);
-                    out[xx * 4 + 3] = 255;
-                }
-            }
-            gb.offset = 0;
-            gb.size = int(pitch * size_t(h));
+        if (size_t(cap) < need_src) {
             if (!d->logged_convert) {
                 d->logged_convert = true;
-                LOGI(kTag, "video frame %dx%d (stride %d, slice height %d) converted to RGBA into the game's buffer "
-                     "(%zu bytes)", w, h, stride, slice, gb.capacity);
+                LOGW(kTag, "decoded frame smaller than expected (%zu < %zu bytes)", size_t(cap), need_src);
             }
+            SetBuffer(buffer, p, cap, o.offset, o.size);
             return kOk;
         }
+        // Convert NV12 (BT.709, limited range) to RGBA: straight into the game's memory when it is big enough,
+        // else into a scratch picture that is written into the texture owning that memory (the game passes
+        // its video texture's storage with a token capacity, as the hardware decoder writes it directly).
+        const bool direct = gb.capacity >= pitch * size_t(h);
+        static thread_local std::vector<uint8_t> scratch;
+        uint8_t* dst = direct ? gb.data : (scratch.resize(pitch * size_t(h)), scratch.data());
+        const uint8_t* y_plane = p + o.offset;
+        const uint8_t* uv_plane = y_plane + size_t(stride) * size_t(slice);
+        for (int yy = 0; yy < h; yy++) {
+            const uint8_t* yr = y_plane + size_t(yy + ct) * size_t(stride) + cl;
+            const uint8_t* uvr = uv_plane + size_t((yy + ct) / 2) * size_t(stride) + (cl & ~1);
+            uint8_t* out = dst + size_t(yy) * pitch;
+            for (int xx = 0; xx < w; xx++) {
+                const int c = 298 * (int(yr[xx]) - 16);
+                const int u = int(uvr[xx & ~1]) - 128, v = int(uvr[(xx & ~1) + 1]) - 128;
+                int r = (c + 459 * v + 128) >> 8;              // 1.793
+                int g = (c - 55 * u - 136 * v + 128) >> 8;     // 0.213, 0.533
+                int b = (c + 541 * u + 128) >> 8;              // 2.112
+                out[xx * 4 + 0] = uint8_t(r < 0 ? 0 : r > 255 ? 255 : r);
+                out[xx * 4 + 1] = uint8_t(g < 0 ? 0 : g > 255 ? 255 : g);
+                out[xx * 4 + 2] = uint8_t(b < 0 ? 0 : b > 255 ? 255 : b);
+                out[xx * 4 + 3] = 255;
+            }
+        }
+        bool ok = direct;
+        if (!direct)
+            ok = dsr::hle::nvn::WriteTextureAtAddress(uint64_t(reinterpret_cast<uintptr_t>(gb.data)), dst, w, h, pitch);
         if (!d->logged_convert) {
             d->logged_convert = true;
-            LOGW(kTag, "game buffer of %zu bytes too small for a %dx%d frame; handing out the decoder's buffer",
-                 gb.capacity, w, h);
+            LOGI(kTag, "video frame %dx%d (stride %d, slice height %d) -> game memory %p (capacity %zu): %s", w, h,
+                 stride, slice, static_cast<void*>(gb.data), gb.capacity,
+                 direct ? "converted in place" : ok ? "written into the texture at that address" : "NO TEXTURE THERE");
+        }
+        if (ok) {
+            if (direct) {
+                gb.offset = 0;
+                gb.size = int(pitch * size_t(h));
+            }
+            return kOk;
         }
     }
     SetBuffer(buffer, p, cap, o.offset, o.size);

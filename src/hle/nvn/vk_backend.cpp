@@ -536,6 +536,7 @@ public:
                 EndRendering();
                 vkCmdResetQueryPool(cmd_, query_pool_, 0, kMaxQueries);
             }
+            StartPassTimestamps();
             LOGI(kTag, "frame capture (requested): recording this frame's passes");
             return;
         }
@@ -562,6 +563,7 @@ public:
             vkCmdResetQueryPool(cmd_, query_pool_, 0, kMaxQueries);
         }
         query_pass_.clear();
+        StartPassTimestamps();
         pass_written_.clear();
         pass_draws_ = 0;
         LOGI(kTag, "frame capture %d: recording this frame's passes", captures_done_ + 1);
@@ -570,7 +572,30 @@ public:
         if (!capture_active_ || !img) return;
         if (std::find(pass_written_.begin(), pass_written_.end(), img) == pass_written_.end()) pass_written_.push_back(img);
     }
+    // GPU timestamps at pass boundaries during a capture: where the GPU's time goes.
+    void StartPassTimestamps() {
+        ts_count_ = 0;
+        if (!ts_pool_) {
+            VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qi.queryCount = kMaxTimestamps;
+            if (vkCreateQueryPool(device_, &qi, nullptr, &ts_pool_) != VK_SUCCESS) ts_pool_ = VK_NULL_HANDLE;
+        }
+        if (!ts_pool_) return;
+        Begin();
+        EndRendering();
+        vkCmdResetQueryPool(cmd_, ts_pool_, 0, kMaxTimestamps);
+        WriteTimestamp();
+    }
+    void WriteTimestamp() {
+        if (!ts_pool_ || ts_count_ >= kMaxTimestamps) return;
+        Begin();
+        vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool_, ts_count_);
+        ts_pass_[ts_count_] = capture_pass_;
+        ts_count_++;
+    }
     void CaptureEndOfPass() {
+        WriteTimestamp();
         if (!pass_written_.empty())
             LOGI(kTag, "capture pass %u: %u draws, last fs %016llx, last textures:%s", capture_pass_, pass_draws_,
                  (unsigned long long)pass_fs_hash_, pass_tex_desc_.empty() ? " none" : pass_tex_desc_.c_str());
@@ -704,6 +729,24 @@ public:
     void FinishCapture() {
         WaitGpuIdle();  // the readback buffers are written by the submission that just went out
         capture_active_ = false;
+        if (ts_pool_ && ts_count_ > 1) {
+            std::vector<uint64_t> ts(ts_count_);
+            if (vkGetQueryPoolResults(device_, ts_pool_, 0, ts_count_, ts.size() * 8, ts.data(), 8,
+                                      VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+                const double ns = props_.limits.timestampPeriod;
+                std::string line;
+                double total = 0;
+                for (uint32_t i = 1; i < ts_count_; i++) {
+                    const double ms = double(ts[i] - ts[i - 1]) * ns / 1e6;
+                    total += ms;
+                    if (ms < 0.05) continue;
+                    char d[48];
+                    snprintf(d, sizeof(d), " p%u:%.2f", ts_pass_[i], ms);
+                    line += d;
+                }
+                LOGI(kTag, "capture %d GPU ms per pass (total %.1f ms):%s", captures_done_ + 1, total, line.c_str());
+            }
+        }
         captures_done_++;
         if (query_pool_ && !query_pass_.empty()) {
             std::vector<uint64_t> res(query_pass_.size());
@@ -1598,6 +1641,7 @@ private:
 
     void RawBarrier(VkImage image, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to,
                     uint32_t levels = 1, uint32_t layers = 1) {
+        barriers_++;
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -1832,6 +1876,7 @@ private:
         if (depth && HasDepth(depth->nvn_format)) ri.pDepthAttachment = &da;
         if (depth && HasStencil(depth->nvn_format)) ri.pStencilAttachment = &da;
         begin_rendering_(cmd_, &ri);
+        render_passes_++;
         rendering_ = true;
         rendering_key_ = key;
         return true;
@@ -2873,6 +2918,9 @@ private:
                  (unsigned long long)big_checks_, (unsigned long long)big_changes_);
             big_checks_ = big_changes_ = 0;
         }
+        LOGI(kTag, "last 10 s: %llu render passes started, %llu image barriers", (unsigned long long)render_passes_,
+             (unsigned long long)barriers_);
+        render_passes_ = barriers_ = 0;
         LOGI(kTag, "last 10 s: %.0f ms executing lists (%.0f ms of it waiting for the GPU), %.1f MB streamed, %llu cached uploads",
              exec_ms_, wait_ms_, upload_bytes_ / 1048576.0, (unsigned long long)upload_hits_);
         std::string phases;
@@ -2959,6 +3007,10 @@ private:
     std::string pass_tex_desc_, pass_ubo_desc_, pass_state_desc_;
     static constexpr uint32_t kMaxQueries = 2048;
     VkQueryPool query_pool_ = VK_NULL_HANDLE;
+    static constexpr uint32_t kMaxTimestamps = 256;
+    VkQueryPool ts_pool_ = VK_NULL_HANDLE;
+    uint32_t ts_count_ = 0, ts_pass_[kMaxTimestamps] = {};
+    uint64_t render_passes_ = 0, barriers_ = 0;
     std::vector<uint32_t> query_pass_;
     uint64_t ubo_desc_draw_ = ~0ull;
     uint64_t tex_desc_draw_ = ~0ull;

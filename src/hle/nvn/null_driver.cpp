@@ -12,6 +12,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <unordered_map>
 #include <thread>
 
 #include "common/log.h"
@@ -60,6 +61,8 @@ constexpr const char* kTag = "nvn.null";
 Table<MemoryPoolState> g_pool_builders, g_pools;
 Table<BufferState> g_buffer_builders, g_buffers;
 Table<TextureState> g_texture_builders, g_textures;
+std::mutex g_tex_addr_mutex;
+std::unordered_map<uint64_t, TextureState> g_tex_by_addr;  // textures by storage address
 Table<WindowState> g_window_builders, g_windows;
 Table<QueueBuilderState> g_queue_builders;
 
@@ -343,6 +346,32 @@ bool TexInitialize(void* tex, const void* b) {
     }
     t.packaged_data = nullptr;
     g_textures.Get(tex) = t;
+    if (t.pool) {
+        std::lock_guard<std::mutex> lk(g_tex_addr_mutex);
+        g_tex_by_addr[PoolBase(t.pool) + uint64_t(t.offset)] = t;
+    }
+    return true;
+}
+
+// Writes a linear RGBA8 picture into level 0 / layer 0 of the texture whose storage starts at `addr`, in that
+// texture's layout (the video decoder fills the game's video texture this way). False if none is known.
+bool WriteTextureAtAddressImpl(uint64_t addr, const void* rgba, int w, int h, size_t pitch) {
+    TextureState t;
+    {
+        std::lock_guard<std::mutex> lk(g_tex_addr_mutex);
+        auto it = g_tex_by_addr.find(addr);
+        if (it == g_tex_by_addr.end()) return false;
+        t = it->second;
+    }
+    const FormatInfo fi = GetFormatInfo(t.format);
+    if (fi.bytes_per_block != 4 || fi.block_w != 1 || fi.block_h != 1) return false;
+    const TextureLayout layout = ComputeLayout(t);
+    if (layout.levels.empty() || !GuestRangeValid(addr, layout.total)) return false;
+    const LevelLayout& l = layout.levels[0];
+    const int cw = std::min(w, t.width), ch = std::min(h, t.height);
+    if (cw <= 0 || ch <= 0 || uint32_t(cw) * 4 > uint32_t(l.row_bytes) || uint32_t(ch) > uint32_t(l.rows)) return false;
+    WriteLevelRegion(reinterpret_cast<uint8_t*>(addr) + l.offset, l, layout.linear, 0, 0, 0, uint32_t(cw) * 4,
+                     uint32_t(ch), 1, static_cast<const uint8_t*>(rgba), pitch, pitch * size_t(ch));
     return true;
 }
 void TexFinalize(void* tex) { g_textures.Erase(tex); }
@@ -490,6 +519,9 @@ int WindowGetNumTextures(const void* w) { return g_windows.Copy(w).num_textures;
 
 }  // namespace
 
+bool WriteTextureAtAddress(uint64_t addr, const void* rgba, int w, int h, size_t pitch) {
+    return WriteTextureAtAddressImpl(addr, rgba, w, h, pitch);
+}
 bool GuestRangeValid(uint64_t addr, size_t size) {
     std::lock_guard<std::mutex> lk(g_pool_range_mutex);
     auto it = g_pool_ranges.upper_bound(uintptr_t(addr));
