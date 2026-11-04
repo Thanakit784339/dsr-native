@@ -17,7 +17,6 @@ constexpr uint32_t Fail(uint32_t module, uint32_t desc) { return module | (desc 
 constexpr uint32_t kNifmNoNetwork = Fail(110, 3400);
 constexpr uint32_t kSslUnavailable = Fail(123, 1);
 constexpr uint32_t kBcatUnavailable = Fail(122, 1);
-constexpr uint32_t kFriendsUnavailable = Fail(121, 1);
 constexpr uint32_t kNsdUnavailable = Fail(141, 1);
 constexpr uint32_t kNfpNeedRestart = Fail(115, 64);   // device not found
 constexpr uint32_t kSwkbdCanceled = Fail(140, 1);
@@ -180,12 +179,13 @@ HLE_ALIAS(_ZNK2nn4bcat21DeliveryCacheProgress18GetWholeDownloadedEv, bcat_Progre
 // ===== friends / nsd / ec ==============================================================================
 HLE_FUNC(_ZN2nn7friends18GetBlockedUserListEPiPNS_7account23NetworkServiceAccountIdEii, uint32_t,
          friends_GetBlockedUserList, (int* count, void*, int, int)) {
+    // The friends service is local on the console and works offline: an empty block list.
     if (count) *count = 0;
-    return kFriendsUnavailable;
+    return 0;
 }
 HLE_FUNC(_ZN2nn7friends18ShowUserDetailInfoERKNS_7account3UidERKNS1_23NetworkServiceAccountIdERKNS0_15InAppScreenNameESA_,
          uint32_t, friends_ShowUserDetailInfo, (const void*, const void*, const void*, const void*)) {
-    return kFriendsUnavailable;
+    return 0;  // the applet would show a profile page and return when closed
 }
 HLE_FUNC(_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_, uint32_t, nsd_ResolveEx, (char* out, const char* in)) {
     strncpy(out, in, 256);
@@ -329,12 +329,17 @@ HLE_FUNC(_ZN2nn7account37LoadNetworkServiceAccountIdTokenCacheEPmPcmRKNS0_10User
 
 // ===== friends play history / nifm proxy / socket errors ==============================================
 HLE_FUNC(_ZN2nn7friends29GetPlayHistoryRegistrationKeyEPNS0_26PlayHistoryRegistrationKeyERKNS_7account3UidEb, uint32_t,
-         friends_GetPlayHistoryRegistrationKey, (void*, const void*, bool)) {
-    return kFriendsUnavailable;
+         friends_GetPlayHistoryRegistrationKey, (void* key, const void*, bool)) {
+    // A 64-byte opaque key generated locally on the console; any stable value works.
+    if (key) {
+        memset(key, 0, 0x40);
+        memcpy(key, "DSRNATIVE-PLAYHISTORY", 21);
+    }
+    return 0;
 }
 HLE_FUNC(_ZN2nn7friends14AddPlayHistoryERKNS_7account3UidERKNS0_26PlayHistoryRegistrationKeyERKNS0_15InAppScreenNameESA_,
          uint32_t, friends_AddPlayHistory, (const void*, const void*, const void*, const void*)) {
-    return kFriendsUnavailable;
+    return 0;  // recorded locally on the console; nothing to keep here
 }
 HLE_FUNC(_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE, uint32_t, nifm_GetCurrentProxySetting, (void*)) {
     return kNifmNoNetwork;
