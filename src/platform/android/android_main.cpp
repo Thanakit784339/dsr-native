@@ -9,6 +9,7 @@
 #include <android/input.h>
 #include <android/log.h>
 #include <android_native_app_glue.h>
+#include <spawn.h>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <time.h>
@@ -122,6 +123,30 @@ int CreateDownloadViaMediaStore(android_app* app, const char* name, std::string*
     return fd;
 }
 
+// Mirrors this process's logcat (Java exceptions, ART/JNI aborts, libc "Fatal signal" lines — things
+// our own logger cannot see) into a second file. A small shell keeps logcat running until a few seconds
+// after this process dies, so the end of a crash is captured too. Apps may read their own logs.
+void StartLogcatMirror(int fd) {
+    char script[512];
+    snprintf(script, sizeof(script),
+             "logcat -v threadtime --pid=%d & L=$!; "
+             "while kill -0 %d 2>/dev/null; do sleep 1; done; sleep 5; kill $L",
+             getpid(), getpid());
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fd, STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, fd, STDERR_FILENO);
+    char* argv[] = {const_cast<char*>("sh"), const_cast<char*>("-c"), script, nullptr};
+    pid_t pid;
+    int rc = posix_spawn(&pid, "/system/bin/sh", &fa, nullptr, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(fd);
+    if (rc == 0)
+        LOGI(kTag, "logcat mirror started (pid %d)", pid);
+    else
+        LOGW(kTag, "logcat mirror failed to start: %s", strerror(rc));
+}
+
 void SetupLogFile(android_app* app) {
     time_t now = time(nullptr);
     tm t;
@@ -135,6 +160,16 @@ void SetupLogFile(android_app* app) {
     if (fd >= 0) {
         dsr::SetLogFileFd(fd);
         LOGI(kTag, "log file: Download/DSRNative/%s (via MediaStore)", name);
+        char logcat_name[80];
+        strftime(logcat_name, sizeof(logcat_name), "dsr_%Y%m%d_%H%M%S_logcat.txt", &t);
+        std::string why2;
+        int lfd = CreateDownloadViaMediaStore(app, logcat_name, &why2);
+        if (lfd >= 0) {
+            LOGI(kTag, "logcat file: Download/DSRNative/%s", logcat_name);
+            StartLogcatMirror(lfd);
+        } else {
+            LOGW(kTag, "logcat file not created: %s", why2.c_str());
+        }
         return;
     }
     failures.push_back("MediaStore Download/DSRNative: " + why);
@@ -264,7 +299,30 @@ int32_t OnInput(android_app*, AInputEvent* ev) {
     return 0;
 }
 
+const char* CmdName(int32_t cmd) {
+    switch (cmd) {
+        case APP_CMD_INPUT_CHANGED: return "INPUT_CHANGED";
+        case APP_CMD_INIT_WINDOW: return "INIT_WINDOW";
+        case APP_CMD_TERM_WINDOW: return "TERM_WINDOW";
+        case APP_CMD_WINDOW_RESIZED: return "WINDOW_RESIZED";
+        case APP_CMD_WINDOW_REDRAW_NEEDED: return "WINDOW_REDRAW_NEEDED";
+        case APP_CMD_CONTENT_RECT_CHANGED: return "CONTENT_RECT_CHANGED";
+        case APP_CMD_GAINED_FOCUS: return "GAINED_FOCUS";
+        case APP_CMD_LOST_FOCUS: return "LOST_FOCUS";
+        case APP_CMD_CONFIG_CHANGED: return "CONFIG_CHANGED";
+        case APP_CMD_LOW_MEMORY: return "LOW_MEMORY";
+        case APP_CMD_START: return "START";
+        case APP_CMD_RESUME: return "RESUME";
+        case APP_CMD_SAVE_STATE: return "SAVE_STATE";
+        case APP_CMD_PAUSE: return "PAUSE";
+        case APP_CMD_STOP: return "STOP";
+        case APP_CMD_DESTROY: return "DESTROY";
+        default: return "?";
+    }
+}
+
 void OnCmd(android_app* app, int32_t cmd) {
+    LOGI(kTag, "lifecycle: %s", CmdName(cmd));
     switch (cmd) {
         case APP_CMD_INIT_WINDOW:
             LOGI(kTag, "window ready %p", app->window);
@@ -297,5 +355,5 @@ void android_main(android_app* app) {
             if (app->destroyRequested) break;
         }
     }
-    LOGI(kTag, "activity destroyed");
+    LOGI(kTag, "activity destroyed (android_main returning)");
 }
