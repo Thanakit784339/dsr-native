@@ -281,6 +281,11 @@ struct Image {
     VkFormatFeatureFlags features = 0;
     bool written = false;  // has the GPU (or an upload) put anything in it
     bool uploaded = false;
+    // Contents came from game memory (not rendered by the GPU): re-uploaded when the game rewrites the
+    // memory (e.g. video frames). Checked at most once per command list via a sparse hash.
+    bool cpu_source = false;
+    uint64_t sample_hash = 0;
+    uint64_t checked_in_list = 0;
     std::map<std::vector<uint32_t>, VkImageView> views;
 };
 
@@ -325,6 +330,7 @@ public:
         std::lock_guard<std::mutex> lk(m_);
         if (!EnsureDevice()) return;
         ResetTransient();
+        list_counter_++;
         for (const Cmd& c : cmds) {
             switch (c.type) {
                 case CmdType::SetRenderTargets:
@@ -350,7 +356,7 @@ public:
                     break;
                 case CmdType::ClearDepthStencil: ClearDepth(c); break;
                 case CmdType::CopyTexture: {
-                    Image* src = GetImage(c.src, false);
+                    Image* src = GetImage(c.src, true);  // a CPU-written source (video frames) is refreshed
                     Image* dst = GetImage(c.dst, false);
                     if (!src || !dst || src == dst) break;
                     Begin();
@@ -367,6 +373,9 @@ public:
                 }
                 case CmdType::BindProgram: {
                     auto code = std::static_pointer_cast<const ShaderCode>(c.obj);
+                    if (program_binds_logged_.insert(c.index * 16 + (code ? code->stage + 1 : 0)).second &&
+                        program_binds_logged_.size() <= 12)
+                        LOGI(kTag, "program bind: stage bits 0x%x, program stage %d", c.index, code ? code->stage : -1);
                     for (int s = 0; s < 2; s++)
                         if (c.index & (1 << s)) st_.program[s] = (code && code->stage == s) ? code : nullptr;
                     break;
@@ -857,7 +866,17 @@ private:
         Image* img = FindImage(t);
         if (!img) img = CreateImage(t);
         if (!img) return nullptr;
-        if (upload && !img->written && !img->uploaded) Upload(*img, t);
+        if (upload && !img->written && !img->uploaded) {
+            Upload(*img, t);
+        } else if (upload && img->cpu_source && img->checked_in_list != list_counter_) {
+            img->checked_in_list = list_counter_;
+            if (SampleHash(t) != img->sample_hash) {
+                Upload(*img, t);
+                if (++reuploads_ <= 8 || reuploads_ % 300 == 0)
+                    LOGI(kTag, "texture %dx%d format %d changed in game memory: re-uploaded (%llu so far)", img->width,
+                         img->height, img->nvn_format, (unsigned long long)reuploads_);
+            }
+        }
         return img;
     }
 
@@ -937,9 +956,26 @@ private:
         img = Image{};
     }
 
+    // Cheap change detector for game-memory textures: 64 bytes at 64 spots plus both ends.
+    uint64_t SampleHash(const TexRef& t) {
+        const size_t total = ComputeLayout(t.tex).total;
+        if (!total || !GuestRangeValid(t.addr, total)) return 0;
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(t.addr);
+        uint64_t h = Fnv(p, std::min<size_t>(256, total));
+        h = Fnv(p + total - std::min<size_t>(256, total), std::min<size_t>(256, total), h);
+        for (size_t i = 1; i < 64; i++) {
+            size_t off = total / 64 * i;
+            h = Fnv(p + off, std::min<size_t>(64, total - off), h);
+        }
+        return h;
+    }
+
     // Fills a sampled texture from game memory: deswizzle each level/layer into the stream, then copy.
     void Upload(Image& img, const TexRef& t) {
         img.uploaded = true;
+        img.cpu_source = true;
+        img.sample_hash = SampleHash(t);
+        img.checked_in_list = list_counter_;
         const TextureLayout layout = ComputeLayout(t.tex);
         if (!GuestRangeValid(t.addr, layout.total)) {
             LogOnce("upload-range", "texture %dx%d format %d: storage outside known memory, not uploaded",
@@ -1138,6 +1174,7 @@ private:
         VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdClearColorImage(cmd_, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &range);
         img.written = true;
+        img.cpu_source = false;
         if (kind == kClearFloat && clear_colors_logged_ < 16) {
             float f[4];
             memcpy(f, color, sizeof(f));
@@ -1166,6 +1203,7 @@ private:
         VkImageSubresourceRange range{a, 0, 1, 0, 1};
         vkCmdClearDepthStencilImage(cmd_, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &range);
         img->written = true;
+        img->cpu_source = false;
     }
 
     void CopyImage(Image& src, const CopyRegion& sr, Image& dst, const CopyRegion& dr, int flags) {
@@ -1208,6 +1246,7 @@ private:
             return;
         }
         dst.written = dst.written || src.written;
+        dst.cpu_source = false;
         if (copies_logged_ < 16) {
             copies_logged_++;
             LOGI(kTag, "copy %dx%d (format %d) -> %dx%d (format %d), flags 0x%x", sw, sh, src.nvn_format, dw, dh,
@@ -1250,6 +1289,7 @@ private:
         vkCmdCopyBufferToImage(cmd_, stream_, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
         img->written = true;
         img->uploaded = true;
+        img->cpu_source = false;
         if (b2t_logged_++ < 8)
             LOGI(kTag, "buffer -> texture %dx%d at %d,%d (format %d)", w, h, r.x, r.y, img->nvn_format);
     }
@@ -1293,6 +1333,7 @@ private:
                 a.loadOp = c->written ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
                 a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
                 c->written = true;
+                c->cpu_source = false;
             }
             atts.push_back(a);
         }
@@ -1305,6 +1346,7 @@ private:
             da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             da.clearValue.depthStencil = {1.0f, 0};
             depth->written = true;
+            depth->cpu_source = false;
         }
         VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
         ri.renderArea = {{0, 0}, {w, h}};
@@ -1456,7 +1498,7 @@ private:
     void Draw(const DrawParams& p) {
         if (p.count <= 0 || p.instances <= 0) return;
         if (!begin_rendering_) return Skip("no dynamic rendering");
-        if (!st_.program[0] || !st_.program[1]) return Skip("no vertex+pixel program bound");
+        if (!st_.program[0]) return Skip("no vertex program bound");
         const DeviceModes modes = GetDeviceModes();
 
         // ---- vertex layout and shader options --------------------------------------------------------------
@@ -1469,8 +1511,9 @@ private:
         }
         fopt.alpha_func = st_.color.alpha_func;
         Shader* vs = GetShader(*st_.program[0], vopt);
-        Shader* fs = GetShader(*st_.program[1], fopt);
-        if (!vs->ok || !fs->ok) return Skip("shader not translated");
+        // No pixel program: a depth-only pass (shadow maps, depth prepass). Draw with the vertex stage only.
+        Shader* fs = st_.program[1] ? GetShader(*st_.program[1], fopt) : &no_fragment_;
+        if (!vs->ok || (st_.program[1] && !fs->ok)) return Skip("shader not translated");
 
         VertexInput vin;
         uint32_t used_streams = 0;
@@ -1568,6 +1611,7 @@ private:
         const VkDeviceSize ubo_align = std::max<VkDeviceSize>(16, props_.limits.minUniformBufferOffsetAlignment);
         for (int stage = 0; stage < 2; stage++) {
             const shader::ShaderInfo& info = stage == 0 ? vs->info : fs->info;
+            if (!st_.program[stage]) continue;
             const ShaderCode& code = *st_.program[stage];
             for (uint32_t n = 0; n < 18; n++) {
                 if (!(info.cbuf_mask >> n & 1)) continue;
@@ -1834,6 +1878,7 @@ private:
         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
         stages[1].module = fs->module;
         stages[1].pName = "main";
+        const bool has_fragment = fs->module != VK_NULL_HANDLE;
         VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         vi.vertexBindingDescriptionCount = uint32_t(vin.bindings.size());
         vi.pVertexBindingDescriptions = vin.bindings.data();
@@ -1883,7 +1928,7 @@ private:
             b.srcAlphaBlendFactor = BlendFactor(bs.src_a);
             b.dstAlphaBlendFactor = BlendFactor(bs.dst_a);
             b.alphaBlendOp = BlendOp(bs.eq_a);
-            b.colorWriteMask = (st_.channel.mask >> (4 * i)) & 0xF;
+            b.colorWriteMask = has_fragment ? ((st_.channel.mask >> (4 * i)) & 0xF) : 0;
         }
         VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         cb.attachmentCount = uint32_t(blend.size());
@@ -1901,7 +1946,7 @@ private:
         rinfo.stencilAttachmentFormat = has_stencil ? depth_format : VK_FORMAT_UNDEFINED;
         VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         ci.pNext = &rinfo;
-        ci.stageCount = 2;
+        ci.stageCount = has_fragment ? 2 : 1;
         ci.pStages = stages;
         ci.pVertexInputState = &vi;
         ci.pInputAssemblyState = &ia;
@@ -2029,6 +2074,7 @@ private:
     std::vector<VkImage> sc_images_;
 
     DrawState st_;
+    Shader no_fragment_;  // stands in for an absent pixel program (ok = false, no module)
     std::unordered_map<uint64_t, Image> images_;
     std::unordered_map<int, std::pair<VkFormat, VkFormatFeatureFlags>> format_cache_;
     std::unordered_map<VkFormat, bool> vertex_format_ok_;
@@ -2039,13 +2085,13 @@ private:
     std::map<std::vector<uint32_t>, VkSampler> samplers_;
 
     // diagnostics
-    uint64_t presented_ = 0, drawn_ = 0;
+    uint64_t presented_ = 0, drawn_ = 0, list_counter_ = 0, reuploads_ = 0;
     int swapchains_created_ = 0, images_created_ = 0, clear_colors_logged_ = 0, copies_logged_ = 0,
         target_sets_logged_ = 0, shaders_translated_ = 0, shader_failures_logged_ = 0, uploads_ = 0, flushes_ = 0,
         b2t_logged_ = 0, constants_logged_ = 0, handles_logged_ = 0;
     bool logged_first_image_ = false;
     std::map<std::string, uint64_t> skipped_;
-    std::set<int> unknown_formats_;
+    std::set<int> unknown_formats_, program_binds_logged_;
     std::map<int, Image*> fallbacks_;
     std::set<uint64_t> logged_clears_, logged_targets_;
     std::set<std::string> logged_once_, missing_ubo_logged_, ubo_binds_logged_;

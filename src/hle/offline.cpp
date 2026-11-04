@@ -7,6 +7,11 @@
 #include <cerrno>
 #include <cstring>
 
+#include <mutex>
+#include <string>
+#include <algorithm>
+#include "common/platform.h"
+#include "arch/arch.h"
 #include "common/log.h"
 #include "hle/os/os.h"
 #include "hle/registry.h"
@@ -267,25 +272,101 @@ HLE_FUNC(_ZN2nn5swkbd12ShowKeyboardEPNS0_6StringERKNS0_15ShowKeyboardArgE, uint3
 }
 HLE_FUNC(_ZN2nn5swkbd9InputText3SetEPKDs, void, swkbd_InputTextSet, (void*, const char16_t*)) {}
 HLE_FUNC(dsr_swkbd_nop, void, swkbd_Nop, ()) {}
+
+// ---- inline keyboard ------------------------------------------------------------------------------------
+// The game drives nn::swkbd::InlineKeyboard: Initialize, register callbacks, Launch + Appear when it wants
+// text, then Calc() every frame. We show an Android text dialog on Appear and, from Calc() (on the game's
+// own thread), invoke the game's "decided enter" or "decided cancel" callback with the result.
+// DecidedEnterArg as this game reads it: UTF-16 text inline at offset 0, length in characters at 0x3ec.
+namespace {
+struct InlineKeyboardState {
+    std::mutex m;
+    const void* on_finished_initialize = nullptr;
+    const void* on_decided_enter = nullptr;
+    const void* on_decided_cancel = nullptr;
+    bool initialize_pending = false;
+    bool waiting_for_text = false;
+} g_ik;
+alignas(16) uint8_t g_decided_enter_arg[0x400];
+constexpr size_t kDecidedTextChars = 0x3ec / 2;
+}  // namespace
 HLE_ALIAS(_ZN2nn5swkbd14InlineKeyboardC1Ev, swkbd_Nop);
 HLE_ALIAS(_ZN2nn5swkbd14InlineKeyboardD1Ev, swkbd_Nop);
-HLE_ALIAS(_ZN2nn5swkbd14InlineKeyboard8FinalizeEv, swkbd_Nop);
-HLE_ALIAS(_ZN2nn5swkbd14InlineKeyboard11SetUtf8ModeEb, swkbd_Nop);
+HLE_FUNC(_ZN2nn5swkbd14InlineKeyboard8FinalizeEv, void, swkbd_IK_Finalize, (void*)) {
+    std::lock_guard<std::mutex> lk(g_ik.m);
+    g_ik.waiting_for_text = false;
+    g_ik.initialize_pending = false;
+}
+HLE_ALIAS(_ZN2nn5swkbd14InlineKeyboard11SetUtf8ModeEb, swkbd_Nop);  // the game uses UTF-16
 HLE_ALIAS(_ZN2nn5swkbd14InlineKeyboard12SetCursorPosEi, swkbd_Nop);
 HLE_ALIAS(_ZN2nn5swkbd14InlineKeyboard12SetInputTextERKNS0_9InputTextE, swkbd_Nop);
 HLE_ALIAS(_ZN2nn5swkbd14InlineKeyboard13SetWindowModeENS1_10WindowModeE, swkbd_Nop);
 HLE_ALIAS(_ZN2nn5swkbd14InlineKeyboard14SetKeytopScaleEf, swkbd_Nop);
 HLE_ALIAS(_ZN2nn5swkbd14InlineKeyboard18SetKeytopTranslateEff, swkbd_Nop);
 HLE_ALIAS(_ZN2nn5swkbd14InlineKeyboard22SetMovedCursorCallbackEPFvPKNS0_14MovedCursorArgEE, swkbd_Nop);
-HLE_ALIAS(_ZN2nn5swkbd14InlineKeyboard23SetDecidedEnterCallbackEPFvPKNS0_15DecidedEnterArgEE, swkbd_Nop);
 HLE_ALIAS(_ZN2nn5swkbd14InlineKeyboard24SetChangedStringCallbackEPFvPKNS0_16ChangedStringArgEE, swkbd_Nop);
-HLE_ALIAS(_ZN2nn5swkbd14InlineKeyboard24SetDecidedCancelCallbackEPFvvE, swkbd_Nop);
 HLE_ALIAS(_ZN2nn5swkbd14InlineKeyboard27SetFinishedKeyboardCallbackEPFvvE, swkbd_Nop);
-HLE_ALIAS(_ZN2nn5swkbd14InlineKeyboard29SetFinishedInitializeCallbackEPFvvE, swkbd_Nop);
-HLE_ALIAS(_ZN2nn5swkbd14InlineKeyboard6AppearERKNS0_9AppearArgE, swkbd_Nop);
+HLE_FUNC(_ZN2nn5swkbd14InlineKeyboard23SetDecidedEnterCallbackEPFvPKNS0_15DecidedEnterArgEE, void,
+         swkbd_IK_SetDecidedEnter, (void*, const void* fn)) {
+    std::lock_guard<std::mutex> lk(g_ik.m);
+    g_ik.on_decided_enter = fn;
+}
+HLE_FUNC(_ZN2nn5swkbd14InlineKeyboard24SetDecidedCancelCallbackEPFvvE, void, swkbd_IK_SetDecidedCancel,
+         (void*, const void* fn)) {
+    std::lock_guard<std::mutex> lk(g_ik.m);
+    g_ik.on_decided_cancel = fn;
+}
+HLE_FUNC(_ZN2nn5swkbd14InlineKeyboard29SetFinishedInitializeCallbackEPFvvE, void, swkbd_IK_SetFinishedInit,
+         (void*, const void* fn)) {
+    std::lock_guard<std::mutex> lk(g_ik.m);
+    g_ik.on_finished_initialize = fn;
+}
 HLE_FUNC(_ZN2nn5swkbd14InlineKeyboard10InitializeEPv, bool, swkbd_IK_Initialize, (void*, void*)) { return true; }
-HLE_FUNC(_ZN2nn5swkbd14InlineKeyboard6LaunchEv, bool, swkbd_IK_Launch, (void*)) { return false; }
-HLE_FUNC(_ZN2nn5swkbd14InlineKeyboard4CalcEv, uint32_t, swkbd_IK_Calc, (void*)) { return 0; }
+HLE_FUNC(_ZN2nn5swkbd14InlineKeyboard6LaunchEv, bool, swkbd_IK_Launch, (void*)) {
+    std::lock_guard<std::mutex> lk(g_ik.m);
+    g_ik.initialize_pending = true;
+    return true;
+}
+HLE_FUNC(_ZN2nn5swkbd14InlineKeyboard6AppearERKNS0_9AppearArgE, void, swkbd_IK_Appear, (void*, const void*)) {
+    LOGI("swkbd", "keyboard requested: showing the text dialog");
+    bool shown = dsr::platform::RequestText("Name", u"", 16);
+    std::lock_guard<std::mutex> lk(g_ik.m);
+    g_ik.waiting_for_text = true;
+    if (!shown) dsr::platform::DeliverText(false, u"");  // no dialog: report a cancel
+}
+HLE_FUNC(_ZN2nn5swkbd14InlineKeyboard4CalcEv, uint32_t, swkbd_IK_Calc, (void*)) {
+    const void* init_cb = nullptr;
+    const void* enter_cb = nullptr;
+    const void* cancel_cb = nullptr;
+    bool ok = false;
+    std::u16string text;
+    {
+        std::lock_guard<std::mutex> lk(g_ik.m);
+        if (g_ik.initialize_pending) {
+            g_ik.initialize_pending = false;
+            init_cb = g_ik.on_finished_initialize;
+        }
+        if (g_ik.waiting_for_text && dsr::platform::TakeText(&ok, &text)) {
+            g_ik.waiting_for_text = false;
+            if (ok)
+                enter_cb = g_ik.on_decided_enter;
+            else
+                cancel_cb = g_ik.on_decided_cancel;
+        }
+    }
+    if (init_cb) dsr::arch::GuestCall<void>(init_cb);
+    if (enter_cb) {
+        memset(g_decided_enter_arg, 0, sizeof(g_decided_enter_arg));
+        const size_t n = std::min(text.size(), kDecidedTextChars - 1);
+        memcpy(g_decided_enter_arg, text.data(), n * 2);
+        const int32_t len = int32_t(n);
+        memcpy(g_decided_enter_arg + 0x3ec, &len, 4);
+        LOGI("swkbd", "name entered (%d characters)", len);
+        dsr::arch::GuestCall<void>(enter_cb, static_cast<const void*>(g_decided_enter_arg));
+    }
+    if (cancel_cb) dsr::arch::GuestCall<void>(cancel_cb);
+    return 0;
+}
 HLE_FUNC(_ZN2nn5swkbd14InlineKeyboard25GetImageMemoryRequirementEPmS2_, void, swkbd_IK_GetImageMemoryRequirement,
          (size_t * size, size_t* align)) {
     *size = 0x1000;

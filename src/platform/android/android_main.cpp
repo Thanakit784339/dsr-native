@@ -155,6 +155,50 @@ void StartLogcatMirror(int fd) {
 }
 
 android_app* g_app_for_files = nullptr;
+
+// Software keyboard: com.dsrnative.app.TextInput.show(activity, title, initial, maxLength). The class is
+// loaded through the activity's class loader because FindClass on a native thread only sees system
+// classes. The result comes back through TextInput.onResult (below).
+bool RequestTextImpl(const char* title, const std::u16string& initial, int max_length) {
+    android_app* app = g_app_for_files;
+    if (!app) return false;
+    JavaVM* vm = app->activity->vm;
+    JNIEnv* env = nullptr;
+    bool attached_here = false;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK || !env) {
+        if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) return false;
+        attached_here = true;
+    }
+    bool ok = false;
+    do {
+        jobject activity = app->activity->clazz;
+        jclass act_cls = env->GetObjectClass(activity);
+        jmethodID get_loader = env->GetMethodID(act_cls, "getClassLoader", "()Ljava/lang/ClassLoader;");
+        jobject loader = env->CallObjectMethod(activity, get_loader);
+        if (env->ExceptionCheck() || !loader) break;
+        jclass loader_cls = env->FindClass("java/lang/ClassLoader");
+        jmethodID load = env->GetMethodID(loader_cls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+        jstring name = env->NewStringUTF("com.dsrnative.app.TextInput");
+        auto cls = static_cast<jclass>(env->CallObjectMethod(loader, load, name));
+        env->DeleteLocalRef(name);
+        if (env->ExceptionCheck() || !cls) break;
+        jmethodID show = env->GetStaticMethodID(cls, "show", "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;I)V");
+        if (env->ExceptionCheck() || !show) break;
+        jstring jtitle = env->NewStringUTF(title);
+        jstring jinit = env->NewString(reinterpret_cast<const jchar*>(initial.data()), jsize(initial.size()));
+        env->CallStaticVoidMethod(cls, show, activity, jtitle, jinit, jint(max_length));
+        env->DeleteLocalRef(jtitle);
+        env->DeleteLocalRef(jinit);
+        ok = !env->ExceptionCheck();
+    } while (false);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    if (attached_here) vm->DetachCurrentThread();
+    if (!ok) LOGW(kTag, "could not show the text input dialog");
+    return ok;
+}
 int CreateUserFileImpl(const char* name, const char* mime_type) {
     if (!g_app_for_files) return -1;
     std::string why;
@@ -166,6 +210,7 @@ int CreateUserFileImpl(const char* name, const char* mime_type) {
 void SetupLogFile(android_app* app) {
     g_app_for_files = app;
     dsr::platform::SetCreateUserFile(&CreateUserFileImpl);
+    dsr::platform::SetRequestText(&RequestTextImpl);
     time_t now = time(nullptr);
     tm t;
     localtime_r(&now, &t);
@@ -381,4 +426,17 @@ void android_main(android_app* app) {
         }
     }
     LOGI(kTag, "activity destroyed (android_main returning)");
+}
+
+// Called by com.dsrnative.app.TextInput when the player confirms or cancels the dialog.
+extern "C" JNIEXPORT void JNICALL Java_com_dsrnative_app_TextInput_onResult(JNIEnv* env, jclass, jstring text,
+                                                                            jboolean ok) {
+    std::u16string s;
+    if (text) {
+        const jchar* chars = env->GetStringChars(text, nullptr);
+        s.assign(reinterpret_cast<const char16_t*>(chars), size_t(env->GetStringLength(text)));
+        env->ReleaseStringChars(text, chars);
+    }
+    LOGI("swkbd", "text input %s (%zu characters)", ok ? "confirmed" : "cancelled", s.size());
+    dsr::platform::DeliverText(ok, s);
 }
