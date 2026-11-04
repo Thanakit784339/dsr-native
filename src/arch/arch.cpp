@@ -4,7 +4,9 @@
 
 #include "common/log.h"
 
-extern "C" thread_local uint64_t dsr_host_x18 = 0;
+extern "C" {
+thread_local uint64_t dsr_host_x18 = 0;
+}
 
 #if !defined(__aarch64__)
 // Dry-run builds on non-arm64 hosts: guest code can be mapped and relocated but never executed.

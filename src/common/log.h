@@ -12,6 +12,11 @@ void Log(LogLevel lvl, const char* tag, const char* fmt, ...) __attribute__((for
 
 void SetLogLevel(LogLevel lvl);
 
+// Mirror every log line into a file (truncates it). Each line is written immediately (no buffering).
+bool OpenLogFile(const char* path);
+// File descriptor of the log file, or -1 (used by the crash handler, which must not allocate).
+int LogFileFd();
+
 }  // namespace dsr
 
 #define LOGT(tag, ...) ::dsr::Log(::dsr::LogLevel::Trace, tag, __VA_ARGS__)

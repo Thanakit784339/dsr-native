@@ -69,8 +69,21 @@ Install the APK and launch it once (creates the folder), then:
 
 ```
 adb push DarkSoulsR/. /sdcard/Android/data/com.dsrnative.app/files/game/
-adb logcat -s "DSR/*"
 ```
+
+## Logs
+
+Every launch writes a log file to the phone's shared storage:
+
+```
+Download/DSRNative/dsr_YYYYMMDD_HHMMSS.txt
+```
+
+Open it with any file manager, or over USB from a PC (Internal storage → Download → DSRNative).
+It contains device info, every runtime message, and — if the app crashes — a crash report with the
+faulting address translated to `main+0x...` offsets (look these up in Ghidra with the ELF from
+`tools/mkelf.py`), registers and a frame-pointer backtrace. Lines are written immediately, so the
+file is complete even after a crash. The same output also goes to logcat (`adb logcat -s "DSR/*"`).
 
 ## Layout
 

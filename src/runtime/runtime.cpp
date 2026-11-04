@@ -9,6 +9,7 @@
 #include <map>
 
 #include "arch/arch.h"
+#include "common/crash.h"
 #include "common/log.h"
 #include "hle/os/os.h"
 #include "hle/registry.h"
@@ -88,6 +89,7 @@ bool LoadGame(const RuntimeConfig& cfg, std::string* err) {
     };
     resolver.unimplemented_entry = arch::UnimplementedEntry();
     if (!rt.main.Load(rt.main_nso, resolver, err)) return false;
+    RegisterCrashModule("main", rt.main.base(), rt.main.size());
 
     rt.guest_malloc = rt.main.Export("malloc");
     rt.guest_free = rt.main.Export("free");

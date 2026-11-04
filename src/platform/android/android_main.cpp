@@ -2,17 +2,24 @@
 //
 // Game files: copy the extracted game (the folder containing exefs/, dvdbnd0.bdt, ...) to
 //   /sdcard/Android/data/com.dsrnative.app/files/game/
-// Save data goes to .../files/save, caches to .../files/cache. Logs: `adb logcat -s 'DSR/*'`.
+// Save data goes to .../files/save, caches to .../files/cache.
+//
+// Logs: every run writes Download/DSRNative/dsr_<date>_<time>.txt on the phone's shared storage
+// (visible to file managers and over USB), plus logcat (`adb logcat -s 'DSR/*'`).
 #include <android/input.h>
 #include <android/log.h>
 #include <android_native_app_glue.h>
 #include <sys/stat.h>
+#include <sys/system_properties.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cmath>
 #include <string>
 #include <thread>
 
+#include "common/crash.h"
 #include "common/log.h"
 #include "hle/input.h"
 #include "hle/video.h"
@@ -29,6 +36,48 @@ bool FileExists(const std::string& p) {
     return stat(p.c_str(), &st) == 0;
 }
 
+std::string Prop(const char* name) {
+    char v[PROP_VALUE_MAX] = "";
+    __system_property_get(name, v);
+    return v;
+}
+
+// Opens the log file: Download/DSRNative/ first (reachable with a file manager on Android 11+), then
+// the app's own external folder as a fallback.
+void SetupLogFile(android_app* app) {
+    time_t now = time(nullptr);
+    tm t;
+    localtime_r(&now, &t);
+    char name[64];
+    strftime(name, sizeof(name), "dsr_%Y%m%d_%H%M%S.txt", &t);
+
+    std::string candidates[2];
+    const std::string shared_dir = "/storage/emulated/0/Download/DSRNative";
+    mkdir(shared_dir.c_str(), 0775);
+    candidates[0] = shared_dir + "/" + name;
+    std::string app_dir = app->activity->externalDataPath ? app->activity->externalDataPath : "";
+    if (!app_dir.empty()) candidates[1] = app_dir + "/" + name;
+
+    for (const std::string& path : candidates) {
+        if (path.empty()) continue;
+        if (dsr::OpenLogFile(path.c_str())) {
+            LOGI(kTag, "log file: %s", path.c_str());
+            return;
+        }
+    }
+    LOGW(kTag, "could not create a log file (logcat only)");
+}
+
+void LogDeviceInfo() {
+    LOGI(kTag, "device: %s %s (%s), Android %s (API %s), build %s", Prop("ro.product.manufacturer").c_str(),
+         Prop("ro.product.model").c_str(), Prop("ro.product.device").c_str(), Prop("ro.build.version.release").c_str(),
+         Prop("ro.build.version.sdk").c_str(), Prop("ro.build.display.id").c_str());
+    LOGI(kTag, "soc: %s %s, cpus: %ld, page size: %ld", Prop("ro.soc.manufacturer").c_str(), Prop("ro.soc.model").c_str(),
+         sysconf(_SC_NPROCESSORS_ONLN), sysconf(_SC_PAGESIZE));
+    long pages = sysconf(_SC_PHYS_PAGES);
+    LOGI(kTag, "ram: %ld MiB", pages > 0 ? long((int64_t(pages) * sysconf(_SC_PAGESIZE)) >> 20) : -1L);
+}
+
 void StartGame(android_app* app) {
     if (g_game_started.exchange(true)) return;
     std::string base = app->activity->externalDataPath ? app->activity->externalDataPath : "/sdcard";
@@ -38,8 +87,11 @@ void StartGame(android_app* app) {
     cfg.cache_dir = base + "/cache";
     mkdir(cfg.save_dir.c_str(), 0775);
     mkdir(cfg.cache_dir.c_str(), 0775);
+    LOGI(kTag, "game dir: %s", cfg.game_dir.c_str());
     if (!FileExists(cfg.game_dir + "/exefs/main")) {
         LOGE(kTag, "game files not found: expected %s/exefs/main", cfg.game_dir.c_str());
+        LOGE(kTag, "copy the extracted game folder (the one containing exefs/ and dvdbnd0.bdt) there, e.g.:");
+        LOGE(kTag, "  adb push DarkSoulsR/. %s/", cfg.game_dir.c_str());
         return;
     }
     std::thread([cfg] {
@@ -138,7 +190,10 @@ void OnCmd(android_app* app, int32_t cmd) {
 
 void android_main(android_app* app) {
     dsr::SetLogLevel(dsr::LogLevel::Debug);
+    SetupLogFile(app);
+    dsr::InstallCrashHandler();
     LOGI(kTag, "Dark Souls Remastered native runtime starting");
+    LogDeviceInfo();
     app->onAppCmd = OnCmd;
     app->onInputEvent = OnInput;
     while (!app->destroyRequested) {

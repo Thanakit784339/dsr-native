@@ -7,6 +7,7 @@
 #include <cstring>
 #include <string>
 
+#include "common/crash.h"
 #include "common/log.h"
 #include "runtime/runtime.h"
 
@@ -26,6 +27,7 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--list")) list = true;
         if (!strcmp(argv[i], "--verbose")) dsr::SetLogLevel(dsr::LogLevel::Debug);
     }
+    dsr::InstallCrashHandler();
     std::string err;
     if (!dsr::LoadGame(cfg, &err)) {
         LOGE("main", "load failed: %s", err.c_str());

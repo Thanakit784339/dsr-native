@@ -22,7 +22,7 @@ endif()
 add_library(dsrcore OBJECT ${DSR_CORE_SOURCES})
 target_include_directories(dsrcore PUBLIC src)
 target_compile_options(dsrcore PRIVATE
-    -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
+    -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-cast-function-type
     $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>)
 if(ANDROID)
     # abi.S reads the thread_local dsr_host_x18 through TLSDESC relocations, which needs real ELF TLS
