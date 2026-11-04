@@ -119,6 +119,10 @@ int RemoveTree(const std::string& path) {
 }
 }  // namespace
 
+namespace dsr::hle::fs {
+bool ResolveGuestPath(const char* guest, std::string* host) { return Resolve(guest, host); }
+}  // namespace dsr::hle::fs
+
 // ---- mounting ------------------------------------------------------------------------------------
 HLE_FUNC(_ZN2nn2fs22QueryMountRomCacheSizeEPm, uint32_t, fs_QueryMountRomCacheSize, (size_t * out)) {
     *out = 0x1000;  // no cache needed: reads go straight to the host filesystem

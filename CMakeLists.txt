@@ -40,7 +40,7 @@ if(ANDROID)
         src/platform/android/android_main.cpp
         ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c)
     target_include_directories(dsr PRIVATE ${ANDROID_NDK}/sources/android/native_app_glue)
-    target_link_libraries(dsr PRIVATE dsrcore android log aaudio)
+    target_link_libraries(dsr PRIVATE dsrcore android log aaudio mediandk)
     # Keep ANativeActivity_onCreate exported from the glue.
     target_link_options(dsr PRIVATE -u ANativeActivity_onCreate -Wl,-z,max-page-size=16384)
 else()

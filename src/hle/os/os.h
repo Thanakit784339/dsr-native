@@ -64,6 +64,9 @@ struct HostSystemEvent;
 void InitSystemEvent(void* system_event_type, bool auto_clear, bool signaled);
 void SignalSystemEvent(void* system_event_type);
 
+// Signals a guest nn::os::EventType from host code (e.g. a decoder callback thread).
+void SignalGuestEvent(void* event_type);
+
 // ---- MultiWait participation --------------------------------------------------------------------
 // Returns true if the object a holder refers to is currently signaled.
 bool IsEventSignaled(void* event_type);

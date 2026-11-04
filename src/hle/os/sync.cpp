@@ -294,6 +294,11 @@ HLE_FUNC(_ZN2nn2os11SignalEventEPNS0_9EventTypeE, void, nn_os_SignalEvent, (void
     BumpWaitEpoch();
 }
 HLE_ALIAS(nnosSignalEvent, nn_os_SignalEvent);
+namespace dsr::hle::os {
+void SignalGuestEvent(void* e) {
+    if (e) nn_os_SignalEvent(e);
+}
+}  // namespace dsr::hle::os
 
 HLE_FUNC(_ZN2nn2os9WaitEventEPNS0_9EventTypeE, void, nn_os_WaitEvent, (void* e)) { EventWait(e, -1); }
 HLE_ALIAS(nnosWaitEvent, nn_os_WaitEvent);
