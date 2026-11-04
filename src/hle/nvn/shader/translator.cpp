@@ -882,6 +882,42 @@ private:
             meta++;
         }
         Id sampled = b_.OpResult(SpvOpLoad, dc ? shadow_type_[slot] : tex_type_[slot], {var});
+        if (!dc && dim == TexDim::D2) {
+            // Plain gathers are done as four texel fetches (clamp to edge), which is what a gather returns by
+            // definition: Adreno returns zeros for gathers from 32-bit float textures.
+            b_.Capability(SpvCapabilityImageQuery);
+            Id image = b_.OpResult(SpvOpImage, tex_image_type_[slot], {sampled});
+            Id size_any = b_.OpResult(SpvOpImageQuerySizeLod, array ? t_v3i_ : t_v2i_, {image, b_.ConstInt(0)});
+            Id sx = b_.OpResult(SpvOpCompositeExtract, t_i32_, {size_any, 0});
+            Id sy = b_.OpResult(SpvOpCompositeExtract, t_i32_, {size_any, 1});
+            Id fx = b_.OpResult(SpvOpFSub, t_f32_, {b_.OpResult(SpvOpFMul, t_f32_, {c[0], b_.OpResult(SpvOpConvertSToF, t_f32_, {sx})}), b_.ConstFloat(0.5f)});
+            Id fy = b_.OpResult(SpvOpFSub, t_f32_, {b_.OpResult(SpvOpFMul, t_f32_, {c[1], b_.OpResult(SpvOpConvertSToF, t_f32_, {sy})}), b_.ConstFloat(0.5f)});
+            Id x0 = b_.OpResult(SpvOpConvertFToS, t_i32_, {b_.Glsl(t_f32_, G::kFloor, {fx})});
+            Id y0 = b_.OpResult(SpvOpConvertFToS, t_i32_, {b_.Glsl(t_f32_, G::kFloor, {fy})});
+            if (!operands.empty()) {  // texel offset
+                Id off = operands[0];
+                x0 = b_.OpResult(SpvOpIAdd, t_i32_, {x0, b_.OpResult(SpvOpCompositeExtract, t_i32_, {off, 0})});
+                y0 = b_.OpResult(SpvOpIAdd, t_i32_, {y0, b_.OpResult(SpvOpCompositeExtract, t_i32_, {off, 1})});
+            }
+            Id mx = b_.OpResult(SpvOpISub, t_i32_, {sx, b_.ConstInt(1)});
+            Id my = b_.OpResult(SpvOpISub, t_i32_, {sy, b_.ConstInt(1)});
+            auto clampi = [&](Id v, Id hi) { return b_.Glsl(t_i32_, G::kSClamp, {v, b_.ConstInt(0), hi}); };
+            Id xs[2] = {clampi(x0, mx), clampi(b_.OpResult(SpvOpIAdd, t_i32_, {x0, b_.ConstInt(1)}), mx)};
+            Id ys[2] = {clampi(y0, my), clampi(b_.OpResult(SpvOpIAdd, t_i32_, {y0, b_.ConstInt(1)}), my)};
+            Id li = array ? b_.OpResult(SpvOpConvertFToS, t_i32_, {layer}) : 0;
+            // Gather order: (x0,y1), (x1,y1), (x1,y0), (x0,y0).
+            const int order[4][2] = {{0, 1}, {1, 1}, {1, 0}, {0, 0}};
+            Id comps[4];
+            for (int k = 0; k < 4; k++) {
+                Id pc = array ? b_.OpResult(SpvOpCompositeConstruct, t_v3i_, {xs[order[k][0]], ys[order[k][1]], li})
+                              : b_.OpResult(SpvOpCompositeConstruct, t_v2i_, {xs[order[k][0]], ys[order[k][1]]});
+                Id t = b_.OpResult(SpvOpImageFetch, t_v4f_, {image, pc, uint32_t(SpvImageOperandsLodMask), b_.ConstInt(0)});
+                comps[k] = b_.OpResult(SpvOpCompositeExtract, t_f32_, {t, component});
+            }
+            Id r = b_.OpResult(SpvOpCompositeConstruct, t_v4f_, {comps[0], comps[1], comps[2], comps[3]});
+            WriteMasked(dest, mask, r);
+            return;
+        }
         std::vector<uint32_t> args = {sampled, coords};
         if (dc)
             args.push_back(GetF(meta++));

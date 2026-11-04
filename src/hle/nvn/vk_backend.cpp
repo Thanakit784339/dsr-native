@@ -528,6 +528,9 @@ public:
         if (!pass_written_.empty())
             LOGI(kTag, "capture pass %u: %u draws, last fs %016llx, last textures:%s", capture_pass_, pass_draws_,
                  (unsigned long long)pass_fs_hash_, pass_tex_desc_.empty() ? " none" : pass_tex_desc_.c_str());
+        if (!pass_written_.empty() && !pass_ubo_desc_.empty())
+            LOGI(kTag, "capture pass %u fragment constants:%s", capture_pass_, pass_ubo_desc_.c_str());
+        pass_ubo_desc_.clear();
         for (Image* img : pass_written_) CaptureImage(*img);
         pass_written_.clear();
         pass_draws_ = 0;
@@ -555,9 +558,11 @@ public:
         }
         if (depth) raw_bpp = HasDepth(img.nvn_format) ? 4 : 0;
         if (raw_bpp && img.type == VK_IMAGE_TYPE_2D && it.src_w * it.src_h <= 1280u * 720u) {
+            // Array images: up to 4 layers, stacked vertically (flag 16).
+            const uint32_t layers = uint32_t(std::min(4, std::max(1, img.layers)));
             it.w = it.src_w;
-            it.h = it.src_h;
-            it.flags = (depth ? 4u : 8u) | (uint32_t(img.vk_format) << 8);
+            it.h = it.src_h * layers;
+            it.flags = (depth ? 4u : 8u) | (layers > 1 ? 16u : 0u) | (uint32_t(img.vk_format) << 8);
             it.raw_bpp = raw_bpp;
             VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             bci.size = VkDeviceSize(it.w) * it.h * raw_bpp;
@@ -575,8 +580,8 @@ public:
             const VkImageLayout restore = img.layout;
             Transition(img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             VkBufferImageCopy c{};
-            c.imageSubresource = {depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT) : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1};
-            c.imageExtent = {it.w, it.h, 1};
+            c.imageSubresource = {depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT) : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, layers};
+            c.imageExtent = {it.w, it.src_h, 1};
             vkCmdCopyImageToBuffer(cmd_, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, it.buffer, 1, &c);
             if (restore != VK_IMAGE_LAYOUT_UNDEFINED) Transition(img, restore);
             capture_items_.push_back(it);
@@ -2099,6 +2104,22 @@ private:
                     MissingUniform(stage, n);
                 }
                 ubo_writes.push_back({uint32_t(stage), n, bi});
+                if (capture_active_ && stage == 1 && src && size && n >= kCbufBase) {
+                    if (ubo_desc_draw_ != drawn_) {
+                        pass_ubo_desc_.clear();
+                        ubo_desc_draw_ = drawn_;
+                    }
+                    char d[64];
+                    snprintf(d, sizeof(d), " c%u(%zu B):", n, size);
+                    pass_ubo_desc_ += d;
+                    const size_t nf = std::min<size_t>(size / 4, 32);
+                    for (size_t k = 0; k < nf; k++) {
+                        float f;
+                        memcpy(&f, src + k * 4, 4);
+                        snprintf(d, sizeof(d), " %g", f);
+                        pass_ubo_desc_ += d;
+                    }
+                }
             }
         }
 
@@ -2700,7 +2721,8 @@ private:
     uint64_t pass_fs_hash_ = 0, last_list_draws_ = 0, list_start_draws_ = 0;
     std::chrono::steady_clock::time_point next_capture_;
     std::vector<Image*> pass_written_;
-    std::string pass_tex_desc_;
+    std::string pass_tex_desc_, pass_ubo_desc_;
+    uint64_t ubo_desc_draw_ = ~0ull;
     uint64_t tex_desc_draw_ = ~0ull;
     std::vector<CaptureItem> capture_items_;
     VkExtent2D no_attachment_extent_{0, 0};  // render area for a draw with no attachments (storage-only)
