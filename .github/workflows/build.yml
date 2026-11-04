@@ -10,17 +10,19 @@ jobs:
   android-apk:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
-
+      # GitHub's Ubuntu runners ship the Android SDK at $ANDROID_HOME; just add what we need.
       - name: Install NDK and CMake
-        run: sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0"
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0"
 
       # The repo has no Gradle wrapper jar; use a pinned Gradle instead.
       - uses: gradle/actions/setup-gradle@v4
@@ -46,7 +48,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install toolchain
         run: sudo apt-get update && sudo apt-get install -y clang cmake
@@ -58,4 +60,4 @@ jobs:
         run: cmake --build build -j
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure -V
