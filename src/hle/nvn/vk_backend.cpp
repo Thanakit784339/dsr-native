@@ -18,6 +18,7 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -479,6 +480,7 @@ public:
                     }
                     break;
                 case CmdType::Draw: Draw(c.draw); break;
+                case CmdType::FenceSync: break;  // signalled by the queue once the list has run
             }
         }
         if (capture_active_) CaptureEndOfPass();
@@ -503,9 +505,30 @@ public:
         uint32_t w = 0, h = 0, src_w = 0, src_h = 0, nvn_format = 0, draws = 0, pass = 0, flags = 0, raw_bpp = 4;
         uint64_t fs_hash = 0;
     };
+    void RequestCapture(int delay_s) override {
+        capture_request_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch()).count() + int64_t(delay_s) * 1000;
+    }
     void MaybeArmCapture() {
-        if (captures_done_ >= 6 || capture_active_) return;
+        if (capture_active_) return;
         const auto now = std::chrono::steady_clock::now();
+        const int64_t req = capture_request_ms_.load();
+        if (req && std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() >= req) {
+            capture_request_ms_ = 0;
+            capture_active_ = true;
+            capture_pass_ = 0;
+            pass_written_.clear();
+            pass_draws_ = 0;
+            query_pass_.clear();
+            if (query_pool_) {
+                Begin();
+                EndRendering();
+                vkCmdResetQueryPool(cmd_, query_pool_, 0, kMaxQueries);
+            }
+            LOGI(kTag, "frame capture (requested): recording this frame's passes");
+            return;
+        }
+        if (captures_done_ >= 6) return;
         if (!capture_clock_started_) {
             if (last_list_draws_ < 100) return;  // wait for real 3D frames
             capture_clock_started_ = true;
@@ -2767,6 +2790,7 @@ private:
     // frame capture
     bool capture_active_ = false, capture_clock_started_ = false;
     int captures_done_ = 0;
+    std::atomic<int64_t> capture_request_ms_{0};
     uint32_t capture_pass_ = 0, pass_draws_ = 0;
     uint64_t pass_fs_hash_ = 0, last_list_draws_ = 0, list_start_draws_ = 0;
     std::chrono::steady_clock::time_point next_capture_;

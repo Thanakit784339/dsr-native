@@ -10,9 +10,13 @@
 // record time, so later Finalize/re-Initialize of the NVN object does not affect recorded work.
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 
 #include "common/log.h"
@@ -379,6 +383,112 @@ void CopyBufferToTexture(void* cb, uint64_t src, const void* dst, const void* /*
 }
 
 // ---- queue ------------------------------------------------------------------------------------------------
+// ---- render thread --------------------------------------------------------------------------------------------
+class GpuQueue {
+public:
+    uint64_t Enqueue(std::function<void()> task) {
+        if (!Threaded()) {
+            task();
+            std::lock_guard<std::mutex> lk(m_);
+            completed_ = ++submitted_;
+            return submitted_;
+        }
+        std::unique_lock<std::mutex> lk(m_);
+        if (!thread_.joinable()) thread_ = std::thread([this] { Run(); });
+        tasks_.push_back(std::move(task));
+        const uint64_t seq = ++submitted_;
+        cv_.notify_all();
+        return seq;
+    }
+    // Waits for task `seq`; false on timeout.
+    bool Wait(uint64_t seq, std::chrono::nanoseconds timeout = std::chrono::nanoseconds::max()) {
+        std::unique_lock<std::mutex> lk(m_);
+        auto done = [&] { return completed_ >= seq; };
+        if (timeout == std::chrono::nanoseconds::max()) {
+            done_cv_.wait(lk, done);
+            return true;
+        }
+        return done_cv_.wait_for(lk, timeout, done);
+    }
+    uint64_t Completed() {
+        std::lock_guard<std::mutex> lk(m_);
+        return completed_;
+    }
+    uint64_t Submitted() {
+        std::lock_guard<std::mutex> lk(m_);
+        return submitted_;
+    }
+
+private:
+    static bool Threaded() {
+#if defined(__ANDROID__)
+        return g_test_backend == nullptr;
+#else
+        return false;
+#endif
+    }
+    void Run() {
+        for (;;) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lk(m_);
+                cv_.wait(lk, [&] { return !tasks_.empty(); });
+                task = std::move(tasks_.front());
+                tasks_.pop_front();
+            }
+            task();
+            {
+                std::lock_guard<std::mutex> lk(m_);
+                completed_++;
+            }
+            done_cv_.notify_all();
+        }
+    }
+    std::mutex m_;
+    std::condition_variable cv_, done_cv_;
+    std::deque<std::function<void()>> tasks_;
+    uint64_t submitted_ = 0, completed_ = 0;
+    std::thread thread_;
+};
+GpuQueue& Queue() {
+    static GpuQueue* q = new GpuQueue;  // never destroyed: the render thread lives as long as the process
+    return *q;
+}
+
+// NVNsync objects: the queue position after which each is signalled (absent or 0: signalled).
+std::mutex g_sync_mutex;
+std::unordered_map<const void*, uint64_t> g_sync_targets;
+
+void FenceSync(void* cb, void* sync, int /*condition*/, int /*flags*/) {
+    Cmd c;
+    c.type = CmdType::FenceSync;
+    c.src_addr = reinterpret_cast<uint64_t>(sync);
+    Append(cb, std::move(c));
+}
+bool SyncInitialize(void* sync, void* /*device*/) {
+    std::lock_guard<std::mutex> lk(g_sync_mutex);
+    g_sync_targets.erase(sync);
+    return true;
+}
+void SyncFinalize(void* sync) {
+    std::lock_guard<std::mutex> lk(g_sync_mutex);
+    g_sync_targets.erase(sync);
+}
+// NVNsyncWaitResult: 0 already signalled, 1 condition satisfied, 2 timeout expired.
+int SyncWait(const void* sync, uint64_t timeout_ns) {
+    uint64_t target = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_sync_mutex);
+        auto it = g_sync_targets.find(sync);
+        if (it != g_sync_targets.end()) target = it->second;
+    }
+    if (!target || Queue().Completed() >= target) return 0;
+    const auto timeout = timeout_ns >= uint64_t(INT64_MAX) ? std::chrono::nanoseconds::max()
+                                                           : std::chrono::nanoseconds(int64_t(timeout_ns));
+    return Queue().Wait(target, timeout) ? 1 : 2;
+}
+void QueueFinish(void* /*queue*/) { Queue().Wait(Queue().Submitted()); }
+
 void QueueSubmitCommands(void* /*queue*/, int n, const uint64_t* handles) {
     g_submit_calls++;
     for (int i = 0; i < n; i++) {
@@ -404,7 +514,14 @@ void QueueSubmitCommands(void* /*queue*/, int n, const uint64_t* handles) {
                 case CmdType::SetRenderTargets: g_stats.rt_binds++; break;
             }
         }
-        GetBackend().Execute(*list);
+        std::vector<const void*> fences;
+        for (const Cmd& c : *list)
+            if (c.type == CmdType::FenceSync) fences.push_back(reinterpret_cast<const void*>(c.src_addr));
+        const uint64_t seq = Queue().Enqueue([list] { GetBackend().Execute(*list); });
+        if (!fences.empty()) {
+            std::lock_guard<std::mutex> lk(g_sync_mutex);
+            for (const void* s : fences) g_sync_targets[s] = seq;
+        }
     }
 }
 
@@ -477,6 +594,8 @@ const Proc kProcs[] = {
     P("nvnCommandBufferGetCopyImageStride", GetCopyImageStride),
     P("nvnCommandBufferCopyBufferToTexture", CopyBufferToTexture),
     P("nvnQueueSubmitCommands", QueueSubmitCommands),
+    P("nvnCommandBufferFenceSync", FenceSync), P("nvnQueueFinish", QueueFinish),
+    P("nvnSyncInitialize", SyncInitialize), P("nvnSyncFinalize", SyncFinalize), P("nvnSyncWait", SyncWait),
 };
 #undef P
 
@@ -494,6 +613,10 @@ GpuStats& Stats() {
     g_stats.unknown_handles = g_unknown_handles.load();
     return g_stats;
 }
+
+uint64_t GpuEnqueue(std::function<void()> task) { return Queue().Enqueue(std::move(task)); }
+void GpuWait(uint64_t seq) { Queue().Wait(seq); }
+uint64_t GpuSubmitted() { return Queue().Submitted(); }
 
 Backend& GetBackend() {
     if (g_test_backend) return *g_test_backend;

@@ -431,7 +431,11 @@ void QueuePresentTexture(void* queue, void* window, int index) {
     next += frame;
 
     TexRef tex = WindowTexture(window, index);
-    GetBackend().Present(tex);
+    // Present on the render thread, after the frame's commands. At most two frames queued ahead.
+    static uint64_t presents[2] = {0, 0};
+    GpuWait(presents[0]);
+    presents[0] = presents[1];
+    presents[1] = GpuEnqueue([tex] { GetBackend().Present(tex); });
 
     static uint64_t frames_at_report = 0;
     uint64_t n = ++frames;
@@ -458,7 +462,6 @@ void QueuePresentTexture(void* queue, void* window, int index) {
 size_t CmdPlenty(const void*) { return 16u << 20; }
 
 // ---- sync ------------------------------------------------------------------------------------------------------
-int SyncWait(const void*, uint64_t timeout) { return 0; /* already signaled */ }
 
 // ---- window ------------------------------------------------------------------------------------------------------
 void WindowBuilderSetDefaults(void* b) { g_window_builders.Reset(b); }
@@ -574,14 +577,14 @@ const Proc kProcs[] = {
     P("nvnQueueBuilderSetComputeMemorySize", QueueBuilderSetComputeMemorySize),
     P("nvnQueueBuilderSetCommandFlushThreshold", Nop), P("nvnQueueBuilderSetQueueMemory", Nop),
     P("nvnQueueBuilderGetQueueMemorySize", QueueBuilderGetQueueMemorySize),
-    P("nvnQueueInitialize", QueueInitialize), P("nvnQueueFinalize", Nop), P("nvnQueueFlush", Nop), P("nvnQueueFinish", Nop), P("nvnQueueFenceSync", Nop), P("nvnQueueWaitSync", Nop),
+    P("nvnQueueInitialize", QueueInitialize), P("nvnQueueFinalize", Nop), P("nvnQueueFlush", Nop), P("nvnQueueFenceSync", Nop), P("nvnQueueWaitSync", Nop),
     P("nvnQueuePresentTexture", QueuePresentTexture),
     // command buffers (recording is a no-op)
     P("nvnCommandBufferInitialize", True), P("nvnCommandBufferFinalize", Nop),
     P("nvnCommandBufferGetCommandMemoryFree", CmdPlenty), P("nvnCommandBufferGetControlMemoryFree", CmdPlenty),
     P("nvnCommandBufferGetCommandMemorySize", CmdPlenty), P("nvnCommandBufferGetControlMemorySize", CmdPlenty),
     // sync
-    P("nvnSyncInitialize", True), P("nvnSyncFinalize", Nop), P("nvnSyncWait", SyncWait),
+    
     // window
     P("nvnWindowBuilderSetDefaults", WindowBuilderSetDefaults), P("nvnWindowBuilderSetDevice", Nop),
     P("nvnWindowBuilderSetNativeWindow", Nop), P("nvnWindowBuilderSetTextures", WindowBuilderSetTextures),

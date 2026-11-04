@@ -23,10 +23,12 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 
+#include "hle/nvn/backend.h"
 #include "common/log.h"
 #include "hle/fs.h"
 #include "hle/os/heap.h"
@@ -165,6 +167,7 @@ int ExSetDataSourcePath(void* self, const char* path) {
     media_status_t r = AMediaExtractor_setDataSourceFd(e->ex, e->fd, 0, st.st_size);
     LOGI(kTag, "Extractor::SetDataSource(%s): %s, %zu tracks", path, r == AMEDIA_OK ? "ok" : "FAILED",
          r == AMEDIA_OK ? AMediaExtractor_getTrackCount(e->ex) : size_t(0));
+    if (r == AMEDIA_OK) dsr::hle::nvn::GetBackend().RequestCapture(8);  // diagnostics: what a video frame shows
     return r == AMEDIA_OK ? kOk : kFail;
 #else
     LOGI(kTag, "Extractor::SetDataSource(%s): no media backend on this host (0 tracks)", path);
@@ -310,6 +313,9 @@ struct Decoder {
     std::deque<int> inputs;
     std::deque<OutputItem> outputs;
     std::unordered_map<int, OutputItem> held;  // output buffers handed to the game
+    uint64_t produced = 0, acquired = 0, released = 0, polls_empty = 0;  // statistics (logged)
+    int64_t last_pts = 0;
+    std::chrono::steady_clock::time_point last_report = std::chrono::steady_clock::now();
 #if defined(__ANDROID__)
     AMediaCodec* codec = nullptr;
 #endif
@@ -338,6 +344,7 @@ void OnOutput(AMediaCodec*, void* ud, int32_t index, AMediaCodecBufferInfo* info
     {
         std::lock_guard<std::mutex> lk(d->m);
         d->outputs.push_back({index, info->offset, info->size, info->presentationTimeUs, info->flags});
+        d->produced++;
     }
     dsr::hle::os::SignalGuestEvent(d->events.output_available);
 }
@@ -480,13 +487,24 @@ int DecSendInputBufferForDecode(void* self, int index, int offset, int size, int
 int DecAcquireOutputBufferIndex(void* self, int* index, int64_t* time_us, uint32_t* flags, int* size) {
     Decoder* d = Dec(self);
     std::lock_guard<std::mutex> lk(d->m);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - d->last_report > std::chrono::seconds(3)) {
+        d->last_report = now;
+        LOGI(kTag, "decoder type %d: %llu decoded, %llu taken by the game, %llu released, %zu waiting, %zu held, "
+             "%llu empty polls, last pts %.2f s", d->type, (unsigned long long)d->produced,
+             (unsigned long long)d->acquired, (unsigned long long)d->released, d->outputs.size(), d->held.size(),
+             (unsigned long long)d->polls_empty, d->last_pts / 1e6);
+    }
     if (d->outputs.empty()) {
+        d->polls_empty++;
         *index = -1;
         return kFail;
     }
     OutputItem o = d->outputs.front();
     d->outputs.pop_front();
     d->held[o.index] = o;
+    d->acquired++;
+    d->last_pts = o.time_us;
     *index = o.index;
     *time_us = o.time_us;
     *flags = o.flags;
@@ -522,6 +540,7 @@ int DecReleaseOutputBufferIndex(void* self, int index) {
     {
         std::lock_guard<std::mutex> lk(d->m);
         d->held.erase(index);
+        d->released++;
     }
     if (d->codec && index >= 0) AMediaCodec_releaseOutputBuffer(d->codec, size_t(index), false);
 #endif

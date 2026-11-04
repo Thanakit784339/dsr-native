@@ -4,6 +4,7 @@
 // null backend that only counts, so the recorder can be unit-tested on any host.
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -54,6 +55,7 @@ enum class CmdType : uint8_t {
     SetStencil,         // index: 0 ref, 1 write mask, 2 compare mask; stage: face; mask: value
     UpdateUniform,      // dst_addr; obj: std::vector<uint8_t>
     CopyBufferToTexture,// src_addr, dst, dst_region, flags, f[0] = row stride, f[1] = image stride
+    FenceSync,          // src_addr: the NVNsync, signalled once the list has executed (handled by the queue)
 };
 
 struct BufferRange {  // NVNbufferRange
@@ -106,6 +108,8 @@ public:
     // Show the window texture (null ref: nothing rendered yet).
     virtual void Present(const TexRef& texture) = 0;
     virtual const char* Name() const = 0;
+    // Diagnostics: capture a frame `delay_s` seconds from now (e.g. during a video). Thread-safe.
+    virtual void RequestCapture(int /*delay_s*/) {}
 };
 
 Backend& GetBackend();
@@ -124,5 +128,11 @@ struct GpuStats {
     uint64_t recordings = 0, submit_calls = 0, unknown_handles = 0;
 };
 GpuStats& Stats();
+
+// The queue: command lists and presents run in order on a render thread (Android), so the game records the
+// next frame while the previous one is executed. Inline (synchronous) on other hosts and in tests.
+uint64_t GpuEnqueue(std::function<void()> task);  // returns the task's sequence number
+void GpuWait(uint64_t seq);                         // until task `seq` (and all before it) has run
+uint64_t GpuSubmitted();
 
 }  // namespace dsr::hle::nvn
