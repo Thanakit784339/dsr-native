@@ -3,6 +3,7 @@
 //
 // Backends: AAudio on Android (blocking writes), or a real-time "null" sink elsewhere.
 #include <algorithm>
+#include <cstdlib>
 #include <condition_variable>
 #include <vector>
 #include <cstring>
@@ -117,7 +118,9 @@ private:
                 b = queued_.front();
             }
             const size_t frames = b->data_size / (sizeof(int16_t) * size_t(channels_));
-            Play(ToStereo(static_cast<const int16_t*>(b->data), frames), frames);
+            const int16_t* pcm = ToStereo(static_cast<const int16_t*>(b->data), frames);
+            Report(pcm, frames);
+            Play(pcm, frames);
             {
                 std::lock_guard<std::mutex> lk(m_);
                 queued_.pop_front();
@@ -151,6 +154,21 @@ private:
         return stereo_.data();
     }
 
+    // Every ~10 s of audio, log how many buffers were played and their peak level, so "no sound" can
+    // be told apart from "the game produces only silence".
+    void Report(const int16_t* pcm, size_t frames) {
+        for (size_t i = 0; i < frames * 2; i++) peak_ = std::max(peak_, std::abs(int(pcm[i])));
+        frames_played_ += frames;
+        buffers_played_++;
+        if (frames_played_ >= next_report_) {
+            LOGI(kTag, "audio out: %llu buffers, %.1f s played, peak level %d/32767 (%s)",
+                 (unsigned long long)buffers_played_, double(frames_played_) / kSampleRate, peak_,
+                 peak_ < 64 ? "silence" : "sound");
+            next_report_ = frames_played_ + 10 * kSampleRate;
+            peak_ = 0;
+        }
+    }
+
     void Play(const int16_t* pcm, size_t frames) {
 #if defined(__ANDROID__)
         if (stream_) {
@@ -174,6 +192,8 @@ private:
     void* event_;
     int channels_;
     std::vector<int16_t> stereo_;
+    uint64_t frames_played_ = 0, buffers_played_ = 0, next_report_ = 0;
+    int peak_ = 0;
     std::mutex m_;
     std::condition_variable cv_;
     std::deque<GuestBuffer*> queued_, released_;
