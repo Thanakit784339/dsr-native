@@ -1,6 +1,18 @@
 cmake_minimum_required(VERSION 3.22)
 project(dsr_native LANGUAGES C CXX ASM)
 
+# Build identifier logged at startup: the commit CI built (GITHUB_SHA) or the local checkout.
+set(DSR_BUILD_ID "$ENV{GITHUB_SHA}")
+if(NOT DSR_BUILD_ID)
+  execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                  OUTPUT_VARIABLE DSR_BUILD_ID OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
+if(NOT DSR_BUILD_ID)
+  set(DSR_BUILD_ID "unknown")
+endif()
+string(SUBSTRING "${DSR_BUILD_ID}" 0 7 DSR_BUILD_ID)
+add_compile_definitions(DSR_BUILD_ID="${DSR_BUILD_ID}")
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)

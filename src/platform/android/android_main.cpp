@@ -274,6 +274,7 @@ void SetupLogFile(android_app* app) {
 }
 
 void LogDeviceInfo() {
+    LOGI(kTag, "DSR Native build %s", DSR_BUILD_ID);
     LOGI(kTag, "device: %s %s (%s), Android %s (API %s), build %s", Prop("ro.product.manufacturer").c_str(),
          Prop("ro.product.model").c_str(), Prop("ro.product.device").c_str(), Prop("ro.build.version.release").c_str(),
          Prop("ro.build.version.sdk").c_str(), Prop("ro.build.display.id").c_str());
