@@ -28,7 +28,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include <unistd.h>
+
 #include "common/log.h"
+#include "common/platform.h"
 #include "hle/nvn/backend.h"
 #include "runtime/runtime.h"
 #include "hle/nvn/layout.h"
@@ -341,9 +344,11 @@ public:
         if (!EnsureDevice()) return;
         ResetTransient();
         list_counter_++;
+        MaybeArmCapture();
         for (const Cmd& c : cmds) {
             switch (c.type) {
                 case CmdType::SetRenderTargets:
+                    if (capture_active_) CaptureEndOfPass();
                     st_.num_rt = c.num_rt;
                     st_.rts = c.rts ? *c.rts : std::vector<TexRef>{};
                     LogTargets(st_.rts, st_.num_rt);
@@ -476,11 +481,167 @@ public:
                 case CmdType::Draw: Draw(c.draw); break;
             }
         }
+        if (capture_active_) CaptureEndOfPass();
         if (recording_) {
             EndRendering();
             SubmitAndWait(VK_NULL_HANDLE, VK_NULL_HANDLE);
             recording_ = false;
         }
+        if (capture_active_) FinishCapture();
+        last_list_draws_ = drawn_ - list_start_draws_;
+        list_start_draws_ = drawn_;
+    }
+
+    // ======================================================================================================
+    // frame capture (diagnostics): every image a frame renders, downscaled to RGBA8, saved to one file
+    // ======================================================================================================
+    struct CaptureItem {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory image_memory = VK_NULL_HANDLE;
+        uint32_t w = 0, h = 0, src_w = 0, src_h = 0, nvn_format = 0, draws = 0, pass = 0, flags = 0;
+        uint64_t fs_hash = 0;
+    };
+    void MaybeArmCapture() {
+        if (captures_done_ >= 6 || capture_active_) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (!capture_clock_started_) {
+            if (last_list_draws_ < 100) return;  // wait for real 3D frames
+            capture_clock_started_ = true;
+            next_capture_ = now + std::chrono::seconds(15);
+            return;
+        }
+        if (now < next_capture_) return;
+        next_capture_ = now + std::chrono::seconds(45);
+        capture_active_ = true;
+        capture_pass_ = 0;
+        pass_written_.clear();
+        pass_draws_ = 0;
+        LOGI(kTag, "frame capture %d: recording this frame's passes", captures_done_ + 1);
+    }
+    void NoteWritten(Image* img) {
+        if (!capture_active_ || !img) return;
+        if (std::find(pass_written_.begin(), pass_written_.end(), img) == pass_written_.end()) pass_written_.push_back(img);
+    }
+    void CaptureEndOfPass() {
+        for (Image* img : pass_written_) CaptureImage(*img);
+        pass_written_.clear();
+        pass_draws_ = 0;
+        capture_pass_++;
+    }
+    void CaptureImage(Image& img) {
+        if (capture_items_.size() >= 120) return;
+        CaptureItem it;
+        it.src_w = uint32_t(img.width);
+        it.src_h = uint32_t(img.height);
+        it.nvn_format = uint32_t(img.nvn_format);
+        it.draws = pass_draws_;
+        it.pass = capture_pass_;
+        it.fs_hash = pass_fs_hash_;
+        const bool depth = IsDepthFormat(img.nvn_format);
+        if (depth || !(img.features & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || img.type == VK_IMAGE_TYPE_3D) {
+            it.flags = 1;  // not captured (depth or unblittable): metadata only
+            capture_items_.push_back(it);
+            return;
+        }
+        uint32_t w = it.src_w, h = it.src_h;
+        while (w > 480) {
+            w = (w + 1) / 2;
+            h = (h + 1) / 2;
+        }
+        w = std::max(1u, w);
+        h = std::max(1u, h);
+        it.w = w;
+        it.h = h;
+        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.imageType = VK_IMAGE_TYPE_2D;
+        ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ci.extent = {w, h, 1};
+        ci.mipLevels = 1;
+        ci.arrayLayers = 1;
+        ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if (vkCreateImage(device_, &ci, nullptr, &it.image) != VK_SUCCESS) return;
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(device_, it.image, &req);
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (vkAllocateMemory(device_, &ai, nullptr, &it.image_memory) != VK_SUCCESS) {
+            vkDestroyImage(device_, it.image, nullptr);
+            return;
+        }
+        vkBindImageMemory(device_, it.image, it.image_memory, 0);
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = VkDeviceSize(w) * h * 4;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        vkCreateBuffer(device_, &bci, nullptr, &it.buffer);
+        vkGetBufferMemoryRequirements(device_, it.buffer, &req);
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        vkAllocateMemory(device_, &ai, nullptr, &it.memory);
+        vkBindBufferMemory(device_, it.buffer, it.memory, 0);
+
+        Begin();
+        EndRendering();
+        const VkImageLayout restore = img.layout;
+        Transition(img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        RawBarrier(it.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageBlit b{};
+        b.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = {int32_t(it.src_w), int32_t(img.type == VK_IMAGE_TYPE_1D ? 1 : it.src_h), 1};
+        b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.dstOffsets[1] = {int32_t(w), int32_t(h), 1};
+        const bool linear = img.features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        vkCmdBlitImage(cmd_, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, it.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &b, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+        RawBarrier(it.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy c{};
+        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        c.imageExtent = {w, h, 1};
+        vkCmdCopyImageToBuffer(cmd_, it.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, it.buffer, 1, &c);
+        if (restore != VK_IMAGE_LAYOUT_UNDEFINED) Transition(img, restore);
+        capture_items_.push_back(it);
+    }
+    void FinishCapture() {
+        capture_active_ = false;
+        captures_done_++;
+        char name[64];
+        time_t now = time(nullptr);
+        tm t;
+        localtime_r(&now, &t);
+        strftime(name, sizeof(name), "dsr_frame_%Y%m%d_%H%M%S.bin", &t);
+        const int fd = dsr::platform::CreateUserFile(name, "application/octet-stream");
+        size_t bytes = 0;
+        for (CaptureItem& it : capture_items_) {
+            struct Header {
+                char magic[4];
+                uint32_t w, h, src_w, src_h, nvn_format, draws, pass, flags;
+                uint64_t fs_hash;
+            } hd{{'D', 'F', 'R', 'M'}, it.w, it.h, it.src_w, it.src_h, it.nvn_format, it.draws, it.pass, it.flags, it.fs_hash};
+            void* px = nullptr;
+            const size_t n = size_t(it.w) * it.h * 4;
+            if (it.memory && n) vkMapMemory(device_, it.memory, 0, n, 0, &px);
+            if (!px) {
+                hd.w = hd.h = 0;
+                hd.flags |= 2;
+            }
+            if (fd >= 0) {
+                bytes += size_t(write(fd, &hd, sizeof(hd)));
+                if (px) bytes += size_t(write(fd, px, n));
+            }
+            if (px) vkUnmapMemory(device_, it.memory);
+            if (it.buffer) vkDestroyBuffer(device_, it.buffer, nullptr);
+            if (it.memory) vkFreeMemory(device_, it.memory, nullptr);
+            if (it.image) vkDestroyImage(device_, it.image, nullptr);
+            if (it.image_memory) vkFreeMemory(device_, it.image_memory, nullptr);
+        }
+        if (fd >= 0) close(fd);
+        LOGI(kTag, "frame capture %d: %zu images, %zu bytes -> Download/DSRNative/%s", captures_done_,
+             capture_items_.size(), bytes, fd >= 0 ? name : "(could not create file)");
+        capture_items_.clear();
     }
 
     void Present(const TexRef& tex) override {
@@ -1415,6 +1576,7 @@ private:
                 a.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                 a.loadOp = c->written ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
                 a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                NoteWritten(c);
                 c->written = true;
                 c->cpu_source = false;
             }
@@ -1771,6 +1933,7 @@ private:
                     Transition(*img, VK_IMAGE_LAYOUT_GENERAL);
                 }
                 img->written = true;
+                NoteWritten(img);
                 static const uint8_t kIdentity[4] = {2, 3, 4, 5};
                 const uint32_t layers = info.image_array[slot] ? uint32_t(img->layers) : 1;
                 VkImageView view = View(*img, type, 0, layers, 1, img->aspect, kIdentity);
@@ -2054,6 +2217,8 @@ private:
             vkCmdDraw(cmd_, uint32_t(p.count), uint32_t(p.instances), 0, uint32_t(p.base_instance));
         }
         drawn_++;
+        pass_draws_++;
+        if (st_.program[1]) pass_fs_hash_ = st_.program[1]->hash;
         if (depth && st_.depth.depth_test && st_.depth.depth_write) depth_gen_++;
         if (drawn_ == 1) LOGI(kTag, "first draw recorded");
     }
@@ -2400,6 +2565,14 @@ private:
     uint64_t depth_gen_ = 0;
     int viewports_logged_ = 0;
     int image_binds_logged_ = 0;
+    // frame capture
+    bool capture_active_ = false, capture_clock_started_ = false;
+    int captures_done_ = 0;
+    uint32_t capture_pass_ = 0, pass_draws_ = 0;
+    uint64_t pass_fs_hash_ = 0, last_list_draws_ = 0, list_start_draws_ = 0;
+    std::chrono::steady_clock::time_point next_capture_;
+    std::vector<Image*> pass_written_;
+    std::vector<CaptureItem> capture_items_;
     VkExtent2D no_attachment_extent_{0, 0};  // render area for a draw with no attachments (storage-only)
     uint64_t fast_draws_ = 0;
     std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> index_ranges_;
