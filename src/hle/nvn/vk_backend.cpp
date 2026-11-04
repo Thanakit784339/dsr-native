@@ -1397,7 +1397,12 @@ private:
             w = std::min(w, uint32_t(depth->width));
             h = std::min(h, uint32_t(depth->height));
         }
-        if (w == UINT32_MAX) return false;
+        if (w == UINT32_MAX) {
+            if (!no_attachment_extent_.width) return false;
+            w = no_attachment_extent_.width;
+            h = no_attachment_extent_.height;
+            key.push_back(uint64_t(w) << 32 | h);
+        }
         *extent = {w, h};
         if (rendering_ && key == rendering_key_) return true;
         EndRendering();
@@ -1620,6 +1625,7 @@ private:
     void Draw(const DrawParams& p) {
         Phase(-1);
         PhaseEnd phase_end{this};
+        no_attachment_extent_ = {0, 0};
         if (p.count <= 0 || p.instances <= 0) return;
         if (!begin_rendering_) return Skip("no dynamic rendering");
         if (!st_.program[0]) return Skip("no vertex program bound");
@@ -1743,8 +1749,16 @@ private:
                 Image* img = ref.valid ? GetImage(ref, false) : nullptr;
                 if (!img) return Skip("storage image not bound");
                 if (!(img->features & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) return Skip("storage image format not supported");
-                for (Image* c : colors)
-                    if (c == img) return Skip("storage image is also a render target");
+                bool conflict = false;
+                for (Image* c : colors) conflict |= c == img;
+                if (conflict || depth == img) {
+                    // The game leaves the image bound as a colour target while the shader writes it directly
+                    // (the shader has no colour outputs). Draw without attachments, sized like the image.
+                    if (stage != 1 || fs->info.output_mask != 0) return Skip("storage image is also a render target");
+                    colors.clear();
+                    if (depth == img) depth = nullptr;
+                    no_attachment_extent_ = {uint32_t(img->width), uint32_t(img->height)};
+                }
                 VkImageViewType type = info.image_dim[slot] == shader::TexDim::D3 ? VK_IMAGE_VIEW_TYPE_3D
                                        : info.image_dim[slot] == shader::TexDim::D1
                                            ? (info.image_array[slot] ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D)
@@ -2386,6 +2400,7 @@ private:
     uint64_t depth_gen_ = 0;
     int viewports_logged_ = 0;
     int image_binds_logged_ = 0;
+    VkExtent2D no_attachment_extent_{0, 0};  // render area for a draw with no attachments (storage-only)
     uint64_t fast_draws_ = 0;
     std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> index_ranges_;
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
