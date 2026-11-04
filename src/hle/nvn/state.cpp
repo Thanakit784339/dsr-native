@@ -27,6 +27,7 @@ Table<SamplerObj> g_sampler_builders, g_samplers;
 
 std::mutex g_pool_mutex;
 std::unordered_map<int, TexRef> g_texture_ids;
+std::unordered_map<int, TexRef> g_image_ids;  // nvnTexturePoolRegisterImage (storage images)
 std::unordered_map<int, SamplerObj> g_sampler_ids;
 std::unordered_map<const void*, std::shared_ptr<const ShaderCode>> g_programs;
 std::atomic<int> g_depth_mode{0}, g_origin_mode{0};
@@ -177,6 +178,15 @@ void TexturePoolRegisterTexture(void* pool, int id, const void* texture, const v
     std::lock_guard<std::mutex> lk(g_pool_mutex);
     g_texture_ids[id] = r;
 }
+void TexturePoolRegisterImage(void* pool, int id, const void* texture, const void* view) {
+    TexRef r = MakeTexRef(texture);
+    std::lock_guard<std::mutex> lk(g_pool_mutex);
+    static int logged = 0;
+    if (logged++ < 8)
+        LOGI(kTag, "image %d registered: %dx%dx%d format %d target %d", id, r.tex.width, r.tex.height, r.tex.depth,
+             r.tex.format, r.tex.target);
+    g_image_ids[id] = r;
+}
 void SamplerPoolRegisterSampler(void* pool, int id, const void* sampler) {
     SamplerObj s = g_samplers.Copy(sampler);
     std::lock_guard<std::mutex> lk(g_pool_mutex);
@@ -229,6 +239,7 @@ const Proc kProcs[] = {
     P("nvnSamplerBuilderSetMaxAnisotropy", SamplerBuilderSetAniso),
     P("nvnSamplerInitialize", SamplerInitialize), P("nvnSamplerFinalize", SamplerFinalize),
     P("nvnTexturePoolRegisterTexture", TexturePoolRegisterTexture),
+    P("nvnTexturePoolRegisterImage", TexturePoolRegisterImage),
     P("nvnSamplerPoolRegisterSampler", SamplerPoolRegisterSampler),
     P("nvnSamplerPoolRegisterSamplerBuilder", SamplerPoolRegisterBuilder),
     P("nvnDeviceSetDepthMode", DeviceSetDepthMode), P("nvnDeviceSetWindowOriginMode", DeviceSetWindowOriginMode),
@@ -255,6 +266,11 @@ TexRef TextureById(int id) {
     std::lock_guard<std::mutex> lk(g_pool_mutex);
     auto it = g_texture_ids.find(id);
     return it == g_texture_ids.end() ? TexRef{} : it->second;
+}
+TexRef ImageById(int id) {
+    std::lock_guard<std::mutex> lk(g_pool_mutex);
+    auto it = g_image_ids.find(id);
+    return it == g_image_ids.end() ? TexRef{} : it->second;
 }
 SamplerObj SamplerById(int id) {
     std::lock_guard<std::mutex> lk(g_pool_mutex);

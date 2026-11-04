@@ -36,7 +36,7 @@ inline uint64_t Bits(uint64_t v, int lo, int n) { return (v >> lo) & ((n >= 64) 
 enum class Op {
     Unknown, AL2P, ALD, AST, BRA, BRK, CONT, DEPBAR, EXIT, F2F, F2I, FADD, FADD32I, FFMA, FFMA32I, FMNMX, FMUL,
     FMUL32I, FSET, FSETP, I2F, I2I, IADD, IADD3, IADD32I, IPA, ISCADD, ISET, ISETP, KIL, LDC, LDL, LOP, LOP32I,
-    MOV, MOV32I, MUFU, NOP, PBK, PCNT, PSETP, RRO, SEL, SHL, SHR, SSY, STL, SULD, SYNC, TEXB, TEX, TEXS, TLD,
+    MOV, MOV32I, MUFU, NOP, PBK, PCNT, PSETP, RRO, SEL, SHL, SHR, SSY, STL, SULD, SUST, SYNC, TEXB, TEX, TEXS, TLD,
     TLDB, TLD4, TLD4B, TLDS, XMAD, MEMBAR, BAR, IMNMX, LOP3, ICMP, FCMP, PRMT, SHF, POPC, FLO, BFE, BFI, IMUL,
     IMAD, LEA, HADD2, HMUL2, HFMA2, R2P, P2R, S2R, CS2R, OUT, SHFL, VOTE, ATOM, RED, LDG, STG, LDS, STS, ST, LD,
 };
@@ -93,7 +93,7 @@ const Pattern kPatterns[] = {
     {"0100110001001---", Op::SHL, Form::Cbuf},     {"0011100-01001---", Op::SHL, Form::Imm},
     {"0101110000101---", Op::SHR, Form::Reg},      {"0100110000101---", Op::SHR, Form::Cbuf},
     {"0011100-00101---", Op::SHR, Form::Imm},      {"111000101001----", Op::SSY, Form::None},
-    {"1110111101010---", Op::STL, Form::None},     {"1110101100------", Op::SULD, Form::None},
+    {"1110111101010---", Op::STL, Form::None},     {"111010110010----", Op::SUST, Form::None}, {"1110101100------", Op::SULD, Form::None},
     {"1111000011111---", Op::SYNC, Form::None},    {"1101111010------", Op::TEXB, Form::None},
     {"11000-----------", Op::TEX, Form::None},     {"1101-00---------", Op::TEXS, Form::None},
     {"11011100--------", Op::TLD, Form::None},     {"11011101--------", Op::TLDB, Form::None},
@@ -151,7 +151,7 @@ const char* OpName(Op op) {
         N(AL2P) N(ALD) N(AST) N(BRA) N(BRK) N(CONT) N(DEPBAR) N(EXIT) N(F2F) N(F2I) N(FADD) N(FADD32I) N(FFMA)
         N(FFMA32I) N(FMNMX) N(FMUL) N(FMUL32I) N(FSET) N(FSETP) N(I2F) N(I2I) N(IADD) N(IADD3) N(IADD32I) N(IPA)
         N(ISCADD) N(ISET) N(ISETP) N(KIL) N(LDC) N(LDL) N(LOP) N(LOP32I) N(MOV) N(MOV32I) N(MUFU) N(NOP) N(PBK)
-        N(PCNT) N(PSETP) N(RRO) N(SEL) N(SHL) N(SHR) N(SSY) N(STL) N(SULD) N(SYNC) N(TEXB) N(TEX) N(TEXS) N(TLD)
+        N(PCNT) N(PSETP) N(RRO) N(SEL) N(SHL) N(SHR) N(SSY) N(STL) N(SULD) N(SUST) N(SYNC) N(TEXB) N(TEX) N(TEXS) N(TLD)
         N(TLDB) N(TLD4) N(TLD4B) N(TLDS) N(XMAD) N(MEMBAR) N(BAR)
 #undef N
         default: return "unknown";
@@ -935,6 +935,60 @@ private:
         skip_until_ = target;
     }
 
+    // ---- surface stores (SUST.P to a bound image) ----------------------------------------------------------
+    // data 0-7, coords 8-15, component mask 20-23 (P mode), type 33-35, bound 51 (image index 36-48 is a byte/4
+    // offset into the driver's binding table: images start at 0x120, 8 bytes each), D mode 52.
+    void EmitSurfaceStore(uint64_t i) {
+        const uint32_t data = uint32_t(Bits(i, 0, 8)), coord = uint32_t(Bits(i, 8, 8));
+        const uint32_t mask = uint32_t(Bits(i, 20, 4)), type = uint32_t(Bits(i, 33, 3));
+        if (Bits(i, 52, 1)) return Error("raw (SUST.D) surface stores");
+        if (!Bits(i, 51, 1)) return Error("bindless surface stores");
+        const uint32_t table = uint32_t(Bits(i, 36, 13)) * 4;
+        if (table < 0x120 || (table - 0x120) % 8 || (table - 0x120) / 8 >= 8) return Error("unexpected image binding offset");
+        const uint32_t slot = (table - 0x120) / 8;
+        TexDim dim;
+        bool array = false;
+        uint32_t n;
+        switch (type) {
+            case 0: dim = TexDim::D1; n = 1; break;
+            case 2: dim = TexDim::D1; n = 1; array = true; break;
+            case 3: dim = TexDim::D2; n = 2; break;
+            case 4: dim = TexDim::D2; n = 2; array = true; break;
+            case 5: dim = TexDim::D3; n = 3; break;
+            default: return Error("unsupported surface type");
+        }
+        if (info_.image_dim[slot] != TexDim::None && (info_.image_dim[slot] != dim || info_.image_array[slot] != array))
+            return Error("image slot used with two dimensions");
+        info_.image_dim[slot] = dim;
+        info_.image_array[slot] = array;
+        if (!image_[slot]) {
+            b_.Capability(SpvCapabilityStorageImageWriteWithoutFormat);
+            if (dim == TexDim::D1) b_.Capability(SpvCapabilityImage1D);
+            SpvDim sd = dim == TexDim::D1 ? SpvDim1D : dim == TexDim::D3 ? SpvDim3D : SpvDim2D;
+            image_type_[slot] = b_.TypeStorageImage(t_f32_, sd, array ? 1 : 0);
+            image_[slot] = b_.Variable(b_.TypePointer(SpvStorageClassUniformConstant, image_type_[slot]),
+                                       SpvStorageClassUniformConstant);
+            b_.Decorate(image_[slot], SpvDecorationDescriptorSet, {DescriptorSet()});
+            b_.Decorate(image_[slot], SpvDecorationBinding, {96 + slot});
+            b_.Decorate(image_[slot], SpvDecorationNonReadable);
+            char name[16];
+            snprintf(name, sizeof(name), "img%u", slot);
+            b_.Name(image_[slot], name);
+            info_.image_mask |= 1u << slot;
+        }
+        std::vector<uint32_t> c;
+        for (uint32_t k = 0; k < n + (array ? 1 : 0); k++) c.push_back(BitcastI(GetU(coord + k)));
+        Id coords = c.size() == 1 ? c[0]
+                                  : b_.OpResult(SpvOpCompositeConstruct, c.size() == 2 ? t_v2i_ : t_v3i_, c);
+        std::vector<uint32_t> texel;
+        uint32_t r = data;
+        for (uint32_t k = 0; k < 4; k++)
+            texel.push_back((mask >> k & 1) ? GetF(r++) : b_.ConstFloat(k == 3 ? 1.0f : 0.0f));
+        Id value = b_.OpResult(SpvOpCompositeConstruct, t_v4f_, texel);
+        Id img = b_.OpResult(SpvOpLoad, image_type_[slot], {image_[slot]});
+        b_.Op(SpvOpImageWrite, {img, coords, value});
+    }
+
     // ---- local memory (STL / LDL): a per-invocation 4 KiB array ------------------------------------------
     Id LocalWord(Id byte_address) {
         if (!local_) {
@@ -1321,6 +1375,7 @@ private:
             case Op::TLDB: EmitTexelFetchBindless(i); break;
             case Op::TLD4B: EmitGatherBindless(i); break;
             case Op::STL: EmitLocal(i, true); break;
+            case Op::SUST: EmitSurfaceStore(i); break;
             case Op::LDL: EmitLocal(i, false); break;
             case Op::XMAD: EmitXmad(i, f); break;
             case Op::I2F: {
@@ -1500,6 +1555,7 @@ private:
     Id in_[32] = {}, in_type_[32] = {}, out_[32] = {};
     Id tex_[32] = {}, tex_type_[32] = {}, shadow_[32] = {}, shadow_type_[32] = {};
     Id tex_image_type_[32] = {}, shadow_image_type_[32] = {};
+    Id image_[8] = {}, image_type_[8] = {};
     Id push_ = 0;
     Id position_ = 0, point_size_ = 0, frag_coord_ = 0, frag_depth_ = 0, point_coord_ = 0, vertex_index_ = 0,
        instance_index_ = 0;

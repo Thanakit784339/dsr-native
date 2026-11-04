@@ -36,6 +36,7 @@ enum class CmdType : uint8_t {
     BindVertexBuffers,  // index: first, obj: std::vector<BufferRange>
     BindUniformBuffers, // stage, index: first, obj: std::vector<BufferRange>
     BindTextures,       // stage, index: first, obj: std::vector<BoundTexture>
+    BindImages,         // stage, index: first, obj: std::vector<TexRef>
     BindBlend,          // obj: BlendStateObj
     BindColor,          // obj: ColorStateObj
     BindChannelMask,    // obj: ChannelMaskStateObj

@@ -30,6 +30,7 @@
 
 #include "common/log.h"
 #include "hle/nvn/backend.h"
+#include "runtime/runtime.h"
 #include "hle/nvn/layout.h"
 #include "hle/nvn/shader/translator.h"
 #include "hle/nvn/state.h"
@@ -304,6 +305,7 @@ struct DrawState {
     BufferRange vertex_buffers[16];
     BufferRange uniforms[2][18];
     BoundTexture textures[2][32];
+    TexRef images[2][8];  // storage images (nvnCommandBufferBindImage)
     BlendStateObj blend[8];
     ColorStateObj color;
     ChannelMaskStateObj channel;
@@ -417,6 +419,20 @@ public:
                     const auto& v = *std::static_pointer_cast<const std::vector<BoundTexture>>(c.obj);
                     for (size_t i = 0; i < v.size(); i++)
                         if (c.index + i < 32) st_.textures[c.stage][c.index + i] = v[i];
+                    break;
+                }
+                case CmdType::BindImages: {
+                    if (c.stage < 0 || c.stage > 1) break;
+                    const auto& v = *std::static_pointer_cast<const std::vector<TexRef>>(c.obj);
+                    for (size_t i = 0; i < v.size(); i++) {
+                        if (c.index + i >= 8) break;
+                        st_.images[c.stage][c.index + i] = v[i];
+                        if (image_binds_logged_ < 6 && v[i].valid) {
+                            image_binds_logged_++;
+                            LOGI(kTag, "image bound: stage %d slot %zu, %dx%dx%d format %d", c.stage, c.index + i,
+                                 v[i].tex.width, v[i].tex.height, v[i].tex.depth, v[i].tex.format);
+                        }
+                    }
                     break;
                 }
                 case CmdType::BindBlend: {
@@ -601,6 +617,8 @@ private:
         en.dualSrcBlend = have.features.dualSrcBlend;
         en.imageCubeArray = have.features.imageCubeArray;
         en.depthClamp = have.features.depthClamp;
+        en.fragmentStoresAndAtomics = have.features.fragmentStoresAndAtomics;
+        en.shaderStorageImageWriteWithoutFormat = have.features.shaderStorageImageWriteWithoutFormat;
         features_ = en;
         VkPhysicalDeviceVulkan13Features en13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
         en13.dynamicRendering = have13.dynamicRendering;
@@ -651,6 +669,7 @@ private:
         vkCreateSemaphore(device_, &sci, nullptr, &acquire_sem_);
         vkCreateSemaphore(device_, &sci, nullptr, &render_sem_);
         if (!CreateStream() || !CreateDescriptorPool()) return false;
+        LoadPipelineCache();
         init_failed_ = false;
         LOGI(kTag, "device ready (queue family %u)", family_);
         return true;
@@ -702,9 +721,53 @@ private:
     }
     VkDeviceSize StreamRemaining() const { return kStreamSize - stream_off_; }
 
+    // Compiled pipelines are kept on disk so a second run does not stall on them.
+    std::string PipelineCachePath() const {
+        const std::string& dir = dsr::GetRuntime().config.cache_dir;
+        return dir.empty() ? std::string() : dir + "/vk_pipelines.bin";
+    }
+    void LoadPipelineCache() {
+        std::vector<uint8_t> data;
+        const std::string path = PipelineCachePath();
+        if (FILE* f = path.empty() ? nullptr : fopen(path.c_str(), "rb")) {
+            fseek(f, 0, SEEK_END);
+            long n = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (n > 0 && n < (256l << 20)) {
+                data.resize(size_t(n));
+                if (fread(data.data(), 1, data.size(), f) != data.size()) data.clear();
+            }
+            fclose(f);
+        }
+        VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        ci.initialDataSize = data.size();
+        ci.pInitialData = data.empty() ? nullptr : data.data();
+        if (vkCreatePipelineCache(device_, &ci, nullptr, &pipeline_cache_) != VK_SUCCESS) {
+            ci.initialDataSize = 0;
+            ci.pInitialData = nullptr;
+            vkCreatePipelineCache(device_, &ci, nullptr, &pipeline_cache_);
+        }
+        LOGI(kTag, "pipeline cache: %zu bytes loaded", data.size());
+    }
+    void SavePipelineCache() {
+        const std::string path = PipelineCachePath();
+        if (!pipeline_cache_ || path.empty()) return;
+        size_t n = 0;
+        if (vkGetPipelineCacheData(device_, pipeline_cache_, &n, nullptr) != VK_SUCCESS || !n) return;
+        std::vector<uint8_t> data(n);
+        if (vkGetPipelineCacheData(device_, pipeline_cache_, &n, data.data()) != VK_SUCCESS) return;
+        const std::string tmp = path + ".tmp";
+        if (FILE* f = fopen(tmp.c_str(), "wb")) {
+            const bool ok = fwrite(data.data(), 1, n, f) == n;
+            fclose(f);
+            if (ok) rename(tmp.c_str(), path.c_str());
+        }
+    }
+
     bool CreateDescriptorPool() {
         VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16384},
-                                        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16384}};
+                                        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16384},
+                                        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}};
         VkDescriptorPoolCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         ci.maxSets = 4096;
         ci.poolSizeCount = 2;
@@ -933,6 +996,7 @@ private:
             img.width == img.height)
             ci.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
         ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (feats & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
         if (IsDepthFormat(t.tex.format))
             ci.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
         else if (feats & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)
@@ -1409,7 +1473,7 @@ private:
     }
 
     VkDescriptorSetLayout SetLayout(VkShaderStageFlags stage, const shader::ShaderInfo& info) {
-        std::vector<uint32_t> key = {uint32_t(stage), info.cbuf_mask, info.texture_mask, info.shadow_mask};
+        std::vector<uint32_t> key = {uint32_t(stage), info.cbuf_mask, info.texture_mask, info.shadow_mask, info.image_mask};
         auto it = set_layouts_.find(key);
         if (it != set_layouts_.end()) return it->second;
         std::vector<VkDescriptorSetLayoutBinding> b;
@@ -1419,6 +1483,8 @@ private:
             if (info.texture_mask >> i & 1) b.push_back({32 + i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, stage, nullptr});
             if (info.shadow_mask >> i & 1) b.push_back({64 + i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, stage, nullptr});
         }
+        for (uint32_t i = 0; i < 8; i++)
+            if (info.image_mask >> i & 1) b.push_back({96 + i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, stage, nullptr});
         VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         ci.bindingCount = uint32_t(b.size());
         ci.pBindings = b.data();
@@ -1666,6 +1732,38 @@ private:
             }
         }
 
+        // Storage images the fragment shader writes (SUST). Kept in GENERAL layout while bound.
+        for (int stage = 0; stage < 2; stage++) {
+            const shader::ShaderInfo& info = stage == 0 ? vs->info : fs->info;
+            for (uint32_t slot = 0; slot < 8; slot++) {
+                if (!(info.image_mask >> slot & 1)) continue;
+                if (!features_.fragmentStoresAndAtomics || !features_.shaderStorageImageWriteWithoutFormat)
+                    return Skip("storage image writes not supported by the GPU");
+                const TexRef& ref = st_.images[stage][slot];
+                Image* img = ref.valid ? GetImage(ref, false) : nullptr;
+                if (!img) return Skip("storage image not bound");
+                if (!(img->features & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) return Skip("storage image format not supported");
+                for (Image* c : colors)
+                    if (c == img) return Skip("storage image is also a render target");
+                VkImageViewType type = info.image_dim[slot] == shader::TexDim::D3 ? VK_IMAGE_VIEW_TYPE_3D
+                                       : info.image_dim[slot] == shader::TexDim::D1
+                                           ? (info.image_array[slot] ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D)
+                                           : (info.image_array[slot] ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D);
+                const bool type_ok = (type == VK_IMAGE_VIEW_TYPE_3D) == (img->type == VK_IMAGE_TYPE_3D) &&
+                                     (info.image_dim[slot] == shader::TexDim::D1) == (img->type == VK_IMAGE_TYPE_1D);
+                if (!type_ok) return Skip("storage image dimension does not match the shader");
+                if (img->layout != VK_IMAGE_LAYOUT_GENERAL) {
+                    EndRendering();
+                    Transition(*img, VK_IMAGE_LAYOUT_GENERAL);
+                }
+                img->written = true;
+                static const uint8_t kIdentity[4] = {2, 3, 4, 5};
+                const uint32_t layers = info.image_array[slot] ? uint32_t(img->layers) : 1;
+                VkImageView view = View(*img, type, 0, layers, 1, img->aspect, kIdentity);
+                if (!view) return Skip("storage image view failed");
+                tex_writes.push_back({uint32_t(stage), 96 + slot, {VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL}});
+            }
+        }
         Phase(2);
         // ---- uniform data ------------------------------------------------------------------------------------
         struct UboWrite {
@@ -1719,90 +1817,132 @@ private:
 
         Phase(3);
         // ---- vertex + index data -------------------------------------------------------------------------------
-        int topology_mode = p.mode;
-        std::vector<uint32_t> expanded;  // converted index list (quads, line loops, u8 indices)
-        int64_t min_vertex = 0, max_vertex = 0;
-        bool indexed = p.index_type >= 0;
-        if (indexed) {
-            const uint32_t isz = p.index_type == 0 ? 1 : p.index_type == 1 ? 2 : 4;
-            if (!GuestRangeValid(p.index_address, size_t(p.count) * isz)) return Skip("index data outside known memory");
-            const uint8_t* ib = reinterpret_cast<const uint8_t*>(p.index_address);
-            expanded.resize(size_t(p.count));
-            min_vertex = INT64_MAX;
-            max_vertex = INT64_MIN;
-            for (int i = 0; i < p.count; i++) {
-                uint32_t v = isz == 1 ? ib[i] : isz == 2 ? reinterpret_cast<const uint16_t*>(ib)[i]
-                                                         : reinterpret_cast<const uint32_t*>(ib)[i];
-                expanded[size_t(i)] = v;
-                int64_t vv = int64_t(v) + p.base_vertex;
-                min_vertex = std::min(min_vertex, vv);
-                max_vertex = std::max(max_vertex, vv);
-            }
-            if (min_vertex < 0) return Skip("negative vertex index");
-            for (uint32_t& v : expanded) v = uint32_t(int64_t(v) + p.base_vertex - min_vertex);
-        } else {
-            min_vertex = p.first;
-            max_vertex = int64_t(p.first) + p.count - 1;
-            expanded.resize(size_t(p.count));
-            for (int i = 0; i < p.count; i++) expanded[size_t(i)] = uint32_t(i);
-        }
-        if (max_vertex - min_vertex > (8 << 20)) return Skip("vertex range too large");
-        // Primitive conversions Vulkan lacks.
-        VkPrimitiveTopology topology;
-        bool use_indices = indexed;
-        switch (topology_mode) {
-            case 0: topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
-            case 1: topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
-            case 2: {  // line loop -> strip with the first vertex repeated
-                topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
-                expanded.push_back(expanded.front());
-                use_indices = true;
-                break;
-            }
-            case 3: topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
-            case 4: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
-            case 5: case 8: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
-            case 6: case 9: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
-            case 7: {  // quads -> triangles
-                topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-                std::vector<uint32_t> tris;
-                for (size_t q = 0; q + 3 < expanded.size(); q += 4) {
-                    const uint32_t* v = &expanded[q];
-                    tris.insert(tris.end(), {v[0], v[1], v[2], v[0], v[2], v[3]});
-                }
-                expanded.swap(tris);
-                use_indices = true;
-                break;
-            }
-            case 10: topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY; break;
-            case 11: topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY; break;
-            case 12: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY; break;
-            case 13: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY; break;
-            default: return Skip("unsupported primitive type");
-        }
-        if (expanded.empty()) return;
-
+        // Fast path: the game's own index and vertex buffers are uploaded as they are (each once per list) and
+        // the GPU applies the base vertex. Needs u16/u32 indices (or none), a topology Vulkan has, and bound
+        // vertex buffers of a reasonable size. Otherwise indices are scanned and rewritten (slow path).
+        std::vector<uint32_t> expanded;  // converted index list (slow path)
+        VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        bool use_indices = false, fast = false;
+        VkIndexType index_type = VK_INDEX_TYPE_UINT32;
+        uint32_t index_count = 0;
         VkDeviceSize vb_offsets[16] = {};
-        for (const VkVertexInputBindingDescription& b : vin.bindings) {
-            const BufferRange& r = st_.vertex_buffers[b.binding];
-            const VertexStreamObj so = b.binding < st_.streams.size() ? st_.streams[b.binding] : VertexStreamObj{};
-            int64_t first = so.divisor ? p.base_instance : min_vertex;
-            int64_t n = so.divisor ? (int64_t(p.instances) + so.divisor - 1) / so.divisor : max_vertex - min_vertex + 1;
-            const uint64_t start = uint64_t(first) * b.stride;
-            const uint64_t bytes = uint64_t(std::max<int64_t>(0, n - 1)) * b.stride + vin.extent[b.binding];
-            if (!r.address) return Skip("vertex buffer not bound");
-            if (start + bytes > r.size || !GuestRangeValid(r.address + start, size_t(bytes)))
-                return Skip("vertex data outside the bound buffer");
-            VkDeviceSize off = UploadCached(reinterpret_cast<const uint8_t*>(r.address + start), size_t(bytes), 16);
-            if (off == VK_WHOLE_SIZE) return Skip("vertex data too large");
-            vb_offsets[b.binding] = off;
-        }
         VkDeviceSize index_off = 0;
-        if (use_indices) {
-            index_off = StreamAlloc(expanded.size() * 4, 4);
-            memcpy(stream_ptr_ + index_off, expanded.data(), expanded.size() * 4);
+        {
+            static const int8_t kTopology[14] = {
+                VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, -1, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP,
+                VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN,
+                -1, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN,
+                VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY,
+                VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY};
+            constexpr uint64_t kFastBufferMax = 6ull << 20;
+            fast = p.mode >= 0 && p.mode < 14 && kTopology[p.mode] >= 0 && (p.index_type < 0 || p.index_type == 1 || p.index_type == 2);
+            for (const VkVertexInputBindingDescription& b : vin.bindings) {
+                if (!fast) break;
+                const BufferRange& r = st_.vertex_buffers[b.binding];
+                if (!r.address || !r.size || r.size > kFastBufferMax || !GuestRangeValid(r.address, size_t(r.size))) fast = false;
+            }
+            const uint32_t isz = p.index_type == 1 ? 2 : 4;
+            if (fast && p.index_type >= 0 && !GuestRangeValid(p.index_address, size_t(p.count) * isz)) fast = false;
+            if (fast) {
+                topology = VkPrimitiveTopology(kTopology[p.mode]);
+                for (const VkVertexInputBindingDescription& b : vin.bindings) {
+                    const BufferRange& r = st_.vertex_buffers[b.binding];
+                    VkDeviceSize off = UploadCached(reinterpret_cast<const uint8_t*>(r.address), size_t(r.size), 16);
+                    if (off == VK_WHOLE_SIZE) return Skip("vertex data too large");
+                    vb_offsets[b.binding] = off;
+                }
+                if (p.index_type >= 0) {
+                    use_indices = true;
+                    index_type = p.index_type == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+                    index_count = uint32_t(p.count);
+                    index_off = UploadCached(reinterpret_cast<const uint8_t*>(p.index_address), size_t(p.count) * isz, 4);
+                    if (index_off == VK_WHOLE_SIZE) return Skip("index data too large");
+                }
+                fast_draws_++;
+            }
         }
+        if (!fast) {
+            int topology_mode = p.mode;
+            int64_t min_vertex = 0, max_vertex = 0;
+            bool indexed = p.index_type >= 0;
+            if (indexed) {
+                const uint32_t isz = p.index_type == 0 ? 1 : p.index_type == 1 ? 2 : 4;
+                if (!GuestRangeValid(p.index_address, size_t(p.count) * isz)) return Skip("index data outside known memory");
+                const uint8_t* ib = reinterpret_cast<const uint8_t*>(p.index_address);
+                expanded.resize(size_t(p.count));
+                min_vertex = INT64_MAX;
+                max_vertex = INT64_MIN;
+                for (int i = 0; i < p.count; i++) {
+                    uint32_t v = isz == 1 ? ib[i] : isz == 2 ? reinterpret_cast<const uint16_t*>(ib)[i]
+                                                             : reinterpret_cast<const uint32_t*>(ib)[i];
+                    expanded[size_t(i)] = v;
+                    int64_t vv = int64_t(v) + p.base_vertex;
+                    min_vertex = std::min(min_vertex, vv);
+                    max_vertex = std::max(max_vertex, vv);
+                }
+                if (min_vertex < 0) return Skip("negative vertex index");
+                for (uint32_t& v : expanded) v = uint32_t(int64_t(v) + p.base_vertex - min_vertex);
+            } else {
+                min_vertex = p.first;
+                max_vertex = int64_t(p.first) + p.count - 1;
+                expanded.resize(size_t(p.count));
+                for (int i = 0; i < p.count; i++) expanded[size_t(i)] = uint32_t(i);
+            }
+            if (max_vertex - min_vertex > (8 << 20)) return Skip("vertex range too large");
+            // Primitive conversions Vulkan lacks.
+            use_indices = indexed;
+            switch (topology_mode) {
+                case 0: topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
+                case 1: topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
+                case 2: {  // line loop -> strip with the first vertex repeated
+                    topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+                    expanded.push_back(expanded.front());
+                    use_indices = true;
+                    break;
+                }
+                case 3: topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
+                case 4: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
+                case 5: case 8: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
+                case 6: case 9: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
+                case 7: {  // quads -> triangles
+                    topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+                    std::vector<uint32_t> tris;
+                    for (size_t q = 0; q + 3 < expanded.size(); q += 4) {
+                        const uint32_t* v = &expanded[q];
+                        tris.insert(tris.end(), {v[0], v[1], v[2], v[0], v[2], v[3]});
+                    }
+                    expanded.swap(tris);
+                    use_indices = true;
+                    break;
+                }
+                case 10: topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY; break;
+                case 11: topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY; break;
+                case 12: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY; break;
+                case 13: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY; break;
+                default: return Skip("unsupported primitive type");
+            }
+            if (expanded.empty()) return;
+            index_count = uint32_t(expanded.size());
 
+            for (const VkVertexInputBindingDescription& b : vin.bindings) {
+                const BufferRange& r = st_.vertex_buffers[b.binding];
+                const VertexStreamObj so = b.binding < st_.streams.size() ? st_.streams[b.binding] : VertexStreamObj{};
+                int64_t first = so.divisor ? p.base_instance : min_vertex;
+                int64_t n = so.divisor ? (int64_t(p.instances) + so.divisor - 1) / so.divisor : max_vertex - min_vertex + 1;
+                const uint64_t start = uint64_t(first) * b.stride;
+                const uint64_t bytes = uint64_t(std::max<int64_t>(0, n - 1)) * b.stride + vin.extent[b.binding];
+                if (!r.address) return Skip("vertex buffer not bound");
+                if (start + bytes > r.size || !GuestRangeValid(r.address + start, size_t(bytes)))
+                    return Skip("vertex data outside the bound buffer");
+                VkDeviceSize off = UploadCached(reinterpret_cast<const uint8_t*>(r.address + start), size_t(bytes), 16);
+                if (off == VK_WHOLE_SIZE) return Skip("vertex data too large");
+                vb_offsets[b.binding] = off;
+            }
+            if (use_indices) {
+                index_off = StreamAlloc(expanded.size() * 4, 4);
+                memcpy(stream_ptr_ + index_off, expanded.data(), expanded.size() * 4);
+            }
+        }
         Phase(4);
         // ---- pipeline ----------------------------------------------------------------------------------------
         VkExtent2D extent;
@@ -1846,7 +1986,7 @@ private:
             w.dstSet = sets[t.set];
             w.dstBinding = t.binding;
             w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w.descriptorType = t.binding >= 96 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             w.pImageInfo = &t.info;
             writes.push_back(w);
         }
@@ -1861,9 +2001,16 @@ private:
         float push[4] = {st_.alpha_ref, 0, 0, 0};
         vkCmdPushConstants(cmd_, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
         SetDynamicState(extent, modes);
-        if (use_indices) {
+        if (fast) {
+            if (use_indices) {
+                vkCmdBindIndexBuffer(cmd_, stream_, index_off, index_type);
+                vkCmdDrawIndexed(cmd_, index_count, uint32_t(p.instances), 0, p.base_vertex, uint32_t(p.base_instance));
+            } else {
+                vkCmdDraw(cmd_, uint32_t(p.count), uint32_t(p.instances), uint32_t(p.first), uint32_t(p.base_instance));
+            }
+        } else if (use_indices) {
             vkCmdBindIndexBuffer(cmd_, stream_, index_off, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd_, uint32_t(expanded.size()), uint32_t(p.instances), 0, 0, uint32_t(p.base_instance));
+            vkCmdDrawIndexed(cmd_, index_count, uint32_t(p.instances), 0, 0, uint32_t(p.base_instance));
         } else {
             vkCmdDraw(cmd_, uint32_t(p.count), uint32_t(p.instances), 0, uint32_t(p.base_instance));
         }
@@ -2052,7 +2199,9 @@ private:
         ci.pDynamicState = &dy;
         ci.layout = layout;
         VkPipeline pipeline = VK_NULL_HANDLE;
-        VkResult r = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline);
+        MsTimer compile_timer(compile_ms_);
+        VkResult r = vkCreateGraphicsPipelines(device_, pipeline_cache_, 1, &ci, nullptr, &pipeline);
+        new_pipelines_++;
         if (r != VK_SUCCESS) {
             LogOnce("pipeline", "vkCreateGraphicsPipelines failed: %d", r);
             pipeline = VK_NULL_HANDLE;
@@ -2118,7 +2267,12 @@ private:
             phases += " " + std::string(kPhaseNames[i]) + "=" + std::to_string(int(phase_ms_[i]));
             phase_ms_[i] = 0;
         }
-        LOGI(kTag, "draw time by phase (ms):%s", phases.c_str());
+        LOGI(kTag, "draw time by phase (ms):%s | %d pipelines compiled in %.0f ms | %llu fast-path draws", phases.c_str(),
+             new_pipelines_, compile_ms_, (unsigned long long)fast_draws_);
+        if (new_pipelines_) SavePipelineCache();
+        new_pipelines_ = 0;
+        compile_ms_ = 0;
+        fast_draws_ = 0;
         exec_ms_ = wait_ms_ = 0;
         upload_bytes_ = upload_hits_ = 0;
     }
@@ -2177,6 +2331,11 @@ private:
     uint64_t upload_hits_ = 0, upload_bytes_ = 0;
     uint64_t depth_gen_ = 0;
     int viewports_logged_ = 0;
+    int image_binds_logged_ = 0;
+    uint64_t fast_draws_ = 0;
+    VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
+    int new_pipelines_ = 0;
+    double compile_ms_ = 0;
     std::set<std::string> viewport_keys_;  // bumped by every depth write (draw or clear)
     std::unordered_map<uint64_t, uint64_t> snapshot_gen_;
     double exec_ms_ = 0, wait_ms_ = 0;

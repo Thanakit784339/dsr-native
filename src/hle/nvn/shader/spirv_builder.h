@@ -79,6 +79,9 @@ public:
     Id TypeImage(Id sampled, SpvDim dim, uint32_t depth, uint32_t arrayed) {
         return Type(SpvOpTypeImage, {sampled, uint32_t(dim), depth, arrayed, 0, 1, uint32_t(SpvImageFormatUnknown)});
     }
+    Id TypeStorageImage(Id sampled, SpvDim dim, uint32_t arrayed) {
+        return Type(SpvOpTypeImage, {sampled, uint32_t(dim), 0, arrayed, 0, 2, uint32_t(SpvImageFormatUnknown)});
+    }
     Id TypeSampledImage(Id image) { return Type(SpvOpTypeSampledImage, {image}); }
     // Arrays and structs are not deduplicated (they carry decorations).
     Id TypeArray(Id elem, uint32_t length) {

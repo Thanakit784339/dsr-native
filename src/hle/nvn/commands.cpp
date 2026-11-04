@@ -223,6 +223,15 @@ void BindTextures(void* cb, int stage, int first, int n, const uint64_t* handles
     for (int i = 0; i < n && handles; i++) v.push_back(ResolveHandle(handles[i]));
     Bind(cb, CmdType::BindTextures, Obj(std::move(v)), stage, first);
 }
+// Image handles (nvnDeviceGetImageHandle) are the pool ids.
+void BindImage(void* cb, int stage, int index, uint64_t handle) {
+    Bind(cb, CmdType::BindImages, Obj(std::vector<TexRef>{ImageById(int(handle & 0xFFFFF))}), stage, index);
+}
+void BindImages(void* cb, int stage, int first, int n, const uint64_t* handles) {
+    std::vector<TexRef> v;
+    for (int i = 0; i < n && handles; i++) v.push_back(ImageById(int(handles[i] & 0xFFFFF)));
+    Bind(cb, CmdType::BindImages, Obj(std::move(v)), stage, first);
+}
 void BindBlendState(void* cb, const void* s) { Bind(cb, CmdType::BindBlend, Obj(GetBlendState(s))); }
 void BindColorState(void* cb, const void* s) { Bind(cb, CmdType::BindColor, Obj(GetColorState(s))); }
 void BindChannelMaskState(void* cb, const void* s) { Bind(cb, CmdType::BindChannelMask, Obj(GetChannelMaskState(s))); }
@@ -412,6 +421,8 @@ const Proc kProcs[] = {
     P("nvnCommandBufferBindUniformBuffers", BindUniformBuffers),
     P("nvnCommandBufferBindTexture", BindTexture),
     P("nvnCommandBufferBindTextures", BindTextures),
+    P("nvnCommandBufferBindImage", BindImage),
+    P("nvnCommandBufferBindImages", BindImages),
     P("nvnCommandBufferBindBlendState", BindBlendState),
     P("nvnCommandBufferBindColorState", BindColorState),
     P("nvnCommandBufferBindChannelMaskState", BindChannelMaskState),

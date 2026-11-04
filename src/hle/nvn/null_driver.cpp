@@ -564,7 +564,7 @@ const Proc kProcs[] = {
     P("nvnTextureInvalidateTexels", Nop), P("nvnTextureWriteTexels", TexWriteTexels),
     P("nvnTextureWriteTexelsStrided", TexWriteTexelsStrided), P("nvnTextureReadTexels", Nop),
     // pools of descriptors, samplers, programs
-    P("nvnTexturePoolInitialize", True), P("nvnTexturePoolFinalize", Nop), P("nvnTexturePoolRegisterImage", Nop), P("nvnSamplerPoolInitialize", True), P("nvnSamplerPoolFinalize", Nop),
+    P("nvnTexturePoolInitialize", True), P("nvnTexturePoolFinalize", Nop),  P("nvnSamplerPoolInitialize", True), P("nvnSamplerPoolFinalize", Nop),
    
     P("nvnProgramInitialize", True), P("nvnProgramFinalize", Nop), P("nvnProgramSetShaders", ProgramSetShaders),
     P("nvnEventInitialize", True), P("nvnEventFinalize", Nop),

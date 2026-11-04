@@ -42,6 +42,9 @@ struct ShaderInfo {
     uint32_t shadow_mask = 0;           // texture slots sampled with depth compare
     TexDim texture_dim[32] = {};        // per slot
     bool texture_array[32] = {};
+    uint32_t image_mask = 0;            // storage images written (SUST), by NVN image slot
+    TexDim image_dim[8] = {};
+    bool image_array[8] = {};
     uint32_t input_mask = 0;            // vertex attributes / varyings read (by location)
     uint32_t flat_mask = 0;             // varyings read with constant (flat) interpolation
     uint32_t output_mask = 0;           // varyings written (vertex) or render targets written (fragment)

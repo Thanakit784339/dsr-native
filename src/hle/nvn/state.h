@@ -20,6 +20,7 @@ VertexStreamObj GetVertexStream(const void* obj);
 
 // Registered in texture / sampler pools by ID (NVN texture handles carry both IDs).
 TexRef TextureById(int id);
+TexRef ImageById(int id);  // storage images (nvnTexturePoolRegisterImage)
 SamplerObj SamplerById(int id);
 
 void SetProgramCode(const void* program, std::shared_ptr<const ShaderCode> code);
