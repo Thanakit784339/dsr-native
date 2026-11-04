@@ -156,6 +156,11 @@ void StartLogcatMirror(int fd) {
 
 android_app* g_app_for_files = nullptr;
 
+}  // namespace
+extern "C" JNIEXPORT void JNICALL Java_com_dsrnative_app_TextInput_onResult(JNIEnv* env, jclass, jstring text,
+                                                                            jboolean ok);
+namespace {
+
 // Software keyboard: com.dsrnative.app.TextInput.show(activity, title, initial, maxLength). The class is
 // loaded through the activity's class loader because FindClass on a native thread only sees system
 // classes. The result comes back through TextInput.onResult (below).
@@ -182,6 +187,15 @@ bool RequestTextImpl(const char* title, const std::u16string& initial, int max_l
         auto cls = static_cast<jclass>(env->CallObjectMethod(loader, load, name));
         env->DeleteLocalRef(name);
         if (env->ExceptionCheck() || !cls) break;
+        // NativeActivity loads this library itself, so Java cannot find our JNI functions by name: register
+        // the callback explicitly (once).
+        static bool registered = false;
+        if (!registered) {
+            JNINativeMethod m{const_cast<char*>("onResult"), const_cast<char*>("(Ljava/lang/String;Z)V"),
+                              reinterpret_cast<void*>(&Java_com_dsrnative_app_TextInput_onResult)};
+            if (env->RegisterNatives(cls, &m, 1) != JNI_OK || env->ExceptionCheck()) break;
+            registered = true;
+        }
         jmethodID show = env->GetStaticMethodID(cls, "show", "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;I)V");
         if (env->ExceptionCheck() || !show) break;
         jstring jtitle = env->NewStringUTF(title);

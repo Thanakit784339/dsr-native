@@ -218,7 +218,15 @@ bool ProgramSetShaders(void* program, int count, const ShaderData* stages) {
             memcpy(hdr, stages[i].control, sizeof(hdr));
             control_size = (hdr[0] == 0x98761234u && hdr[5] >= 24 && hdr[5] <= 0x10000) ? hdr[5] : 0x800;
         }
-        DumpShader(a, reinterpret_cast<const void*>(a), n, stages[i].control, control_size);
+        // The whole GPU section (control header word 8) extends past the code; dump it so the location of
+        // the compiler's constant pool (read by shaders as c[1]) can be found.
+        size_t section = n;
+        if (stages[i].control) {
+            uint32_t hdr[9];
+            memcpy(hdr, stages[i].control, sizeof(hdr));
+            if (hdr[0] == 0x98761234u && hdr[8] > n && hdr[8] <= 0x10000 && GuestRangeValid(a, hdr[8])) section = hdr[8];
+        }
+        DumpShader(a, reinterpret_cast<const void*>(a), section, stages[i].control, control_size);
         if (a && n >= 0x88) {
             auto sc = std::make_shared<ShaderCode>();
             const uint8_t* p = reinterpret_cast<const uint8_t*>(a);
@@ -334,6 +342,48 @@ size_t TexGetStorageSize(const void* t) { return StorageSize(g_textures.Copy(t))
 uint64_t TexGetTextureAddress(const void* t) {
     TextureState s = g_textures.Copy(t);
     return PoolBase(s.pool) + uint64_t(s.offset);
+}
+
+// nvnTextureWriteTexels: the CPU writes linear texel data into the texture's (tiled) storage, as the
+// real driver does. The backend notices the changed storage and re-uploads (video frames use this).
+void TexWriteTexelsStrided(const void* tex, const void* /*view*/, const CopyRegion* region, const void* data,
+                           int64_t row_stride, int64_t image_stride) {
+    if (!tex || !region || !data) return;
+    TextureState t = g_textures.Copy(tex);
+    uint8_t* base = reinterpret_cast<uint8_t*>(PoolBase(t.pool) + uint64_t(t.offset));
+    if (!t.pool || !base) return;
+    const TextureLayout layout = ComputeLayout(t);
+    if (layout.levels.empty()) return;
+    const LevelLayout& l = layout.levels[0];
+    const FormatInfo fi = GetFormatInfo(t.format);
+    const bool is_3d = t.target == kTarget3D;
+    const int w = std::max(0, region->width), h = std::max(1, region->height), d = std::max(1, region->depth);
+    const uint32_t x_bytes = uint32_t(region->x / fi.block_w * fi.bytes_per_block);
+    const uint32_t y = uint32_t(region->y / fi.block_h);
+    const uint32_t w_bytes = uint32_t((w + fi.block_w - 1) / fi.block_w * fi.bytes_per_block);
+    const uint32_t rows = uint32_t((h + fi.block_h - 1) / fi.block_h);
+    if (x_bytes + w_bytes > uint32_t(l.row_bytes) || y + rows > uint32_t(l.rows)) return;
+    const size_t row_pitch = row_stride > 0 ? size_t(row_stride) : w_bytes;
+    const size_t slice_pitch = image_stride > 0 ? size_t(image_stride) : row_pitch * rows;
+    const uint8_t* src = static_cast<const uint8_t*>(data);
+    if (is_3d) {
+        WriteLevelRegion(base + l.offset, l, layout.linear, x_bytes, y, uint32_t(region->z), w_bytes, rows,
+                         uint32_t(d), src, row_pitch, slice_pitch);
+    } else {  // array layers / cube faces are separate layers
+        for (int z = 0; z < d; z++) {
+            const int layer = region->z + z;
+            if (layer < 0 || layer >= layout.layers) break;
+            WriteLevelRegion(base + size_t(layer) * layout.layer_stride + l.offset, l, layout.linear, x_bytes, y, 0,
+                             w_bytes, rows, 1, src + size_t(z) * slice_pitch, row_pitch, slice_pitch);
+        }
+    }
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 4)
+        LOGI(kTag, "nvnTextureWriteTexels %dx%d at %d,%d into %dx%d format %d", w, h, region->x, region->y, t.width,
+             t.height, t.format);
+}
+void TexWriteTexels(const void* tex, const void* view, const CopyRegion* region, const void* data) {
+    TexWriteTexelsStrided(tex, view, region, data, 0, 0);
 }
 
 // ---- queues ------------------------------------------------------------------------------------------------
@@ -496,7 +546,8 @@ const Proc kProcs[] = {
     P("nvnTextureGetFormat", TexGetFormat), P("nvnTextureGetSamples", TexGetSamples),
     P("nvnTextureGetTarget", TexGetTarget), P("nvnTextureGetStorageSize", TexGetStorageSize),
     P("nvnTextureGetTextureAddress", TexGetTextureAddress), P("nvnTextureFlushTexels", Nop),
-    P("nvnTextureInvalidateTexels", Nop), P("nvnTextureWriteTexels", Nop), P("nvnTextureReadTexels", Nop),
+    P("nvnTextureInvalidateTexels", Nop), P("nvnTextureWriteTexels", TexWriteTexels),
+    P("nvnTextureWriteTexelsStrided", TexWriteTexelsStrided), P("nvnTextureReadTexels", Nop),
     // pools of descriptors, samplers, programs
     P("nvnTexturePoolInitialize", True), P("nvnTexturePoolFinalize", Nop), P("nvnTexturePoolRegisterImage", Nop), P("nvnSamplerPoolInitialize", True), P("nvnSamplerPoolFinalize", Nop),
    

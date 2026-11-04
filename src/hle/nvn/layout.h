@@ -42,4 +42,10 @@ TextureLayout ComputeLayout(const TextureState& t);
 void DeswizzleLevel(uint8_t* linear, const uint8_t* swizzled, const LevelLayout& l);
 void SwizzleLevel(uint8_t* swizzled, const uint8_t* linear, const LevelLayout& l);
 
+// Writes a box of tightly or explicitly pitched linear data into one level of one layer
+// (x in bytes of block rows, y in block rows, z in slices).
+void WriteLevelRegion(uint8_t* level_base, const LevelLayout& l, bool linear, uint32_t x_bytes, uint32_t y,
+                      uint32_t z, uint32_t w_bytes, uint32_t rows, uint32_t depth, const uint8_t* src,
+                      size_t row_pitch, size_t slice_pitch);
+
 }  // namespace dsr::hle::nvn

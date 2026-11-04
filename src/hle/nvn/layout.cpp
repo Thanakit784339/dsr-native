@@ -106,6 +106,41 @@ TextureLayout ComputeLayout(const TextureState& t) {
     return out;
 }
 
+void WriteLevelRegion(uint8_t* level_base, const LevelLayout& l, bool linear, uint32_t x_bytes, uint32_t y0,
+                      uint32_t z0, uint32_t w_bytes, uint32_t rows, uint32_t depth, const uint8_t* src,
+                      size_t row_pitch, size_t slice_pitch) {
+    if (linear) {
+        for (uint32_t z = 0; z < depth; z++)
+            for (uint32_t y = 0; y < rows; y++)
+                memcpy(level_base + (size_t(z0 + z) * l.rows + y0 + y) * size_t(l.row_bytes) + x_bytes,
+                       src + z * slice_pitch + y * row_pitch, w_bytes);
+        return;
+    }
+    const uint32_t gobs_x = uint32_t(DivCeil(size_t(l.row_bytes), kGobWidth));
+    const uint32_t block_size = gobs_x << (9 + l.bh_log2 + l.bd_log2);
+    const uint32_t slice_size = uint32_t(DivCeil(size_t(l.rows), size_t(kGobHeight) << l.bh_log2)) * block_size;
+    const uint32_t bh_mask = (1u << l.bh_log2) - 1, bd_mask = (1u << l.bd_log2) - 1;
+    const uint32_t x_shift = 9 + l.bh_log2 + l.bd_log2;
+    for (uint32_t zi = 0; zi < depth; zi++) {
+        const uint32_t z = z0 + zi;
+        const uint32_t off_z = (z >> l.bd_log2) * slice_size + ((z & bd_mask) << (9 + l.bh_log2));
+        for (uint32_t yi = 0; yi < rows; yi++) {
+            const uint32_t y = y0 + yi;
+            const uint32_t gob_y = y / kGobHeight;
+            const uint32_t off_y = (gob_y >> l.bh_log2) * block_size + ((gob_y & bh_mask) << 9);
+            const uint8_t* row = src + zi * slice_pitch + yi * row_pitch;
+            uint32_t x = 0;
+            while (x < w_bytes) {
+                const uint32_t bx = x_bytes + x;
+                const uint32_t n = std::min(16u - (bx % 16u), w_bytes - x);  // stay inside a 16-byte piece
+                const uint32_t off = off_z + off_y + ((bx / kGobWidth) << x_shift) + GobOffset(bx, y);
+                memcpy(level_base + off, row + x, n);
+                x += n;
+            }
+        }
+    }
+}
+
 void DeswizzleLevel(uint8_t* linear, const uint8_t* swizzled, const LevelLayout& l) {
     Convert<true>(linear, const_cast<uint8_t*>(swizzled), l);
 }

@@ -428,6 +428,16 @@ static void TestBlockLinear() {
                 SwizzleLevel(base, lin.data(), lv);
                 DeswizzleLevel(back.data(), base, lv);
                 CHECK(lin == back);
+                // Region writes (nvnTextureWriteTexels) in two halves must give the same bytes.
+                std::vector<uint8_t> by_region(lv.size + 64, 0), whole(lv.size + 64, 0);
+                SwizzleLevel(whole.data(), lin.data(), lv);
+                const uint32_t half = uint32_t(lv.rows / 2);
+                WriteLevelRegion(by_region.data(), lv, false, 0, 0, 0, uint32_t(lv.row_bytes), half, uint32_t(lv.depth),
+                                 lin.data(), size_t(lv.row_bytes), size_t(lv.row_bytes) * lv.rows);
+                WriteLevelRegion(by_region.data(), lv, false, 0, half, 0, uint32_t(lv.row_bytes), uint32_t(lv.rows) - half,
+                                 uint32_t(lv.depth), lin.data() + size_t(half) * lv.row_bytes, size_t(lv.row_bytes),
+                                 size_t(lv.row_bytes) * lv.rows);
+                CHECK(by_region == whole);
             }
     }
 }
