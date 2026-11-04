@@ -48,6 +48,9 @@ FormatInfo GetFormatInfo(int f) {
     if (f >= 61 && f <= 64) return {1, 1, 4};   // RGB10A2, R11G11B10F, RGB9E5
     if (f == 65 || f == 66 || f == 69 || f == 70 || f == 73 || f == 74) return {4, 4, 8};  // DXT1, RGTC1
     if (f >= 65 && f <= 80) return {4, 4, 16};  // DXT3/5, RGTC2, BPTC
+    if (f >= 109 && f <= 112) return {1, 1, 4};   // RGBX8 (unorm, snorm, uint, sint)
+    if (f >= 113 && f <= 117) return {1, 1, 8};   // RGBX16
+    if (f >= 118 && f <= 120) return {1, 1, 16};  // RGBX32
     return {1, 1, 8};                           // unknown: generous
 }
 

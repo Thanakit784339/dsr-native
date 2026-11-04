@@ -47,6 +47,7 @@ bool IsDepthFormat(int f) { return f >= 49 && f <= 54; }
 bool HasDepth(int f) { return f >= 50 && f <= 54; }
 bool HasStencil(int f) { return f == 49 || f == 53 || f == 54; }
 bool IsCompressed(int f) { return f >= 65 && f <= 80; }
+bool IgnoresAlpha(int f) { return f == 55 || (f >= 109 && f <= 120); }  // RGBX formats
 VkImageAspectFlags AspectOf(int f) {
     if (!IsDepthFormat(f)) return VK_IMAGE_ASPECT_COLOR_BIT;
     VkImageAspectFlags a = 0;
@@ -127,6 +128,19 @@ std::vector<VkFormat> ImageCandidates(int f) {
         case 78: return {VK_FORMAT_BC7_SRGB_BLOCK};
         case 79: return {VK_FORMAT_BC6H_SFLOAT_BLOCK};
         case 80: return {VK_FORMAT_BC6H_UFLOAT_BLOCK};
+        // RGBX: RGBA storage with alpha ignored (sampled as 1, see IgnoresAlpha).
+        case 109: return {VK_FORMAT_R8G8B8A8_UNORM};
+        case 110: return {VK_FORMAT_R8G8B8A8_SNORM};
+        case 111: return {VK_FORMAT_R8G8B8A8_UINT};
+        case 112: return {VK_FORMAT_R8G8B8A8_SINT};
+        case 113: return {VK_FORMAT_R16G16B16A16_SFLOAT};
+        case 114: return {VK_FORMAT_R16G16B16A16_UNORM};
+        case 115: return {VK_FORMAT_R16G16B16A16_SNORM};
+        case 116: return {VK_FORMAT_R16G16B16A16_UINT};
+        case 117: return {VK_FORMAT_R16G16B16A16_SINT};
+        case 118: return {VK_FORMAT_R32G32B32A32_SFLOAT};
+        case 119: return {VK_FORMAT_R32G32B32A32_UINT};
+        case 120: return {VK_FORMAT_R32G32B32A32_SINT};
         default: return {};
     }
 }
@@ -1385,6 +1399,37 @@ private:
     // ======================================================================================================
     // draws
     // ======================================================================================================
+    // 1x1 opaque white image for the dimension a shader expects (6 layers for cubes).
+    Image* Fallback(shader::TexDim dim, bool array) {
+        const int key = int(dim) * 2 + (array ? 1 : 0);
+        auto it = fallbacks_.find(key);
+        if (it != fallbacks_.end()) return it->second;
+        TexRef t;
+        t.valid = true;
+        t.addr = 0x100 + uint64_t(key);  // never a real guest address
+        t.tex.format = 37;
+        t.tex.width = t.tex.height = 1;
+        t.tex.levels = 1;
+        t.tex.target = dim == shader::TexDim::D1 ? (array ? kTarget1DArray : kTarget1D)
+                       : dim == shader::TexDim::D3 ? kTarget3D
+                       : dim == shader::TexDim::Cube ? kTargetCubemap
+                       : (array ? kTarget2DArray : kTarget2D);
+        t.tex.depth = 1;
+        Image* img = CreateImage(t);
+        if (img) {
+            Begin();
+            EndRendering();
+            Transition(*img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VkClearColorValue white;
+            white.float32[0] = white.float32[1] = white.float32[2] = white.float32[3] = 1.0f;
+            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, uint32_t(img->layers)};
+            vkCmdClearColorImage(cmd_, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &white, 1, &range);
+            img->written = img->uploaded = true;
+        }
+        fallbacks_[key] = img;
+        return img;
+    }
+
     // This game does not bind textures through NVN: it writes texture handles (from
     // nvnDeviceGetTextureHandle) into its own uniform buffer at binding 10, which shaders read as
     // c[13][0x20 + 8 * slot]. Read the handle from there and resolve it like a bind would.
@@ -1478,9 +1523,19 @@ private:
                 if (!plain && !shadow) continue;
                 BoundTexture bt = st_.textures[stage][slot];
                 if (!bt.valid) bt = HandleFromUniforms(stage, slot);
-                if (!bt.valid) return Skip("texture handle not found");
-                Image* img = GetImage(bt.texture, true);
-                if (!img) return Skip("texture format not supported");
+                Image* img = bt.valid ? GetImage(bt.texture, true) : nullptr;
+                if (!img) {
+                    // Missing or unsupported texture: draw with a white stand-in rather than dropping the
+                    // draw (one skipped pass can blank the whole frame).
+                    Skip(bt.valid ? "texture format not supported (white stand-in used)"
+                                  : "texture handle not found (white stand-in used)");
+                    img = Fallback(info.texture_dim[slot], info.texture_array[slot]);
+                    bt.texture.tex.swizzle[0] = 2;
+                    bt.texture.tex.swizzle[1] = 3;
+                    bt.texture.tex.swizzle[2] = 4;
+                    bt.texture.tex.swizzle[3] = 5;
+                    if (!img) return Skip("no stand-in texture");
+                }
                 for (Image* c : colors)
                     if (c == img) return Skip("texture is also a render target");
                 if (depth == img) return Skip("texture is also the depth target");
@@ -1488,7 +1543,12 @@ private:
                     EndRendering();
                     Transition(*img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 }
-                VkImageView view = SampledView(*img, info.texture_dim[slot], info.texture_array[slot], bt.texture.tex.swizzle);
+                uint8_t swz[4];
+                memcpy(swz, bt.texture.tex.swizzle, 4);
+                if (IgnoresAlpha(img->nvn_format))
+                    for (uint8_t& c : swz)
+                        if (c == 5) c = 1;  // A -> ONE
+                VkImageView view = SampledView(*img, info.texture_dim[slot], info.texture_array[slot], swz);
                 if (!view) return Skip("texture view does not match the shader");
                 if (plain)
                     tex_writes.push_back({uint32_t(stage), 32 + slot,
@@ -1986,6 +2046,7 @@ private:
     bool logged_first_image_ = false;
     std::map<std::string, uint64_t> skipped_;
     std::set<int> unknown_formats_;
+    std::map<int, Image*> fallbacks_;
     std::set<uint64_t> logged_clears_, logged_targets_;
     std::set<std::string> logged_once_, missing_ubo_logged_, ubo_binds_logged_;
     std::chrono::steady_clock::time_point last_report_ = std::chrono::steady_clock::now();
