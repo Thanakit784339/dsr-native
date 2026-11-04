@@ -456,6 +456,7 @@ int DecGetInputBuffer(void* self, int index, void* buffer) {
 #if defined(__ANDROID__)
     Decoder* d = Dec(self);
     size_t cap = 0;
+    if (index < 0) return kFail;
     uint8_t* p = d->codec ? AMediaCodec_getInputBuffer(d->codec, size_t(index), &cap) : nullptr;
     if (!p) return kFail;
     SetBuffer(buffer, p, cap, 0, 0);
@@ -467,7 +468,7 @@ int DecGetInputBuffer(void* self, int index, void* buffer) {
 int DecSendInputBufferForDecode(void* self, int index, int offset, int size, int64_t time_us, uint32_t flags) {
 #if defined(__ANDROID__)
     Decoder* d = Dec(self);
-    if (!d->codec) return kFail;
+    if (!d->codec || index < 0) return kFail;
     return AMediaCodec_queueInputBuffer(d->codec, size_t(index), off_t(offset), size_t(size), uint64_t(time_us),
                                         flags) == AMEDIA_OK
                ? kOk
@@ -496,6 +497,7 @@ int DecGetOutputBuffer(void* self, int index, void* buffer) {
 #if defined(__ANDROID__)
     Decoder* d = Dec(self);
     size_t cap = 0;
+    if (index < 0) return kFail;
     uint8_t* p = d->codec ? AMediaCodec_getOutputBuffer(d->codec, size_t(index), &cap) : nullptr;
     if (!p) return kFail;
     OutputItem o{};
@@ -521,7 +523,7 @@ int DecReleaseOutputBufferIndex(void* self, int index) {
         std::lock_guard<std::mutex> lk(d->m);
         d->held.erase(index);
     }
-    if (d->codec) AMediaCodec_releaseOutputBuffer(d->codec, size_t(index), false);
+    if (d->codec && index >= 0) AMediaCodec_releaseOutputBuffer(d->codec, size_t(index), false);
 #endif
     return kOk;
 }
