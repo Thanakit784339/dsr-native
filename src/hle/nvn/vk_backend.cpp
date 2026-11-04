@@ -1361,10 +1361,20 @@ private:
         return View(img, type, 0, layers, uint32_t(img.levels), aspect, swz);
     }
 
-    VkSampler Sampler(const SamplerObj& s, bool shadow) {
-        std::vector<uint32_t> key(sizeof(SamplerObj) / 4 + 1);
+    // Formats the GPU cannot filter linearly (32-bit float on Adreno, unlike the Switch): sampling them with a
+    // linear sampler is undefined in Vulkan and reads zeros here. Such textures get a nearest sampler.
+    bool Filterable(const Image& img) {
+        const bool ok = img.features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        if (!ok && unfilterable_logged_.insert(img.nvn_format).second)
+            LOGI(kTag, "NVN format %d (Vulkan %d) cannot be filtered linearly on this GPU: sampled with nearest filtering",
+                 img.nvn_format, img.vk_format);
+        return ok;
+    }
+    VkSampler Sampler(const SamplerObj& s, bool shadow, bool filterable = true) {
+        std::vector<uint32_t> key(sizeof(SamplerObj) / 4 + 2);
         memcpy(key.data(), &s, sizeof(SamplerObj));
-        key.back() = shadow;
+        key[key.size() - 2] = shadow;
+        key.back() = filterable;
         auto it = samplers_.find(key);
         if (it != samplers_.end()) return it->second;
         VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -1374,10 +1384,15 @@ private:
         ci.addressModeU = AddressMode(s.wrap[0]);
         ci.addressModeV = AddressMode(s.wrap[1]);
         ci.addressModeW = AddressMode(s.wrap[2]);
+        if (!filterable) {
+            ci.magFilter = VK_FILTER_NEAREST;
+            ci.minFilter = VK_FILTER_NEAREST;
+            ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        }
         ci.mipLodBias = s.lod_bias;
         ci.minLod = std::max(0.0f, s.lod_min);
         ci.maxLod = (s.min_filter <= 1) ? 0.25f : std::max(ci.minLod, std::min(s.lod_max, 16.0f));
-        if (features_.samplerAnisotropy && s.max_anisotropy > 1.0f) {
+        if (filterable && features_.samplerAnisotropy && s.max_anisotropy > 1.0f) {
             ci.anisotropyEnable = VK_TRUE;
             ci.maxAnisotropy = std::min(s.max_anisotropy, props_.limits.maxSamplerAnisotropy);
         }
@@ -1958,10 +1973,10 @@ private:
                 if (!view) return Skip("texture view does not match the shader");
                 if (plain)
                     tex_writes.push_back({uint32_t(stage), 32 + slot,
-                                          {Sampler(bt.sampler, false), view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+                                          {Sampler(bt.sampler, false, Filterable(*img)), view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
                 if (shadow)
                     tex_writes.push_back({uint32_t(stage), 64 + slot,
-                                          {Sampler(bt.sampler, true), view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+                                          {Sampler(bt.sampler, true, Filterable(*img)), view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
             }
         }
 
@@ -2647,6 +2662,7 @@ private:
     int viewports_logged_ = 0;
     int image_binds_logged_ = 0;
     std::set<uint64_t> mismatch_logged_;
+    std::set<int> unfilterable_logged_;
     // frame capture
     bool capture_active_ = false, capture_clock_started_ = false;
     int captures_done_ = 0;
