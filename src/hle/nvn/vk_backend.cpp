@@ -500,7 +500,7 @@ public:
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkImage image = VK_NULL_HANDLE;
         VkDeviceMemory image_memory = VK_NULL_HANDLE;
-        uint32_t w = 0, h = 0, src_w = 0, src_h = 0, nvn_format = 0, draws = 0, pass = 0, flags = 0;
+        uint32_t w = 0, h = 0, src_w = 0, src_h = 0, nvn_format = 0, draws = 0, pass = 0, flags = 0, raw_bpp = 4;
         uint64_t fs_hash = 0;
     };
     void MaybeArmCapture() {
@@ -543,13 +543,24 @@ public:
         it.pass = capture_pass_;
         it.fs_hash = pass_fs_hash_;
         const bool depth = IsDepthFormat(img.nvn_format);
-        if (depth && HasDepth(img.nvn_format) && img.type == VK_IMAGE_TYPE_2D && it.src_w * it.src_h <= 1280u * 720u) {
-            // Depth: raw copy of the depth aspect (D24: low 24 bits of each word; D32F: float). Full size.
+        // Raw copies (full size, layer 0, mip 0): depth (as the driver stores it, float on Adreno) and float
+        // colour formats, whose values an 8-bit blit would clamp (negatives, HDR).
+        uint32_t raw_bpp = 0;
+        switch (img.vk_format) {
+            case VK_FORMAT_R16_SFLOAT: raw_bpp = 2; break;
+            case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_B10G11R11_UFLOAT_PACK32: raw_bpp = 4; break;
+            case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R32G32_SFLOAT: raw_bpp = 8; break;
+            case VK_FORMAT_R32G32B32A32_SFLOAT: raw_bpp = 16; break;
+            default: break;
+        }
+        if (depth) raw_bpp = HasDepth(img.nvn_format) ? 4 : 0;
+        if (raw_bpp && img.type == VK_IMAGE_TYPE_2D && it.src_w * it.src_h <= 1280u * 720u) {
             it.w = it.src_w;
             it.h = it.src_h;
-            it.flags = 4u | (uint32_t(img.vk_format) << 8);
+            it.flags = (depth ? 4u : 8u) | (uint32_t(img.vk_format) << 8);
+            it.raw_bpp = raw_bpp;
             VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-            bci.size = VkDeviceSize(it.w) * it.h * 4;
+            bci.size = VkDeviceSize(it.w) * it.h * raw_bpp;
             bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             if (vkCreateBuffer(device_, &bci, nullptr, &it.buffer) != VK_SUCCESS) return;
             VkMemoryRequirements req;
@@ -564,7 +575,7 @@ public:
             const VkImageLayout restore = img.layout;
             Transition(img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             VkBufferImageCopy c{};
-            c.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+            c.imageSubresource = {depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT) : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1};
             c.imageExtent = {it.w, it.h, 1};
             vkCmdCopyImageToBuffer(cmd_, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, it.buffer, 1, &c);
             if (restore != VK_IMAGE_LAYOUT_UNDEFINED) Transition(img, restore);
@@ -653,7 +664,7 @@ public:
                 uint64_t fs_hash;
             } hd{{'D', 'F', 'R', 'M'}, it.w, it.h, it.src_w, it.src_h, it.nvn_format, it.draws, it.pass, it.flags, it.fs_hash};
             void* px = nullptr;
-            const size_t n = size_t(it.w) * it.h * 4;
+            const size_t n = size_t(it.w) * it.h * it.raw_bpp;
             if (it.memory && n) vkMapMemory(device_, it.memory, 0, n, 0, &px);
             if (!px) {
                 hd.w = hd.h = 0;

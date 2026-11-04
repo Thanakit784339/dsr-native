@@ -23,7 +23,10 @@
 namespace dsr::hle::nvn {
 namespace {
 constexpr const char* kTag = "nvn";
-constexpr size_t kMaxHandles = 16384;
+// Recent lists kept for submission. ~25 frames: lists are normally submitted right after recording. Lists
+// the game submits more than once (static command sets) are kept regardless (up to kMaxKept).
+constexpr size_t kMaxHandles = 512;
+constexpr size_t kMaxKept = 2048;
 
 // The game checks GetCommandMemoryUsed before submitting and skips buffers that report 0, so report a
 // plausible figure: an estimate of what real NVN would have written, reset when memory is (re)added.
@@ -40,6 +43,8 @@ Table<Recorder> g_recorders;
 std::mutex g_handle_mutex;
 std::unordered_map<uint64_t, std::shared_ptr<const CmdList>> g_handles;
 std::deque<uint64_t> g_handle_order;
+std::unordered_map<uint64_t, uint32_t> g_submit_counts;  // submissions per live handle
+std::deque<uint64_t> g_kept;                               // handles submitted twice or more
 uint64_t g_next_handle = 1;
 
 GpuStats g_stats;
@@ -83,8 +88,20 @@ uint64_t EndRecording(void* cb) {
     g_handles.emplace(h, std::move(list));
     g_handle_order.push_back(h);
     while (g_handle_order.size() > kMaxHandles) {
-        g_handles.erase(g_handle_order.front());
+        const uint64_t old = g_handle_order.front();
         g_handle_order.pop_front();
+        auto sc = g_submit_counts.find(old);
+        if (sc != g_submit_counts.end() && sc->second >= 2) {
+            g_kept.push_back(old);  // reused: keep
+            continue;
+        }
+        if (sc != g_submit_counts.end()) g_submit_counts.erase(sc);
+        g_handles.erase(old);
+    }
+    while (g_kept.size() > kMaxKept) {
+        g_handles.erase(g_kept.front());
+        g_submit_counts.erase(g_kept.front());
+        g_kept.pop_front();
     }
     return h;
 }
@@ -359,6 +376,10 @@ void QueueSubmitCommands(void* /*queue*/, int n, const uint64_t* handles) {
         if (!list) {
             g_unknown_handles++;
             continue;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_handle_mutex);
+            g_submit_counts[handles[i]]++;
         }
         g_stats.submits++;
         g_stats.commands += list->size();
