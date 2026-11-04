@@ -525,6 +525,9 @@ public:
         if (std::find(pass_written_.begin(), pass_written_.end(), img) == pass_written_.end()) pass_written_.push_back(img);
     }
     void CaptureEndOfPass() {
+        if (!pass_written_.empty())
+            LOGI(kTag, "capture pass %u: %u draws, last fs %016llx, last textures:%s", capture_pass_, pass_draws_,
+                 (unsigned long long)pass_fs_hash_, pass_tex_desc_.empty() ? " none" : pass_tex_desc_.c_str());
         for (Image* img : pass_written_) CaptureImage(*img);
         pass_written_.clear();
         pass_draws_ = 0;
@@ -540,6 +543,34 @@ public:
         it.pass = capture_pass_;
         it.fs_hash = pass_fs_hash_;
         const bool depth = IsDepthFormat(img.nvn_format);
+        if (depth && HasDepth(img.nvn_format) && img.type == VK_IMAGE_TYPE_2D && it.src_w * it.src_h <= 1280u * 720u) {
+            // Depth: raw copy of the depth aspect (D24: low 24 bits of each word; D32F: float). Full size.
+            it.w = it.src_w;
+            it.h = it.src_h;
+            it.flags = 4u | (uint32_t(img.vk_format) << 8);
+            VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bci.size = VkDeviceSize(it.w) * it.h * 4;
+            bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            if (vkCreateBuffer(device_, &bci, nullptr, &it.buffer) != VK_SUCCESS) return;
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(device_, it.buffer, &req);
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            ai.allocationSize = req.size;
+            ai.memoryTypeIndex = FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            vkAllocateMemory(device_, &ai, nullptr, &it.memory);
+            vkBindBufferMemory(device_, it.buffer, it.memory, 0);
+            Begin();
+            EndRendering();
+            const VkImageLayout restore = img.layout;
+            Transition(img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            VkBufferImageCopy c{};
+            c.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+            c.imageExtent = {it.w, it.h, 1};
+            vkCmdCopyImageToBuffer(cmd_, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, it.buffer, 1, &c);
+            if (restore != VK_IMAGE_LAYOUT_UNDEFINED) Transition(img, restore);
+            capture_items_.push_back(it);
+            return;
+        }
         if (depth || !(img.features & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || img.type == VK_IMAGE_TYPE_3D) {
             it.flags = 1;  // not captured (depth or unblittable): metadata only
             capture_items_.push_back(it);
@@ -1063,7 +1094,14 @@ private:
         auto it = images_.find(t.addr);
         if (it == images_.end()) return nullptr;
         Image& img = it->second;
-        if (img.nvn_format != t.tex.format || img.width != t.tex.width || img.height != t.tex.height) return nullptr;
+        if (img.nvn_format != t.tex.format || img.width != t.tex.width || img.height != t.tex.height) {
+            const uint64_t key = t.addr ^ (uint64_t(t.tex.format) << 48) ^ (uint64_t(img.nvn_format) << 56);
+            if (mismatch_logged_.size() < 24 && mismatch_logged_.insert(key).second)
+                LOGW(kTag, "memory @%llx used as fmt %d %dx%d but holds an image of fmt %d %dx%d%s (replaced)",
+                     (unsigned long long)t.addr, t.tex.format, t.tex.width, t.tex.height, img.nvn_format, img.width,
+                     img.height, img.written ? " that was drawn into" : "");
+            return nullptr;
+        }
         return &img;
     }
 
@@ -1590,6 +1628,7 @@ private:
             da.loadOp = depth->written ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
             da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             da.clearValue.depthStencil = {1.0f, 0};
+            NoteWritten(depth);
             depth->written = true;
             depth->cpu_source = false;
         }
@@ -1889,6 +1928,21 @@ private:
                 if (IgnoresAlpha(img->nvn_format))
                     for (uint8_t& c : swz)
                         if (c == 5) c = 1;  // A -> ONE
+                if (capture_active_) {
+                    if (stage == 0 && slot == 0 && tex_desc_draw_ != drawn_) {
+                        pass_tex_desc_.clear();
+                        tex_desc_draw_ = drawn_;
+                    }
+                    char d[160];
+                    snprintf(d, sizeof(d), " [%s%u: fmt %d %dx%d @%llx%s%s%s]", stage ? "fs" : "vs", slot, img->nvn_format,
+                             img->width, img->height, (unsigned long long)bt.texture.addr, img->written ? " drawn" : "",
+                             img->uploaded ? " uploaded" : "", shadow ? " compare" : "");
+                    if (tex_desc_draw_ != drawn_) {
+                        pass_tex_desc_.clear();
+                        tex_desc_draw_ = drawn_;
+                    }
+                    pass_tex_desc_ += d;
+                }
                 VkImageView view = SampledView(*img, info.texture_dim[slot], info.texture_array[slot], swz);
                 if (!view) return Skip("texture view does not match the shader");
                 if (plain)
@@ -2493,6 +2547,22 @@ private:
         for (auto& [reason, n] : skipped_) skipped += " | " + std::to_string(n) + " " + reason;
         LOGI(kTag, "draws: %llu drawn, %zu pipelines, %d shaders, %d uploads, %d flushes%s", (unsigned long long)drawn_,
              pipelines_.size(), shaders_translated_, uploads_, flushes_, skipped.c_str());
+        {
+            long rss_kb = 0;
+            if (FILE* f = fopen("/proc/self/statm", "r")) {
+                long pages = 0, resident = 0;
+                if (fscanf(f, "%ld %ld", &pages, &resident) == 2) rss_kb = resident * (sysconf(_SC_PAGESIZE) / 1024);
+                fclose(f);
+            }
+            uint64_t gpu = 0;
+            for (auto& [a, img] : images_) {
+                VkMemoryRequirements req{};
+                if (img.image) vkGetImageMemoryRequirements(device_, img.image, &req);
+                gpu += req.size;
+            }
+            LOGI(kTag, "memory: process %ld MB resident, %zu GPU images using %llu MB, %zu index ranges cached", rss_kb / 1024,
+                 images_.size(), (unsigned long long)(gpu >> 20), index_ranges_.size());
+        }
         LOGI(kTag, "last 10 s: %.0f ms executing lists (%.0f ms of it waiting for the GPU), %.1f MB streamed, %llu cached uploads",
              exec_ms_, wait_ms_, upload_bytes_ / 1048576.0, (unsigned long long)upload_hits_);
         std::string phases;
@@ -2565,6 +2635,7 @@ private:
     uint64_t depth_gen_ = 0;
     int viewports_logged_ = 0;
     int image_binds_logged_ = 0;
+    std::set<uint64_t> mismatch_logged_;
     // frame capture
     bool capture_active_ = false, capture_clock_started_ = false;
     int captures_done_ = 0;
@@ -2572,6 +2643,8 @@ private:
     uint64_t pass_fs_hash_ = 0, last_list_draws_ = 0, list_start_draws_ = 0;
     std::chrono::steady_clock::time_point next_capture_;
     std::vector<Image*> pass_written_;
+    std::string pass_tex_desc_;
+    uint64_t tex_desc_draw_ = ~0ull;
     std::vector<CaptureItem> capture_items_;
     VkExtent2D no_attachment_extent_{0, 0};  // render area for a draw with no attachments (storage-only)
     uint64_t fast_draws_ = 0;
