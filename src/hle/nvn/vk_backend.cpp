@@ -516,6 +516,18 @@ public:
         next_capture_ = now + std::chrono::seconds(45);
         capture_active_ = true;
         capture_pass_ = 0;
+        if (!query_pool_) {
+            VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qi.queryType = VK_QUERY_TYPE_OCCLUSION;
+            qi.queryCount = kMaxQueries;
+            vkCreateQueryPool(device_, &qi, nullptr, &query_pool_);
+        }
+        if (query_pool_) {
+            Begin();
+            EndRendering();
+            vkCmdResetQueryPool(cmd_, query_pool_, 0, kMaxQueries);
+        }
+        query_pass_.clear();
         pass_written_.clear();
         pass_draws_ = 0;
         LOGI(kTag, "frame capture %d: recording this frame's passes", captures_done_ + 1);
@@ -528,6 +540,9 @@ public:
         if (!pass_written_.empty())
             LOGI(kTag, "capture pass %u: %u draws, last fs %016llx, last textures:%s", capture_pass_, pass_draws_,
                  (unsigned long long)pass_fs_hash_, pass_tex_desc_.empty() ? " none" : pass_tex_desc_.c_str());
+        if (!pass_written_.empty() && !pass_state_desc_.empty())
+            LOGI(kTag, "capture pass %u state: %s", capture_pass_, pass_state_desc_.c_str());
+        pass_state_desc_.clear();
         if (!pass_written_.empty() && !pass_ubo_desc_.empty())
             LOGI(kTag, "capture pass %u fragment constants:%s", capture_pass_, pass_ubo_desc_.c_str());
         pass_ubo_desc_.clear();
@@ -655,6 +670,24 @@ public:
     void FinishCapture() {
         capture_active_ = false;
         captures_done_++;
+        if (query_pool_ && !query_pass_.empty()) {
+            std::vector<uint64_t> res(query_pass_.size());
+            if (vkGetQueryPoolResults(device_, query_pool_, 0, uint32_t(res.size()), res.size() * 8, res.data(), 8,
+                                      VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+                std::map<uint32_t, std::pair<uint64_t, uint32_t>> per_pass;  // samples, draws
+                for (size_t q = 0; q < res.size(); q++) {
+                    per_pass[query_pass_[q]].first += res[q];
+                    per_pass[query_pass_[q]].second++;
+                }
+                std::string line;
+                for (auto& [pass, v] : per_pass) {
+                    char d[64];
+                    snprintf(d, sizeof(d), " p%u:%llu/%u", pass, (unsigned long long)v.first, v.second);
+                    line += d;
+                }
+                LOGI(kTag, "capture %d samples passed per pass (samples/draws):%s", captures_done_, line.c_str());
+            }
+        }
         char name[64];
         time_t now = time(nullptr);
         tm t;
@@ -2334,6 +2367,8 @@ private:
         float push[4] = {st_.alpha_ref, 0, 0, 0};
         vkCmdPushConstants(cmd_, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
         SetDynamicState(extent, modes);
+        const bool query = capture_active_ && query_pool_ && query_pass_.size() < kMaxQueries;
+        if (query) vkCmdBeginQuery(cmd_, query_pool_, uint32_t(query_pass_.size()), 0);
         if (fast) {
             if (use_indices) {
                 vkCmdBindIndexBuffer(cmd_, stream_, index_off, index_type);
@@ -2346,6 +2381,20 @@ private:
             vkCmdDrawIndexed(cmd_, index_count, uint32_t(p.instances), 0, 0, uint32_t(p.base_instance));
         } else {
             vkCmdDraw(cmd_, uint32_t(p.count), uint32_t(p.instances), 0, uint32_t(p.base_instance));
+        }
+        if (query) {
+            vkCmdEndQuery(cmd_, query_pool_, uint32_t(query_pass_.size()));
+            query_pass_.push_back(capture_pass_);
+        }
+        if (capture_active_) {
+            char d[320];
+            snprintf(d, sizeof(d),
+                     "vs %016llx | %zu colour targets | alpha test func %d ref %g | blend enable 0x%x | channel mask 0x%08x"
+                     " | cull %d front %d | depth test %d write %d | stencil %d",
+                     (unsigned long long)(st_.program[0] ? st_.program[0]->hash : 0), colors.size(), st_.color.alpha_func,
+                     st_.alpha_ref, st_.color.blend_enable, st_.channel.mask, st_.polygon.cull, st_.polygon.front_face,
+                     int(st_.depth.depth_test), int(st_.depth.depth_write), int(st_.depth.stencil_test));
+            pass_state_desc_ = d;
         }
         drawn_++;
         pass_draws_++;
@@ -2721,7 +2770,10 @@ private:
     uint64_t pass_fs_hash_ = 0, last_list_draws_ = 0, list_start_draws_ = 0;
     std::chrono::steady_clock::time_point next_capture_;
     std::vector<Image*> pass_written_;
-    std::string pass_tex_desc_, pass_ubo_desc_;
+    std::string pass_tex_desc_, pass_ubo_desc_, pass_state_desc_;
+    static constexpr uint32_t kMaxQueries = 2048;
+    VkQueryPool query_pool_ = VK_NULL_HANDLE;
+    std::vector<uint32_t> query_pass_;
     uint64_t ubo_desc_draw_ = ~0ull;
     uint64_t tex_desc_draw_ = ~0ull;
     std::vector<CaptureItem> capture_items_;
