@@ -859,6 +859,7 @@ private:
         en.imageCubeArray = have.features.imageCubeArray;
         en.depthClamp = have.features.depthClamp;
         en.fragmentStoresAndAtomics = have.features.fragmentStoresAndAtomics;
+        en.geometryShader = have.features.geometryShader;  // gl_PrimitiveID in fragment shaders
         en.shaderStorageImageWriteWithoutFormat = have.features.shaderStorageImageWriteWithoutFormat;
         features_ = en;
         VkPhysicalDeviceVulkan13Features en13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};

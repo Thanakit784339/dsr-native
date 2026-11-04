@@ -562,7 +562,14 @@ private:
                                {pc, b_.ConstUint((addr - 0x2e0) / 4)});
             return BitcastU(b_.OpResult(SpvOpLoad, t_f32_, {p}));
         }
-        if (addr == 0x60) return b_.ConstUint(0);  // primitive id: not plumbed yet
+        if (addr == 0x60) {  // primitive id (the game picks array layers by triangle: 4 full-screen triangles)
+            b_.Capability(SpvCapabilityGeometry);
+            const bool first = !prim_id_;
+            Id pid = BuiltinVar(&prim_id_, SpvStorageClassInput, t_i32_, SpvBuiltInPrimitiveId, "gl_PrimitiveID");
+            if (first) b_.Decorate(pid, SpvDecorationFlat);
+            info_.uses_primitive_id = true;
+            return BitcastU(b_.OpResult(SpvOpLoad, t_i32_, {pid}));
+        }
         Error("unsupported fragment attribute");
         return b_.ConstUint(0);
     }
@@ -1613,6 +1620,7 @@ private:
     Id tex_[32] = {}, tex_type_[32] = {}, shadow_[32] = {}, shadow_type_[32] = {};
     Id tex_image_type_[32] = {}, shadow_image_type_[32] = {};
     Id image_[8] = {}, image_type_[8] = {};
+    Id prim_id_ = 0;
     Id push_ = 0;
     Id position_ = 0, point_size_ = 0, frag_coord_ = 0, frag_depth_ = 0, point_coord_ = 0, vertex_index_ = 0,
        instance_index_ = 0;

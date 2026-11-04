@@ -51,6 +51,7 @@ struct ShaderInfo {
     bool writes_depth = false;
     bool uses_discard = false;
     bool writes_point_size = false;
+    bool uses_primitive_id = false;     // fragment shader reads gl_PrimitiveID (needs geometryShader)
     uint32_t instruction_count = 0;
 };
 
