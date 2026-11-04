@@ -20,7 +20,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" OR ANDROID_ABI STREQUAL "arm64
 endif()
 
 add_library(dsrcore OBJECT ${DSR_CORE_SOURCES})
-target_include_directories(dsrcore PUBLIC src)
+target_include_directories(dsrcore PUBLIC src third_party/spirv)
 target_compile_options(dsrcore PRIVATE
     -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-cast-function-type
     $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>)
@@ -46,6 +46,9 @@ if(ANDROID)
 else()
     add_executable(dsr_dryrun src/platform/host/dryrun_main.cpp)
     target_link_libraries(dsr_dryrun PRIVATE dsrcore pthread)
+    # Translates a shader dump written by the app (tools/shader_tool/shader_tool.cpp).
+    add_executable(dsr_shader_tool tools/shader_tool/shader_tool.cpp)
+    target_link_libraries(dsr_shader_tool PRIVATE dsrcore pthread)
 endif()
 
 # ---- tests (host only; on arm64 they also exercise the assembly transition code) ----

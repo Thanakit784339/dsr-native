@@ -596,7 +596,7 @@ private:
         if (kind == kClearFloat && clear_colors_logged_ < 16) {
             float f[4];
             memcpy(f, color, sizeof(f));
-            uint64_t key = (uint64_t(img.nvn_format) << 48) ^ (uint64_t(color[0]) * 31 + color[1]) * 31 + color[2];
+            uint64_t key = (uint64_t(img.nvn_format) << 48) ^ ((uint64_t(color[0]) * 31 + color[1]) * 31 + color[2]);
             if (logged_clears_.insert(key).second) {
                 clear_colors_logged_++;
                 LOGI(kTag, "clear %dx%d (format %d) to (%.3f, %.3f, %.3f, %.3f)", img.width, img.height,

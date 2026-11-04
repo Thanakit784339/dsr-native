@@ -11,6 +11,7 @@
 #include "arch/arch.h"
 #include "hle/nvn.h"
 #include "hle/nvn/backend.h"
+#include "hle/nvn/shader/translator.h"
 #include "hle/registry.h"
 #include "loader/dynamic_thunks.h"
 #include "loader/nso.h"
@@ -319,6 +320,79 @@ static void TestNvnCommands() {
     SetBackendForTesting(nullptr);
 }
 
+// Shader translator: a hand-assembled pass-through vertex shader and a texture * color pixel shader
+// (the shape of the game's menu shaders) must translate and report their interface.
+static std::vector<uint8_t> MakeShader(uint32_t sph_type, uint32_t omap, const std::vector<uint64_t>& insts) {
+    std::vector<uint8_t> code(0x80, 0);
+    uint32_t w0 = (sph_type << 10) | (3u << 5) | 1u;
+    memcpy(&code[0x30], &w0, 4);
+    memcpy(&code[0x30 + 18 * 4], &omap, 4);
+    size_t n = 0;
+    for (uint64_t inst : insts) {
+        if (n % 4 == 0) {  // scheduling word
+            uint64_t sched = 0x001f8000fc0007e0ull;
+            code.insert(code.end(), reinterpret_cast<uint8_t*>(&sched), reinterpret_cast<uint8_t*>(&sched) + 8);
+            n++;
+        }
+        code.insert(code.end(), reinterpret_cast<const uint8_t*>(&inst), reinterpret_cast<const uint8_t*>(&inst) + 8);
+        n++;
+    }
+    return code;
+}
+
+// Tiny Maxwell encoder for tests: opcode bits + the operand fields the translator reads.
+namespace enc {
+constexpr uint64_t kPT = 7ull << 16, kRZ = 255;
+uint64_t Ald(uint32_t d, uint32_t addr) { return (0xefd8ull << 48) | (uint64_t(addr) << 20) | (kRZ << 8) | kPT | d; }
+uint64_t Ast(uint32_t s, uint32_t addr) { return (0xeff0ull << 48) | (uint64_t(addr) << 20) | (kRZ << 8) | kPT | s; }
+uint64_t MovCbuf(uint32_t d, uint32_t idx, uint32_t off) {
+    return (0x4c98ull << 48) | (uint64_t(idx) << 34) | (uint64_t(off / 4) << 20) | kPT | d;
+}
+uint64_t Ipa(uint32_t d, uint32_t attr, uint32_t mode, uint32_t mul) {
+    return (0xe0ull << 56) | (uint64_t(mode) << 54) | (uint64_t(attr) << 28) | (uint64_t(mul) << 20) | (kRZ << 8) | kPT | d;
+}
+uint64_t Mufu(uint32_t d, uint32_t a, uint32_t op) { return (0x5080ull << 48) | (uint64_t(op) << 20) | (a << 8) | kPT | d; }
+uint64_t Fmul(uint32_t d, uint32_t a, uint32_t b) { return (0x5c68ull << 48) | (uint64_t(b) << 20) | (a << 8) | kPT | d; }
+uint64_t TexB(uint32_t d, uint32_t coord, uint32_t meta, uint32_t type, uint32_t mask) {
+    return (0xdeb8ull << 48) | (uint64_t(mask) << 31) | (uint64_t(type) << 28) | (uint64_t(meta) << 20) |
+           (coord << 8) | kPT | d;
+}
+constexpr uint64_t kExit = (0xe300ull << 48) | kPT | 0xf;
+constexpr uint64_t kBra = (0xe240ull << 48) | kPT | 0xf;
+}  // namespace enc
+
+static void TestShaderTranslator() {
+    using namespace dsr::hle::nvn::shader;
+    using namespace enc;
+    // Vertex: position from attribute 0, varying 0 from attribute 1.
+    auto vs = MakeShader(1, 0, {Ald(0, 0x80), Ald(1, 0x84), Ald(2, 0x88), Ald(3, 0x8c), Ast(0, 0x70), Ast(1, 0x74),
+                                Ast(2, 0x78), Ast(3, 0x7c), Ald(4, 0x90), Ast(4, 0x80), kExit});
+    TranslateResult v = Translate(vs.data(), vs.size(), TranslateOptions{});
+    if (!v.ok) fprintf(stderr, "  vertex: %s\n", v.error.c_str());
+    CHECK(v.ok);
+    CHECK(v.ok && v.info.stage == Stage::Vertex && v.info.input_mask == 0x3 && v.info.output_mask == 0x1);
+    CHECK(v.ok && v.spirv.size() > 5 && v.spirv[0] == 0x07230203);
+
+    // Fragment, shaped like the game's menu shader: handle from the texture table, perspective divide,
+    // 2D rgba sample, multiply by the interpolated color, write render target 0.
+    auto fs = MakeShader(5, 0xF, {MovCbuf(11, 13, 0x20), Ipa(10, 0x7c, 0, 255), Ipa(4, 0x80, 0, 255),
+                                  Ipa(5, 0x84, 0, 255), Mufu(10, 10, 4), Fmul(4, 10, 4), Fmul(5, 10, 5),
+                                  TexB(0, 4, 11, 2, 0xF), Ipa(6, 0x90, 1, 10), Fmul(0, 0, 6), kExit});
+    TranslateResult f = Translate(fs.data(), fs.size(), TranslateOptions{});
+    if (!f.ok) fprintf(stderr, "  fragment: %s\n", f.error.c_str());
+    CHECK(f.ok);
+    CHECK(f.ok && f.info.stage == Stage::Fragment && f.info.texture_mask == 0x1 && f.info.output_mask == 0x1);
+    CHECK(f.ok && f.info.texture_dim[0] == TexDim::D2 && f.info.cbuf_mask == 0);  // the handle needs no buffer
+    CHECK(f.ok && f.info.input_mask == 0x3);
+
+    // A texture handle that does not come from the binding table is reported, not guessed.
+    auto bad = MakeShader(5, 0xF, {Ipa(4, 0x80, 0, 255), TexB(0, 4, 4, 2, 0xF), kExit});
+    CHECK(!Translate(bad.data(), bad.size(), TranslateOptions{}).ok);
+    // Branches are reported, not mistranslated.
+    auto br = MakeShader(5, 0xF, {kBra, kExit});
+    CHECK(!Translate(br.data(), br.size(), TranslateOptions{}).ok);
+}
+
 // ---- arm64 ABI glue ----------------------------------------------------------------------------
 #if defined(__aarch64__)
 extern "C" {
@@ -397,6 +471,7 @@ int main() {
         {"os_sync", TestOsSync},
         {"null_nvn", TestNullNvn},
         {"nvn_commands", TestNvnCommands},
+        {"shader_translator", TestShaderTranslator},
 #if defined(__aarch64__)
         {"abi_arm64", TestAbi},
 #endif
