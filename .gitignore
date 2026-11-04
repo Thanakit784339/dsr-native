@@ -5,3 +5,11 @@ android/app/.cxx/
 android/local.properties
 android/.idea/
 *.iml
+
+# Never commit game data or extracted executables.
+*.nso
+*.bdt
+*.bhd5
+*.mp4
+exefs/
+game/

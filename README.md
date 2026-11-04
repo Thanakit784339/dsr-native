@@ -37,7 +37,13 @@ list of NVN functions it requested — that list is the spec for the Vulkan back
 
 ## Building
 
-**Android APK** — open `android/` in Android Studio (with NDK + CMake installed) and run. Or from a shell
+**GitHub Actions (no local tools needed)** — push this repo to GitHub. Every push runs
+`.github/workflows/build.yml`, which builds the debug APK (download it from the run page under
+*Artifacts* → `dsr-native-debug-apk`) and runs the runtime tests on x86-64 and arm64. You can also
+start a build by hand from the *Actions* tab (*Build* → *Run workflow*).
+Do not commit game files: the repo only contains source code, and `.gitignore` blocks game data.
+
+**Android Studio** — open `android/` in Android Studio (with NDK + CMake installed) and run. Or from a shell
 with the Android SDK configured: `cd android && gradle assembleDebug`.
 Requirements: arm64-v8a device, Android 10 (API 29) or newer.
 
