@@ -1515,8 +1515,29 @@ private:
                 break;
             }
             case Op::IADD3: {
-                Id s = b_.OpResult(SpvOpIAdd, t_u32_, {GetU(ra), SrcBU(i, f, false)});
-                SetU(dest, b_.OpResult(SpvOpIAdd, t_u32_, {s, GetU(uint32_t(Bits(i, 39, 8)))}));
+                // dest = ((a + b) shifted) + c. Register form: halves a 35-36, b 33-34, c 31-32 (0 all, 1 low, 2
+                // high), shift 37-38 (1: >> 16, 2: << 16) applied to a + b. All forms: negate a 51, b 50, c 49.
+                Id a = GetU(ra), bv = SrcBU(i, f, false), c = GetU(uint32_t(Bits(i, 39, 8)));
+                uint32_t shift = 0;
+                if (f == Form::Reg) {
+                    auto halfsel = [&](Id v, uint32_t sel) -> Id {
+                        if (sel == 1) return b_.OpResult(SpvOpBitwiseAnd, t_u32_, {v, b_.ConstUint(0xFFFF)});
+                        if (sel == 2) return b_.OpResult(SpvOpShiftRightLogical, t_u32_, {v, b_.ConstUint(16)});
+                        return v;
+                    };
+                    a = halfsel(a, uint32_t(Bits(i, 35, 2)));
+                    bv = halfsel(bv, uint32_t(Bits(i, 33, 2)));
+                    c = halfsel(c, uint32_t(Bits(i, 31, 2)));
+                    shift = uint32_t(Bits(i, 37, 2));
+                }
+                auto neg = [&](Id v) { return BitcastU(b_.OpResult(SpvOpSNegate, t_i32_, {BitcastI(v)})); };
+                if (Bits(i, 51, 1)) a = neg(a);
+                if (Bits(i, 50, 1)) bv = neg(bv);
+                if (Bits(i, 49, 1)) c = neg(c);
+                Id s = b_.OpResult(SpvOpIAdd, t_u32_, {a, bv});
+                if (shift == 1) s = b_.OpResult(SpvOpShiftRightLogical, t_u32_, {s, b_.ConstUint(16)});
+                if (shift == 2) s = b_.OpResult(SpvOpShiftLeftLogical, t_u32_, {s, b_.ConstUint(16)});
+                SetU(dest, b_.OpResult(SpvOpIAdd, t_u32_, {s, c}));
                 break;
             }
             case Op::ISCADD: {
