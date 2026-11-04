@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -382,6 +383,61 @@ void OnError(AMediaCodec*, void* ud, media_status_t err, int32_t code, const cha
 }
 #endif
 
+// NV12 (BT.709, limited range) -> RGBA8, two pixels per chroma sample, table driven.
+struct YuvTables {
+    int y[256], rv[256], gu[256], gv[256], bu[256];
+    YuvTables() {
+        for (int i = 0; i < 256; i++) {
+            y[i] = 298 * (i - 16) + 128;
+            rv[i] = 459 * (i - 128);   // 1.793
+            gu[i] = -55 * (i - 128);   // 0.213
+            gv[i] = -136 * (i - 128);  // 0.533
+            bu[i] = 541 * (i - 128);   // 2.112
+        }
+    }
+};
+inline uint8_t Clamp8(int v) { return uint8_t(v < 0 ? 0 : v > 255 ? 255 : v); }
+void ConvertNv12(const uint8_t* y_plane, int stride, int slice, int cl, int ct, int w, int h, uint8_t* dst,
+                 size_t pitch) {
+    static const YuvTables T;
+    const uint8_t* uv_plane = y_plane + size_t(stride) * size_t(slice);
+    for (int yy = 0; yy < h; yy++) {
+        const uint8_t* yr = y_plane + size_t(yy + ct) * size_t(stride) + cl;
+        const uint8_t* uvr = uv_plane + size_t((yy + ct) / 2) * size_t(stride) + (cl & ~1);
+        uint32_t* out = reinterpret_cast<uint32_t*>(dst + size_t(yy) * pitch);
+        int xx = 0;
+        for (; xx + 1 < w; xx += 2) {
+            const int u = uvr[xx], v = uvr[xx + 1];
+            const int dr = T.rv[v], dg = T.gu[u] + T.gv[v], db = T.bu[u];
+            const int c0 = T.y[yr[xx]], c1 = T.y[yr[xx + 1]];
+            out[xx] = uint32_t(Clamp8((c0 + dr) >> 8)) | uint32_t(Clamp8((c0 + dg) >> 8)) << 8 |
+                      uint32_t(Clamp8((c0 + db) >> 8)) << 16 | 0xff000000u;
+            out[xx + 1] = uint32_t(Clamp8((c1 + dr) >> 8)) | uint32_t(Clamp8((c1 + dg) >> 8)) << 8 |
+                          uint32_t(Clamp8((c1 + db) >> 8)) << 16 | 0xff000000u;
+        }
+        if (xx < w) {
+            const int u = uvr[xx], v = uvr[xx + 1], c = T.y[yr[xx]];
+            out[xx] = uint32_t(Clamp8((c + T.rv[v]) >> 8)) | uint32_t(Clamp8((c + T.gu[u] + T.gv[v]) >> 8)) << 8 |
+                      uint32_t(Clamp8((c + T.bu[u]) >> 8)) << 16 | 0xff000000u;
+        }
+    }
+}
+// Average conversion time, logged every 120 frames.
+void RecordConvertTime(std::chrono::steady_clock::duration d) {
+    static std::mutex m;
+    static double total_ms = 0, max_ms = 0;
+    static int n = 0;
+    std::lock_guard<std::mutex> lk(m);
+    const double ms = std::chrono::duration<double, std::milli>(d).count();
+    total_ms += ms;
+    max_ms = std::max(max_ms, ms);
+    if (++n == 120) {
+        LOGI(kTag, "video frame conversion: %.1f ms average, %.1f ms max (120 frames)", total_ms / n, max_ms);
+        total_ms = max_ms = 0;
+        n = 0;
+    }
+}
+
 void DecDtor(void* self) {
     Trace("Decoder::~Decoder");
     delete Dec(self);
@@ -571,37 +627,45 @@ int DecGetOutputBuffer(void* self, int index, void* buffer) {
             return kOk;
         }
         // Convert NV12 (BT.709, limited range) to RGBA: straight into the game's memory when it is big enough,
-        // else into a scratch picture that is written into the texture owning that memory (the game passes
-        // its video texture's storage with a token capacity, as the hardware decoder writes it directly).
+        // else into a picture that is written into the texture owning that memory (the game passes its video
+        // texture's storage with a token capacity, as the hardware decoder writes it directly). That write
+        // runs on the render thread, between command lists: the backend reads (uploads) that memory while it
+        // executes them, and a half-written frame shows up as blocks of two different frames.
         const bool direct = gb.capacity >= pitch * size_t(h);
-        static thread_local std::vector<uint8_t> scratch;
-        uint8_t* dst = direct ? gb.data : (scratch.resize(pitch * size_t(h)), scratch.data());
-        const uint8_t* y_plane = p + o.offset;
-        const uint8_t* uv_plane = y_plane + size_t(stride) * size_t(slice);
-        for (int yy = 0; yy < h; yy++) {
-            const uint8_t* yr = y_plane + size_t(yy + ct) * size_t(stride) + cl;
-            const uint8_t* uvr = uv_plane + size_t((yy + ct) / 2) * size_t(stride) + (cl & ~1);
-            uint8_t* out = dst + size_t(yy) * pitch;
-            for (int xx = 0; xx < w; xx++) {
-                const int c = 298 * (int(yr[xx]) - 16);
-                const int u = int(uvr[xx & ~1]) - 128, v = int(uvr[(xx & ~1) + 1]) - 128;
-                int r = (c + 459 * v + 128) >> 8;              // 1.793
-                int g = (c - 55 * u - 136 * v + 128) >> 8;     // 0.213, 0.533
-                int b = (c + 541 * u + 128) >> 8;              // 2.112
-                out[xx * 4 + 0] = uint8_t(r < 0 ? 0 : r > 255 ? 255 : r);
-                out[xx * 4 + 1] = uint8_t(g < 0 ? 0 : g > 255 ? 255 : g);
-                out[xx * 4 + 2] = uint8_t(b < 0 ? 0 : b > 255 ? 255 : b);
-                out[xx * 4 + 3] = 255;
+        auto frame = direct ? nullptr : std::make_shared<std::vector<uint8_t>>(pitch * size_t(h));
+        uint8_t* dst = direct ? gb.data : frame->data();
+        const auto t0 = std::chrono::steady_clock::now();
+        ConvertNv12(p + o.offset, stride, slice, cl, ct, w, h, dst, pitch);
+        RecordConvertTime(std::chrono::steady_clock::now() - t0);
+        bool ok = direct;
+        if (!direct) {
+            ok = true;  // checked on the render thread (logged once below)
+            const uint64_t addr = uint64_t(reinterpret_cast<uintptr_t>(gb.data));
+            const bool first = !d->logged_convert;
+            const uint64_t seq = dsr::hle::nvn::GpuEnqueue([frame, addr, w, h, pitch, first] {
+                const bool r = dsr::hle::nvn::WriteTextureAtAddress(addr, frame->data(), w, h, pitch);
+                if (first || !r) {
+                    static int logged = 0;
+                    if (logged++ < 4)
+                        LOGI(kTag, "video frame %dx%d -> texture %llx: %s", w, h, (unsigned long long)addr,
+                             r ? "written into that texture" : "NO TEXTURE THERE");
+                }
+            });
+            // At most a few frames (8 MB each) waiting for the render thread.
+            static std::mutex pending_m;
+            static std::deque<uint64_t> pending;
+            std::lock_guard<std::mutex> lk(pending_m);
+            pending.push_back(seq);
+            while (pending.size() > 3) {
+                dsr::hle::nvn::GpuWait(pending.front());
+                pending.pop_front();
             }
         }
-        bool ok = direct;
-        if (!direct)
-            ok = dsr::hle::nvn::WriteTextureAtAddress(uint64_t(reinterpret_cast<uintptr_t>(gb.data)), dst, w, h, pitch);
         if (!d->logged_convert) {
             d->logged_convert = true;
             LOGI(kTag, "video frame %dx%d (stride %d, slice height %d) -> game memory %p (capacity %zu): %s", w, h,
                  stride, slice, static_cast<void*>(gb.data), gb.capacity,
-                 direct ? "converted in place" : ok ? "written into that texture" : "NO TEXTURE THERE");
+                 direct ? "converted in place" : "queued for the render thread");
         }
         if (ok) {
             if (direct) {

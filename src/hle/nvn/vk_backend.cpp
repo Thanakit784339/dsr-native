@@ -300,6 +300,7 @@ struct Image {
     // memory (e.g. video frames). Checked at most once per command list via a sparse hash.
     bool cpu_source = false;
     uint64_t sample_hash = 0;
+    bool force_reload = false;  // the CPU rewrote the storage (TextureMemoryWritten)
     uint64_t checked_in_list = 0;
     std::map<std::vector<uint32_t>, VkImageView> views;
     std::unordered_map<uint64_t, VkImageView> fast_views;  // same views by hashed key
@@ -516,6 +517,13 @@ public:
         uint32_t w = 0, h = 0, src_w = 0, src_h = 0, nvn_format = 0, draws = 0, pass = 0, flags = 0, raw_bpp = 4;
         uint64_t fs_hash = 0;
     };
+    void TextureMemoryWritten(uint64_t addr) override {
+        auto it = images_.find(addr);
+        if (it == images_.end()) return;
+        it->second.force_reload = true;
+        it->second.checked_in_list = 0;
+    }
+
     void RequestCapture(int delay_s) override {
         capture_request_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
                                   std::chrono::steady_clock::now().time_since_epoch()).count() + int64_t(delay_s) * 1000;
@@ -1281,7 +1289,7 @@ private:
             img->checked_in_list = list_counter_;
             const bool big = size_t(img->width) * img->height >= 512 * 512;
             if (big) big_checks_++;
-            if (SampleHash(t) != img->sample_hash) {
+            if (img->force_reload || SampleHash(t) != img->sample_hash) {
                 if (big) big_changes_++;
                 Upload(*img, t);
                 if (++reuploads_ <= 8 || reuploads_ % 300 == 0)
@@ -1389,6 +1397,7 @@ private:
     void Upload(Image& img, const TexRef& t) {
         img.uploaded = true;
         img.cpu_source = true;
+        img.force_reload = false;
         img.sample_hash = SampleHash(t);
         img.checked_in_list = list_counter_;
         const TextureLayout layout = ComputeLayout(t.tex);

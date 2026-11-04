@@ -25,6 +25,7 @@ constexpr uint32_t kOk = 0;
 constexpr uint32_t kAudioInUnavailable = 153u | (1u << 9);
 constexpr int kSampleRate = 48000;
 constexpr int kChannels = 2;
+constexpr int32_t kBufferFrames = 3072;  // host stream buffer (64 ms at 48 kHz)
 
 // Guest AudioOutBuffer: our layout within the SDK's struct.
 struct GuestBuffer {
@@ -55,11 +56,22 @@ public:
         AAudioStreamBuilder_setChannelCount(b, kChannels);
         AAudioStreamBuilder_setSampleRate(b, kSampleRate);
         AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+        AAudioStreamBuilder_setBufferCapacityInFrames(b, kBufferFrames * 2);
         aaudio_result_t r = AAudioStreamBuilder_openStream(b, &stream_);
         AAudioStreamBuilder_delete(b);
         if (r != AAUDIO_OK) {
             LOGE(kTag, "AAudio openStream failed: %s", AAudio_convertResultToText(r));
             stream_ = nullptr;
+        } else {
+            // A low-latency stream defaults to a buffer of a burst or two (a few ms): the game's buffer is
+            // released only once its samples fit in there, so any delay of the game's audio thread (busy
+            // CPU, e.g. while a video plays) runs the device dry and the sound stutters. Keep ~64 ms queued.
+            const int32_t cap = AAudioStream_getBufferCapacityInFrames(stream_);
+            AAudioStream_setBufferSizeInFrames(stream_, std::min<int32_t>(kBufferFrames, cap));
+            LOGI(kTag, "AAudio stream: %d Hz, burst %d frames, buffer %d of %d frames, %s", AAudioStream_getSampleRate(stream_),
+                 AAudioStream_getFramesPerBurst(stream_), AAudioStream_getBufferSizeInFrames(stream_), cap,
+                 AAudioStream_getPerformanceMode(stream_) == AAUDIO_PERFORMANCE_MODE_LOW_LATENCY ? "low latency"
+                                                                                                   : "normal");
         }
 #endif
         return true;
@@ -161,9 +173,13 @@ private:
         frames_played_ += frames;
         buffers_played_++;
         if (frames_played_ >= next_report_) {
-            LOGI(kTag, "audio out: %llu buffers, %.1f s played, peak level %d/32767 (%s)",
-                 (unsigned long long)buffers_played_, double(frames_played_) / kSampleRate, peak_,
-                 peak_ < 64 ? "silence" : "sound");
+            int32_t xruns = 0;
+#if defined(__ANDROID__)
+            if (stream_) xruns = AAudioStream_getXRunCount(stream_);
+#endif
+            LOGI(kTag, "audio out (%d ch): %llu buffers, %.1f s played, peak level %d/32767 (%s), %d underruns",
+                 channels_, (unsigned long long)buffers_played_, double(frames_played_) / kSampleRate, peak_,
+                 peak_ < 64 ? "silence" : "sound", xruns);
             next_report_ = frames_played_ + 10 * kSampleRate;
             peak_ = 0;
         }

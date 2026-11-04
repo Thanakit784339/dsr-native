@@ -377,6 +377,7 @@ bool WriteTextureAtAddressImpl(uint64_t addr, const void* rgba, int w, int h, si
     if (cw <= 0 || ch <= 0 || uint32_t(cw) * 4 > uint32_t(l.row_bytes) || uint32_t(ch) > uint32_t(l.rows)) return false;
     WriteLevelRegion(reinterpret_cast<uint8_t*>(addr) + l.offset, l, layout.linear, 0, 0, 0, uint32_t(cw) * 4,
                      uint32_t(ch), 1, static_cast<const uint8_t*>(rgba), pitch, pitch * size_t(ch));
+    GetBackend().TextureMemoryWritten(addr);
     return true;
 }
 void TexFinalize(void* tex) { g_textures.Erase(tex); }
