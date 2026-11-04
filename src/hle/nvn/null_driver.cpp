@@ -278,16 +278,19 @@ void QueuePresentTexture(void* queue, void* window, int index) {
         report = clock::now();
         GpuStats s = Stats();
         double f = double(std::max<uint64_t>(1, n - frames_at_report));
-        LOGI(kTag, "%llu frames presented | per frame: %.1f submits, %.1f draws, %.1f clears, %.1f copies, %.1f target binds",
-             (unsigned long long)n, (s.submits - last.submits) / f, (s.draws - last.draws) / f,
-             (s.clears - last.clears) / f, (s.copies - last.copies) / f, (s.rt_binds - last.rt_binds) / f);
+        LOGI(kTag,
+             "%llu frames presented | per frame: %.1f recorded, %.1f submit calls, %.1f lists run, %.1f draws, "
+             "%.1f clears, %.1f copies, %.1f target binds%s",
+             (unsigned long long)n, (s.recordings - last.recordings) / f, (s.submit_calls - last.submit_calls) / f,
+             (s.submits - last.submits) / f, (s.draws - last.draws) / f, (s.clears - last.clears) / f,
+             (s.copies - last.copies) / f, (s.rt_binds - last.rt_binds) / f,
+             s.unknown_handles != last.unknown_handles ? " (some handles unknown)" : "");
         last = s;
         frames_at_report = n;
     }
 }
 
 // ---- command buffers -----------------------------------------------------------------------------------------
-size_t CmdZero(const void*) { return 0; }
 size_t CmdPlenty(const void*) { return 16u << 20; }
 
 // ---- sync ------------------------------------------------------------------------------------------------------
@@ -404,8 +407,6 @@ const Proc kProcs[] = {
     P("nvnQueuePresentTexture", QueuePresentTexture),
     // command buffers (recording is a no-op)
     P("nvnCommandBufferInitialize", True), P("nvnCommandBufferFinalize", Nop),
-    P("nvnCommandBufferAddCommandMemory", Nop), P("nvnCommandBufferAddControlMemory", Nop),
-    P("nvnCommandBufferGetCommandMemoryUsed", CmdZero), P("nvnCommandBufferGetControlMemoryUsed", CmdZero),
     P("nvnCommandBufferGetCommandMemoryFree", CmdPlenty), P("nvnCommandBufferGetControlMemoryFree", CmdPlenty),
     P("nvnCommandBufferGetCommandMemorySize", CmdPlenty), P("nvnCommandBufferGetControlMemorySize", CmdPlenty),
     // sync

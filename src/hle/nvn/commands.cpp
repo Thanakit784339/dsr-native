@@ -9,6 +9,7 @@
 // Every texture referenced by a command is captured by value (description + storage address) at
 // record time, so later Finalize/re-Initialize of the NVN object does not affect recorded work.
 
+#include <atomic>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -23,9 +24,15 @@ namespace {
 constexpr const char* kTag = "nvn";
 constexpr size_t kMaxHandles = 16384;
 
+// The game checks GetCommandMemoryUsed before submitting and skips buffers that report 0, so report a
+// plausible figure: an estimate of what real NVN would have written, reset when memory is (re)added.
+constexpr size_t kBytesPerCommand = 32;
+constexpr size_t kControlBytesPerRecording = 64;
+
 struct Recorder {
     bool recording = false;
     CmdList cmds;
+    size_t command_used = 0, control_used = 0;
 };
 Table<Recorder> g_recorders;
 
@@ -35,6 +42,7 @@ std::deque<uint64_t> g_handle_order;
 uint64_t g_next_handle = 1;
 
 GpuStats g_stats;
+std::atomic<uint64_t> g_begin_count{0}, g_end_count{0}, g_submit_calls{0}, g_unknown_handles{0};
 std::unique_ptr<Backend> g_default_backend;
 Backend* g_test_backend = nullptr;
 std::once_flag g_backend_once;
@@ -48,6 +56,7 @@ std::shared_ptr<const CmdList> FindHandle(uint64_t h) {
 void Append(void* cb, Cmd&& c) {
     Recorder& r = g_recorders.Get(cb);
     r.cmds.push_back(std::move(c));
+    r.command_used += kBytesPerCommand;
 }
 
 // ---- recording ------------------------------------------------------------------------------------------
@@ -55,12 +64,19 @@ void BeginRecording(void* cb) {
     Recorder& r = g_recorders.Get(cb);
     r.recording = true;
     r.cmds.clear();
+    r.control_used += kControlBytesPerRecording;
+    g_begin_count++;
 }
+void AddCommandMemory(void* cb, const void*, int64_t, size_t) { g_recorders.Get(cb).command_used = 0; }
+void AddControlMemory(void* cb, void*, size_t) { g_recorders.Get(cb).control_used = 0; }
+size_t GetCommandMemoryUsed(const void* cb) { return g_recorders.Copy(cb).command_used; }
+size_t GetControlMemoryUsed(const void* cb) { return g_recorders.Copy(cb).control_used; }
 uint64_t EndRecording(void* cb) {
     Recorder& r = g_recorders.Get(cb);
     auto list = std::make_shared<const CmdList>(std::move(r.cmds));
     r.cmds = CmdList{};
     r.recording = false;
+    g_end_count++;
     std::lock_guard<std::mutex> lk(g_handle_mutex);
     uint64_t h = g_next_handle++;
     g_handles.emplace(h, std::move(list));
@@ -160,9 +176,13 @@ void Draw(void* cb) {
 
 // ---- queue ------------------------------------------------------------------------------------------------
 void QueueSubmitCommands(void* /*queue*/, int n, const uint64_t* handles) {
+    g_submit_calls++;
     for (int i = 0; i < n; i++) {
         auto list = FindHandle(handles[i]);
-        if (!list) continue;
+        if (!list) {
+            g_unknown_handles++;
+            continue;
+        }
         g_stats.submits++;
         g_stats.commands += list->size();
         for (const Cmd& c : *list) {
@@ -188,6 +208,10 @@ const Proc kProcs[] = {
     P("nvnCommandBufferBeginRecording", BeginRecording),
     P("nvnCommandBufferEndRecording", EndRecording),
     P("nvnCommandBufferIsRecording", IsRecording),
+    P("nvnCommandBufferAddCommandMemory", AddCommandMemory),
+    P("nvnCommandBufferAddControlMemory", AddControlMemory),
+    P("nvnCommandBufferGetCommandMemoryUsed", GetCommandMemoryUsed),
+    P("nvnCommandBufferGetControlMemoryUsed", GetControlMemoryUsed),
     P("nvnCommandBufferCallCommands", CallCommands),
     P("nvnCommandBufferCopyCommands", CallCommands),
     P("nvnCommandBufferSetRenderTargets", SetRenderTargets),
@@ -222,7 +246,12 @@ struct Registrar {
 
 }  // namespace
 
-GpuStats& Stats() { return g_stats; }
+GpuStats& Stats() {
+    g_stats.recordings = g_end_count.load();
+    g_stats.submit_calls = g_submit_calls.load();
+    g_stats.unknown_handles = g_unknown_handles.load();
+    return g_stats;
+}
 
 Backend& GetBackend() {
     if (g_test_backend) return *g_test_backend;

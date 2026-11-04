@@ -232,7 +232,7 @@ public:
         pi.pSwapchains = &swapchain_;
         pi.pImageIndices = &idx;
         r = vkQueuePresentKHR(queue_, &pi);
-        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || r == VK_ERROR_SURFACE_LOST_KHR)
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR)
             swapchain_dirty_ = true;
         else if (r != VK_SUCCESS)
             LogOnce("present", "vkQueuePresentKHR failed: %d", r);
@@ -383,13 +383,19 @@ private:
             auto* aw = static_cast<ANativeWindow*>(window_);
             extent = {uint32_t(ANativeWindow_getWidth(aw)), uint32_t(ANativeWindow_getHeight(aw))};
         }
-        // We present with an identity transform and let the compositor rotate if the panel is mounted
-        // sideways; in that case the surface extent is reported in the panel's native orientation.
-        if (caps.currentTransform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR))
-            std::swap(extent.width, extent.height);
+        // Present with an identity transform: the image is in the window's orientation and the compositor
+        // rotates it for the panel (the AYN Thor's panel reports a 90-degree transform). currentExtent is
+        // already the window's size, so it is used unchanged. Such swapchains report SUBOPTIMAL on every
+        // frame; that is expected and must not trigger re-creation.
         VkSurfaceTransformFlagBitsKHR transform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
                                                       ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
                                                       : caps.currentTransform;
+        {
+            auto* aw = static_cast<ANativeWindow*>(window_);
+            LOGI(kTag, "surface: current extent %ux%u, window %dx%d, transform 0x%x", caps.currentExtent.width,
+                 caps.currentExtent.height, ANativeWindow_getWidth(aw), ANativeWindow_getHeight(aw),
+                 caps.currentTransform);
+        }
         VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
         for (VkCompositeAlphaFlagBitsKHR a : {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR})
             if (caps.supportedCompositeAlpha & a) {
@@ -427,8 +433,8 @@ private:
         vkGetSwapchainImagesKHR(device_, swapchain_, &ni, nullptr);
         sc_images_.resize(ni);
         vkGetSwapchainImagesKHR(device_, swapchain_, &ni, sc_images_.data());
-        LOGI(kTag, "swapchain %ux%u, format %d, %u images (surface transform 0x%x)", extent.width, extent.height,
-             fmt.format, ni, caps.currentTransform);
+        if (++swapchains_created_ <= 8)
+            LOGI(kTag, "swapchain %ux%u, format %d, %u images", extent.width, extent.height, fmt.format, ni);
         return true;
     }
 
@@ -695,6 +701,7 @@ private:
 
     // diagnostics
     uint64_t presented_ = 0;
+    int swapchains_created_ = 0;
     int images_created_ = 0, clear_colors_logged_ = 0, copies_logged_ = 0, target_sets_logged_ = 0;
     bool logged_first_image_ = false;
     std::set<uint64_t> logged_clears_, logged_targets_;

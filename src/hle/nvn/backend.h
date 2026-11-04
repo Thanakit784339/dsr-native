@@ -71,6 +71,7 @@ TexRef WindowTexture(const void* nvn_window, int index);
 // Per-frame statistics, reported every 10 s by the present path.
 struct GpuStats {
     uint64_t submits = 0, commands = 0, draws = 0, clears = 0, copies = 0, rt_binds = 0;
+    uint64_t recordings = 0, submit_calls = 0, unknown_handles = 0;
 };
 GpuStats& Stats();
 

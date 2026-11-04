@@ -274,6 +274,8 @@ static void TestNvnCommands() {
     Nvn<void (*)(void*, int, const float*, int)>("nvnCommandBufferClearColor")(cb, 0, red, 0xF);
     Nvn<void (*)(void*, float, bool, int, int)>("nvnCommandBufferClearDepthStencil")(cb, 1.0f, true, 0, 0xFF);
     Nvn<void (*)(void*)>("nvnCommandBufferDrawArrays")(cb);
+    // The game only submits buffers that report command memory use.
+    CHECK(Nvn<size_t (*)(const void*)>("nvnCommandBufferGetCommandMemoryUsed")(cb) > 0);
     uint64_t h = Nvn<uint64_t (*)(void*)>("nvnCommandBufferEndRecording")(cb);
     CHECK(h != 0);
     CHECK(!Nvn<bool (*)(const void*)>("nvnCommandBufferIsRecording")(cb));
