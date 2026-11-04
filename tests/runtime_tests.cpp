@@ -390,8 +390,8 @@ static void TestShaderTranslator() {
     // A texture handle that does not come from the binding table is reported, not guessed.
     auto bad = MakeShader(5, 0xF, {Ipa(4, 0x80, 0, 255), TexB(0, 4, 4, 2, 0xF), kExit});
     CHECK(!Translate(bad.data(), bad.size(), TranslateOptions{}).ok);
-    // Branches are reported, not mistranslated.
-    auto br = MakeShader(5, 0xF, {kBra, kExit});
+    // Loops (backward branches) are reported, not mistranslated.
+    auto br = MakeShader(5, 0xF, {Ipa(4, 0x80, 0, 255), kBra | (0xFFFFE8ull << 20), kExit});
     CHECK(!Translate(br.data(), br.size(), TranslateOptions{}).ok);
 }
 

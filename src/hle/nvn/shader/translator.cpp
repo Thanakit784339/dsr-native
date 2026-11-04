@@ -189,6 +189,21 @@ public:
             uint64_t inst;
             memcpy(&inst, code_ + kCodeOffset + idx * 8, 8);
             pc_ = uint32_t(idx * 8);
+            // Close conditional blocks that end here (their SSY reconvergence point).
+            while (!blocks_.empty() && blocks_.back().end == pc_) {
+                if (!blocks_.back().closed) b_.Op(SpvOpBranch, {blocks_.back().merge});
+                b_.Label(blocks_.back().merge);
+                // After the merge a register is only known if the block may not have changed it.
+                const auto& before = blocks_.back().known_before;
+                for (int r = 0; r < 256; r++)
+                    if (known_[r].kind != before[r].kind || known_[r].value != before[r].value) known_[r] = Known{};
+                blocks_.pop_back();
+            }
+            while (!ssy_.empty() && ssy_.back() == pc_) ssy_.pop_back();
+            if (skip_until_) {
+                if (pc_ < skip_until_) continue;  // jumped over (dead code)
+                skip_until_ = 0;
+            }
             info_.instruction_count++;
             ended = Emit(inst);
         }
@@ -640,6 +655,7 @@ private:
             if (sd == SpvDim1D) b_.Capability(SpvCapabilitySampled1D);
             if (sd == SpvDimCube && array) b_.Capability(SpvCapabilitySampledCubeArray);
             Id image = b_.TypeImage(t_f32_, sd, shadow ? 1 : 0, array ? 1 : 0);
+            (shadow ? shadow_image_type_ : tex_image_type_)[slot] = image;
             sampled = b_.TypeSampledImage(image);
             var = b_.Variable(b_.TypePointer(SpvStorageClassUniformConstant, sampled), SpvStorageClassUniformConstant);
             b_.Decorate(var, SpvDecorationDescriptorSet, {DescriptorSet()});
@@ -770,6 +786,178 @@ private:
         }
     }
 
+    static void TexTypeInfo(uint32_t type, TexDim* dim, uint32_t* ncoords) {
+        switch (type >> 1) {
+            case 0: *dim = TexDim::D1; *ncoords = 1; break;
+            case 1: *dim = TexDim::D2; *ncoords = 2; break;
+            case 2: *dim = TexDim::D3; *ncoords = 3; break;
+            default: *dim = TexDim::Cube; *ncoords = 3; break;
+        }
+    }
+    void WriteMasked(uint32_t dest, uint32_t mask, Id vec4_result) {
+        uint32_t d = dest;
+        for (uint32_t c = 0; c < 4; c++) {
+            if (!(mask >> c & 1)) continue;
+            Id v = b_.OpResult(SpvOpCompositeExtract, t_f32_, {vec4_result, c});
+            if (d != 255) SetF(d++, v);
+        }
+    }
+
+    // TLD (bindless texel fetch): integer coordinates, mip level 0.
+    void EmitTexelFetchBindless(uint64_t i) {
+        const uint32_t dest = uint32_t(Bits(i, 0, 8));
+        uint32_t coord = uint32_t(Bits(i, 8, 8));
+        const uint32_t meta = uint32_t(Bits(i, 20, 8));
+        const uint32_t type = uint32_t(Bits(i, 28, 3)), mask = uint32_t(Bits(i, 31, 4));
+        TexDim dim;
+        uint32_t n;
+        TexTypeInfo(type, &dim, &n);
+        const bool array = type & 1;
+        if (dim == TexDim::Cube) return Error("texel fetch from a cube map");
+        if (known_[meta].kind != Known::TexSlot) return Error("texture handle not from the binding table");
+        const uint32_t slot = known_[meta].value;
+        Id var = TextureVar(slot, false, dim, array);
+        std::vector<Id> c;
+        Id layer = array ? BitcastI(GetU(coord++)) : 0;
+        for (uint32_t k = 0; k < n; k++) c.push_back(BitcastI(GetU(coord + k)));
+        if (layer) c.push_back(layer);
+        Id coords = c[0];
+        if (c.size() > 1) {
+            Id vt = c.size() == 2 ? t_v2i_ : c.size() == 3 ? t_v3i_ : b_.TypeVector(t_i32_, 4);
+            coords = b_.OpResult(SpvOpCompositeConstruct, vt, std::vector<uint32_t>(c.begin(), c.end()));
+        }
+        Id sampled = b_.OpResult(SpvOpLoad, tex_type_[slot], {var});
+        Id image = b_.OpResult(SpvOpImage, tex_image_type_[slot], {sampled});
+        Id r = b_.OpResult(SpvOpImageFetch, t_v4f_, {image, coords, uint32_t(SpvImageOperandsLodMask), b_.ConstInt(0)});
+        WriteMasked(dest, mask, r);
+    }
+
+    // TLD4 (bindless gather): component 38-39, offset type 36-37 (1 = AOFFI), depth compare 50.
+    void EmitGatherBindless(uint64_t i) {
+        const uint32_t dest = uint32_t(Bits(i, 0, 8));
+        uint32_t coord = uint32_t(Bits(i, 8, 8));
+        uint32_t meta = uint32_t(Bits(i, 20, 8));
+        const uint32_t type = uint32_t(Bits(i, 28, 3)), mask = uint32_t(Bits(i, 31, 4));
+        const uint32_t offset_type = uint32_t(Bits(i, 36, 2)), component = uint32_t(Bits(i, 38, 2));
+        const bool dc = Bits(i, 50, 1);
+        TexDim dim;
+        uint32_t n;
+        TexTypeInfo(type, &dim, &n);
+        const bool array = type & 1;
+        if (dim != TexDim::D2 && dim != TexDim::Cube) return Error("gather from a 1D/3D texture");
+        if (offset_type > 1) return Error("per-texel gather offsets");
+        if (known_[meta].kind != Known::TexSlot) return Error("texture handle not from the binding table");
+        const uint32_t slot = known_[meta].value;
+        meta++;
+        Id var = TextureVar(slot, dc, dim, array);
+        std::vector<Id> c;
+        Id layer = array ? b_.OpResult(SpvOpConvertUToF, t_f32_, {GetU(coord++)}) : 0;
+        for (uint32_t k = 0; k < n; k++) c.push_back(GetF(coord + k));
+        if (layer) c.push_back(layer);
+        Id vt = c.size() == 2 ? t_v2f_ : c.size() == 3 ? t_v3f_ : t_v4f_;
+        Id coords = b_.OpResult(SpvOpCompositeConstruct, vt, std::vector<uint32_t>(c.begin(), c.end()));
+        std::vector<uint32_t> operands;
+        uint32_t mask_bits = 0;
+        if (offset_type == 1 && dim == TexDim::D2) {
+            if (known_[meta].kind == Known::Const) {
+                const uint32_t packed = known_[meta].value;
+                int32_t ox = int32_t(packed & 0xF), oy = int32_t((packed >> 4) & 0xF);
+                if (ox & 8) ox -= 16;
+                if (oy & 8) oy -= 16;
+                operands.push_back(b_.ConstComposite(t_v2i_, {b_.ConstInt(ox), b_.ConstInt(oy)}));
+                mask_bits = SpvImageOperandsConstOffsetMask;
+            } else {
+                b_.Capability(SpvCapabilityImageGatherExtended);
+                Id raw = BitcastI(GetU(meta));
+                Id ox = b_.OpResult(SpvOpBitFieldSExtract, t_i32_, {raw, b_.ConstUint(0), b_.ConstUint(4)});
+                Id oy = b_.OpResult(SpvOpBitFieldSExtract, t_i32_, {raw, b_.ConstUint(4), b_.ConstUint(4)});
+                operands.push_back(b_.OpResult(SpvOpCompositeConstruct, t_v2i_, {ox, oy}));
+                mask_bits = SpvImageOperandsOffsetMask;
+            }
+            meta++;
+        }
+        Id sampled = b_.OpResult(SpvOpLoad, dc ? shadow_type_[slot] : tex_type_[slot], {var});
+        std::vector<uint32_t> args = {sampled, coords};
+        if (dc)
+            args.push_back(GetF(meta++));
+        else
+            args.push_back(b_.ConstUint(component));
+        if (mask_bits) {
+            args.push_back(mask_bits);
+            args.insert(args.end(), operands.begin(), operands.end());
+        }
+        Id r = b_.OpResult(dc ? SpvOpImageDrefGather : SpvOpImageGather, t_v4f_, args);
+        WriteMasked(dest, mask, r);
+    }
+
+    // ---- forward branches (SYNC to an SSY point, BRA) as structured selections ------------------------------
+    // Branch targets are relative to the next instruction. A target on a scheduling control word means the
+    // instruction after it.
+    uint32_t BranchTarget(uint64_t i) const {
+        int32_t off = int32_t(Bits(i, 20, 24) << 8) >> 8;
+        const int32_t signed_target = int32_t(pc_) + 8 + off;
+        if (signed_target < 0) return 0;  // before the program: reported as a backward branch
+        uint32_t t = uint32_t(signed_target);
+        if (t % 32 == 0) t += 8;
+        return t;
+    }
+    void JumpForward(uint32_t target, bool predicated, uint32_t guard) {
+        // Blocks must nest: a new one may not outlive the enclosing one.
+        if (!blocks_.empty() && target > blocks_.back().end) {
+            Error("unstructured branch out of a conditional block");
+            return;
+        }
+        if (predicated) {
+            // Threads where the guard holds jump to the target: the code up to it runs only when it fails.
+            Id skip = GetPred(guard & 7, guard & 8);
+            Id run = b_.OpResult(SpvOpLogicalNot, t_bool_, {skip});
+            Id body = b_.NewId(), merge = b_.NewId();
+            b_.Op(SpvOpSelectionMerge, {merge, uint32_t(SpvSelectionControlMaskNone)});
+            b_.Op(SpvOpBranchConditional, {run, body, merge});
+            b_.Label(body);
+            blocks_.push_back({merge, target, false, std::vector<Known>(known_, known_ + 256)});
+            return;
+        }
+        // Everyone jumps: end the innermost block if it ends there, then skip the dead code.
+        if (!blocks_.empty()) {
+            if (blocks_.back().end != target) {
+                Error("unstructured jump inside a conditional block");
+                return;
+            }
+            if (!blocks_.back().closed) b_.Op(SpvOpBranch, {blocks_.back().merge});
+            blocks_.back().closed = true;
+        }
+        skip_until_ = target;
+    }
+
+    // ---- local memory (STL / LDL): a per-invocation 4 KiB array ------------------------------------------
+    Id LocalWord(Id byte_address) {
+        if (!local_) {
+            Id arr = b_.TypeArray(t_u32_, 1024);
+            local_ = b_.LocalVariable(b_.TypePointer(SpvStorageClassFunction, arr));
+            b_.Name(local_, "lmem");
+        }
+        Id idx = b_.OpResult(SpvOpShiftRightLogical, t_u32_, {byte_address, b_.ConstUint(2)});
+        idx = b_.OpResult(SpvOpBitwiseAnd, t_u32_, {idx, b_.ConstUint(1023)});
+        return b_.OpResult(SpvOpAccessChain, p_fn_u32_, {local_, idx});
+    }
+    void EmitLocal(uint64_t i, bool store) {
+        const uint32_t reg = uint32_t(Bits(i, 0, 8)), addr = uint32_t(Bits(i, 8, 8));
+        const int32_t off = int32_t(Bits(i, 20, 24) << 8) >> 8;
+        const uint32_t size = uint32_t(Bits(i, 48, 3));
+        const uint32_t words = size == 4 ? 1 : size == 5 ? 2 : size == 6 ? 4 : 0;
+        if (!words) return Error("unsupported local memory access size");
+        Id base = b_.OpResult(SpvOpIAdd, t_u32_, {GetU(addr), b_.ConstUint(uint32_t(off))});
+        for (uint32_t k = 0; k < words; k++) {
+            Id a = k ? b_.OpResult(SpvOpIAdd, t_u32_, {base, b_.ConstUint(4 * k)}) : base;
+            Id p = LocalWord(a);
+            if (store)
+                b_.Op(SpvOpStore, {p, GetU(reg + k)});
+            else
+                SetU(reg + k, b_.OpResult(SpvOpLoad, t_u32_, {p}));
+        }
+    }
+
     // ---- XMAD (16x16 multiply-add) ------------------------------------------------------------------------
     void EmitXmad(uint64_t i, Form f) {
         const uint32_t dest = uint32_t(Bits(i, 0, 8));
@@ -850,22 +1038,50 @@ private:
         // Instructions that change control flow or end the program.
         switch (d.op) {
             case Op::EXIT:
-                if (!predicated) {
-                    EmitExit();
-                    return true;
-                }
-                break;
             case Op::KIL:
                 if (!predicated) {
-                    info_.uses_discard = true;
-                    b_.Op(SpvOpKill, {});
-                    return true;
+                    if (d.op == Op::EXIT) {
+                        EmitExit();
+                    } else {
+                        info_.uses_discard = true;
+                        b_.Op(SpvOpKill, {});
+                    }
+                    if (blocks_.empty()) return true;
+                    // Inside a conditional block: the rest of the block is dead.
+                    blocks_.back().closed = true;
+                    skip_until_ = blocks_.back().end;
+                    return false;
                 }
                 break;
-            case Op::BRA:
-                Error("branches are not supported yet");
+            case Op::SSY:
+                // Pushes the reconvergence point for a following SYNC.
+                ssy_.push_back(BranchTarget(i));
                 return false;
-            case Op::SSY: case Op::SYNC: case Op::PBK: case Op::BRK: case Op::PCNT: case Op::CONT:
+            case Op::BRA: {
+                const uint32_t target = BranchTarget(i);
+                if (target <= pc_) {
+                    // A branch to itself after the final EXIT is padding; anything else is a loop.
+                    if (target == pc_ && !predicated) return blocks_.empty();
+                    Error("backward branches (loops) are not supported yet");
+                    return false;
+                }
+                JumpForward(target, predicated, guard);
+                return false;
+            }
+            case Op::SYNC: {
+                if (ssy_.empty()) {
+                    Error("SYNC without SSY");
+                    return false;
+                }
+                const uint32_t target = ssy_.back();
+                if (target <= pc_) {
+                    Error("backward SYNC target");
+                    return false;
+                }
+                JumpForward(target, predicated, guard);
+                return false;
+            }
+            case Op::PBK: case Op::BRK: case Op::PCNT: case Op::CONT:
                 Error(std::string("control flow (") + OpName(d.op) + ") is not supported yet");
                 return false;
             case Op::DEPBAR: case Op::NOP: case Op::MEMBAR:
@@ -1097,6 +1313,10 @@ private:
                 break;
             }
             case Op::TEXB: EmitTexBindless(i); break;
+            case Op::TLDB: EmitTexelFetchBindless(i); break;
+            case Op::TLD4B: EmitGatherBindless(i); break;
+            case Op::STL: EmitLocal(i, true); break;
+            case Op::LDL: EmitLocal(i, false); break;
             case Op::XMAD: EmitXmad(i, f); break;
             case Op::I2F: {
                 const uint32_t dst_fmt = uint32_t(Bits(i, 8, 2)), src_fmt = uint32_t(Bits(i, 10, 2));
@@ -1117,16 +1337,59 @@ private:
                 break;
             }
             case Op::F2I: {
-                if (Bits(i, 8, 2) != 2 || Bits(i, 10, 2) != 2) {
+                // dst size 8-9 (0: 8, 1: 16, 2: 32 bit), src size 10-11 (2: F32), signed 12; saturates.
+                const uint32_t dst = uint32_t(Bits(i, 8, 2));
+                const bool sgn = Bits(i, 12, 1);
+                if (dst == 3 || Bits(i, 10, 2) != 2) {
                     Error("unsupported F2I format");
                     return;
                 }
                 Id v = FMod(SrcBF(i, f), Bits(i, 49, 1), Bits(i, 45, 1));
                 static const G kRound[4] = {G::kRoundEven, G::kFloor, G::kCeil, G::kTrunc};
                 v = b_.Glsl(t_f32_, kRound[Bits(i, 39, 2)], {v});
-                Id r = Bits(i, 12, 1) ? BitcastU(b_.OpResult(SpvOpConvertFToS, t_i32_, {v}))
-                                      : b_.OpResult(SpvOpConvertFToU, t_u32_, {v});
+                const uint32_t bits = 8u << dst;
+                const double lo = sgn ? -double(1ull << (bits - 1)) : 0.0;
+                const double hi = sgn ? double((1ull << (bits - 1)) - 1) : double((1ull << bits) - 1);
+                // Clamp in float (the largest 32-bit values are not representable; stay just inside).
+                const float flo = float(lo), fhi = bits == 32 ? (sgn ? 2147483520.0f : 4294967040.0f) : float(hi);
+                v = b_.Glsl(t_f32_, G::kFClamp, {v, b_.ConstFloat(flo), b_.ConstFloat(fhi)});
+                Id r = sgn ? BitcastU(b_.OpResult(SpvOpConvertFToS, t_i32_, {v}))
+                           : b_.OpResult(SpvOpConvertFToU, t_u32_, {v});
                 SetU(dest, r);
+                break;
+            }
+            case Op::I2I: {
+                // dst size 8-9, src size 10-11, dst signed 12, src signed 13, byte/half selector 41-42,
+                // neg 45, abs 49, saturate 50.
+                const uint32_t dsz = uint32_t(Bits(i, 8, 2)), ssz = uint32_t(Bits(i, 10, 2));
+                const bool dsgn = Bits(i, 12, 1), ssgn = Bits(i, 13, 1), sat = Bits(i, 50, 1);
+                if (dsz == 3 || ssz == 3) {
+                    Error("unsupported I2I format");
+                    return;
+                }
+                Id v = SrcBU(i, f, false);
+                if (ssz != 2) {
+                    const uint32_t width = 8u << ssz, shift = uint32_t(Bits(i, 41, 2)) * width;
+                    v = ssgn ? BitcastU(b_.OpResult(SpvOpBitFieldSExtract, t_i32_, {BitcastI(v), b_.ConstUint(shift), b_.ConstUint(width)}))
+                             : b_.OpResult(SpvOpBitFieldUExtract, t_u32_, {v, b_.ConstUint(shift), b_.ConstUint(width)});
+                }
+                if (Bits(i, 49, 1)) v = BitcastU(b_.Glsl(t_i32_, G::kSAbsShim, {BitcastI(v)}));
+                if (Bits(i, 45, 1)) v = BitcastU(b_.OpResult(SpvOpSNegate, t_i32_, {BitcastI(v)}));
+                const uint32_t bits = 8u << dsz;
+                if (sat && bits < 32) {
+                    if (ssgn) {
+                        const int32_t lo = dsgn ? -(1 << (bits - 1)) : 0;
+                        const int32_t hi = dsgn ? (1 << (bits - 1)) - 1 : int32_t((1u << bits) - 1);
+                        v = BitcastU(b_.Glsl(t_i32_, G::kSClamp, {BitcastI(v), b_.ConstInt(lo), b_.ConstInt(hi)}));
+                    } else {
+                        const uint32_t hi = dsgn ? (1u << (bits - 1)) - 1 : (1u << bits) - 1;
+                        v = b_.Glsl(t_u32_, G::kUMin, {v, b_.ConstUint(hi)});
+                    }
+                }
+                if (bits < 32)
+                    v = dsgn ? BitcastU(b_.OpResult(SpvOpBitFieldSExtract, t_i32_, {BitcastI(v), b_.ConstUint(0), b_.ConstUint(bits)}))
+                             : b_.OpResult(SpvOpBitFieldUExtract, t_u32_, {v, b_.ConstUint(0), b_.ConstUint(bits)});
+                SetU(dest, v);
                 break;
             }
             case Op::F2F: {
@@ -1231,10 +1494,22 @@ private:
     Id reg_[256] = {}, pred_[8] = {}, cbuf_[kMaxCbufs] = {};
     Id in_[32] = {}, in_type_[32] = {}, out_[32] = {};
     Id tex_[32] = {}, tex_type_[32] = {}, shadow_[32] = {}, shadow_type_[32] = {};
+    Id tex_image_type_[32] = {}, shadow_image_type_[32] = {};
     Id push_ = 0;
     Id position_ = 0, point_size_ = 0, frag_coord_ = 0, frag_depth_ = 0, point_coord_ = 0, vertex_index_ = 0,
        instance_index_ = 0;
     std::vector<Id> interface_;
+    // Structured control flow from SSY/SYNC.
+    struct Block {
+        Id merge;
+        uint32_t end;   // byte offset of the reconvergence point
+        bool closed;    // branch to merge already emitted
+        std::vector<Known> known_before;  // register knowledge at the block's start
+    };
+    std::vector<Block> blocks_;
+    std::vector<uint32_t> ssy_;
+    uint32_t skip_until_ = 0;
+    Id local_ = 0;  // local memory (STL/LDL)
     Known known_[256];
 };
 
