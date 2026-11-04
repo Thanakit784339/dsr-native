@@ -24,6 +24,11 @@ target_include_directories(dsrcore PUBLIC src)
 target_compile_options(dsrcore PRIVATE
     -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
     $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>)
+if(ANDROID)
+    # abi.S reads the thread_local dsr_host_x18 through TLSDESC relocations, which needs real ELF TLS
+    # (API 29+). Emulated TLS would rename the symbol and break the link.
+    target_compile_options(dsrcore PUBLIC -fno-emulated-tls)
+endif()
 if(DSR_ARM64 AND NOT ANDROID)
     # Android reserves x18 by default; on other arm64 targets reserve it explicitly so host code
     # never depends on a value guest code may have clobbered.
