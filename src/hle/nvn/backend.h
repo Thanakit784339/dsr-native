@@ -121,7 +121,8 @@ TexRef MakeTexRef(const void* nvn_texture);
 TexRef WindowTexture(const void* nvn_window, int index);
 // True if [addr, addr+size) lies inside one registered NVN memory pool (safe to read).
 bool GuestRangeValid(uint64_t addr, size_t size);
-// Writes a linear RGBA8 picture into the texture whose storage starts at `addr` (its own layout).
+// Writes a linear RGBA8 picture into a texture (its own layout): `addr` is the texture's storage address or
+// an NVNtexture object pointer.
 bool WriteTextureAtAddress(uint64_t addr, const void* rgba, int w, int h, size_t pitch);
 
 // Per-frame statistics, reported every 10 s by the present path.

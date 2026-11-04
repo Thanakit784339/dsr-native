@@ -360,8 +360,13 @@ bool WriteTextureAtAddressImpl(uint64_t addr, const void* rgba, int w, int h, si
     {
         std::lock_guard<std::mutex> lk(g_tex_addr_mutex);
         auto it = g_tex_by_addr.find(addr);
-        if (it == g_tex_by_addr.end()) return false;
-        t = it->second;
+        if (it != g_tex_by_addr.end()) t = it->second;
+    }
+    if (!t.pool) {
+        // Not a storage address: an NVNtexture object (the movie decoder gets the game's texture object).
+        t = g_textures.Copy(reinterpret_cast<const void*>(addr));
+        if (!t.pool) return false;
+        addr = PoolBase(t.pool) + uint64_t(t.offset);
     }
     const FormatInfo fi = GetFormatInfo(t.format);
     if (fi.bytes_per_block != 4 || fi.block_w != 1 || fi.block_h != 1) return false;

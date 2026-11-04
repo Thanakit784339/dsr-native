@@ -601,7 +601,7 @@ int DecGetOutputBuffer(void* self, int index, void* buffer) {
             d->logged_convert = true;
             LOGI(kTag, "video frame %dx%d (stride %d, slice height %d) -> game memory %p (capacity %zu): %s", w, h,
                  stride, slice, static_cast<void*>(gb.data), gb.capacity,
-                 direct ? "converted in place" : ok ? "written into the texture at that address" : "NO TEXTURE THERE");
+                 direct ? "converted in place" : ok ? "written into that texture" : "NO TEXTURE THERE");
         }
         if (ok) {
             if (direct) {

@@ -1797,10 +1797,12 @@ private:
     // ======================================================================================================
     // rendering
     // ======================================================================================================
-    void EndRendering() {
+    // `line`: the caller (diagnostics: which code path breaks render passes, counted per 10 s).
+    void EndRendering(int line = __builtin_LINE()) {
         if (rendering_) {
             end_rendering_(cmd_);
             rendering_ = false;
+            pass_breaks_[line]++;
         }
     }
 
@@ -2921,6 +2923,16 @@ private:
         LOGI(kTag, "last 10 s: %llu render passes started, %llu image barriers", (unsigned long long)render_passes_,
              (unsigned long long)barriers_);
         render_passes_ = barriers_ = 0;
+        if (!pass_breaks_.empty()) {
+            std::vector<std::pair<uint64_t, int>> v;
+            for (auto& [line, n] : pass_breaks_) v.push_back({n, line});
+            std::sort(v.rbegin(), v.rend());
+            std::string top;
+            for (size_t i = 0; i < v.size() && i < 8; i++)
+                top += " line " + std::to_string(v[i].second) + ": " + std::to_string(v[i].first) + ";";
+            LOGI(kTag, "render passes ended by (source line: count):%s", top.c_str());
+            pass_breaks_.clear();
+        }
         LOGI(kTag, "last 10 s: %.0f ms executing lists (%.0f ms of it waiting for the GPU), %.1f MB streamed, %llu cached uploads",
              exec_ms_, wait_ms_, upload_bytes_ / 1048576.0, (unsigned long long)upload_hits_);
         std::string phases;
@@ -3011,6 +3023,7 @@ private:
     VkQueryPool ts_pool_ = VK_NULL_HANDLE;
     uint32_t ts_count_ = 0, ts_pass_[kMaxTimestamps] = {};
     uint64_t render_passes_ = 0, barriers_ = 0;
+    std::map<int, uint64_t> pass_breaks_;
     std::vector<uint32_t> query_pass_;
     uint64_t ubo_desc_draw_ = ~0ull;
     uint64_t tex_desc_draw_ = ~0ull;
