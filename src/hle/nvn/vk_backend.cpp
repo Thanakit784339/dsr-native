@@ -269,6 +269,16 @@ uint64_t Fnv(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
     for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull;
     return h;
 }
+// Incremental 64-bit FNV-1a for cache keys (no allocation).
+struct Key64 {
+    uint64_t h = 1469598103934665603ull;
+    void Add(const void* p, size_t n) {
+        const uint8_t* b = static_cast<const uint8_t*>(p);
+        for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull;
+    }
+    template <typename T>
+    void Add(const T& v) { Add(&v, sizeof(v)); }
+};
 struct VecHash {
     size_t operator()(const std::vector<uint32_t>& v) const { return size_t(Fnv(v.data(), v.size() * 4)); }
 };
@@ -292,6 +302,7 @@ struct Image {
     uint64_t sample_hash = 0;
     uint64_t checked_in_list = 0;
     std::map<std::vector<uint32_t>, VkImageView> views;
+    std::unordered_map<uint64_t, VkImageView> fast_views;  // same views by hashed key
 };
 
 struct Shader {
@@ -1043,6 +1054,7 @@ private:
     void ResetTransient() {
         stream_off_ = kMaxUniformRange;  // [0, 64K) is the zero buffer
         vkResetDescriptorPool(device_, desc_pool_, 0);
+        desc_cache_.clear();
         stream_cache_.clear();
     }
     void Begin() {
@@ -1215,7 +1227,10 @@ private:
             Upload(*img, t);
         } else if (upload && img->cpu_source && img->checked_in_list != list_counter_) {
             img->checked_in_list = list_counter_;
+            const bool big = size_t(img->width) * img->height >= 512 * 512;
+            if (big) big_checks_++;
             if (SampleHash(t) != img->sample_hash) {
+                if (big) big_changes_++;
                 Upload(*img, t);
                 if (++reuploads_ <= 8 || reuploads_ % 300 == 0)
                     LOGI(kTag, "texture %dx%d format %d changed in game memory: re-uploaded (%llu so far)", img->width,
@@ -1309,9 +1324,11 @@ private:
         const uint8_t* p = reinterpret_cast<const uint8_t*>(t.addr);
         uint64_t h = Fnv(p, std::min<size_t>(256, total));
         h = Fnv(p + total - std::min<size_t>(256, total), std::min<size_t>(256, total), h);
-        for (size_t i = 1; i < 64; i++) {
-            size_t off = total / 64 * i;
-            h = Fnv(p + off, std::min<size_t>(64, total - off), h);
+        // Large textures (video frames: mostly dark, letterboxed) need many spots or changes go unnoticed.
+        const size_t spots = total >= (1u << 20) ? 4096 : 64, len = total >= (1u << 20) ? 16 : 64;
+        for (size_t i = 1; i < spots; i++) {
+            size_t off = total / spots * i;
+            h = Fnv(p + off, std::min<size_t>(len, total - off), h);
         }
         return h;
     }
@@ -1378,7 +1395,12 @@ private:
 
     VkImageView View(Image& img, VkImageViewType type, uint32_t base_layer, uint32_t layers, uint32_t levels,
                      VkImageAspectFlags aspect, const uint8_t swz[4], uint32_t base_level = 0) {
-        std::vector<uint32_t> key = {uint32_t(type), base_layer, layers, levels, aspect, swz[0], swz[1], swz[2], swz[3], base_level};
+        Key64 k;
+        const uint32_t parts[10] = {uint32_t(type), base_layer, layers, levels, aspect, swz[0], swz[1], swz[2], swz[3], base_level};
+        k.Add(parts, sizeof(parts));
+        auto fast = img.fast_views.find(k.h);
+        if (fast != img.fast_views.end()) return fast->second;
+        std::vector<uint32_t> key(parts, parts + 10);
         auto it = img.views.find(key);
         if (it != img.views.end()) return it->second;
         VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -1393,6 +1415,7 @@ private:
             v = VK_NULL_HANDLE;
         }
         img.views[key] = v;
+        img.fast_views[k.h] = v;
         return v;
     }
     // The level/layer a render target view selects (clamped to the image).
@@ -1447,6 +1470,12 @@ private:
         return ok;
     }
     VkSampler Sampler(const SamplerObj& s, bool shadow, bool filterable = true) {
+        Key64 fk;
+        fk.Add(&s, sizeof(SamplerObj));
+        fk.Add(shadow);
+        fk.Add(filterable);
+        auto fast = samplers_fast_.find(fk.h);
+        if (fast != samplers_fast_.end()) return fast->second;
         std::vector<uint32_t> key(sizeof(SamplerObj) / 4 + 2);
         memcpy(key.data(), &s, sizeof(SamplerObj));
         key[key.size() - 2] = shadow;
@@ -1480,6 +1509,7 @@ private:
         VkSampler smp = VK_NULL_HANDLE;
         vkCreateSampler(device_, &ci, nullptr, &smp);
         samplers_[key] = smp;
+        samplers_fast_[fk.h] = smp;
         return smp;
     }
 
@@ -1487,6 +1517,9 @@ private:
     // command buffer helpers
     // ======================================================================================================
     void BeginCommands() {
+        bound_pipeline_ = VK_NULL_HANDLE;
+        bound_layout_ = VK_NULL_HANDLE;
+        bound_sets_[0] = bound_sets_[1] = VK_NULL_HANDLE;
         vkResetCommandBuffer(cmd_, 0);
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -1766,10 +1799,18 @@ private:
     // shaders, layouts, pipelines
     // ======================================================================================================
     Shader* GetShader(const ShaderCode& code, const shader::TranslateOptions& opt) {
-        std::vector<uint32_t> key = {uint32_t(code.hash), uint32_t(code.hash >> 32), opt.int_attrib_mask,
-                                     opt.signed_attrib_mask, uint32_t(opt.gl_depth_range), uint32_t(opt.alpha_func)};
+        const uint32_t parts[6] = {uint32_t(code.hash), uint32_t(code.hash >> 32), opt.int_attrib_mask,
+                                   opt.signed_attrib_mask, uint32_t(opt.gl_depth_range), uint32_t(opt.alpha_func)};
+        Key64 fk;
+        fk.Add(parts, sizeof(parts));
+        auto fast = shaders_fast_.find(fk.h);
+        if (fast != shaders_fast_.end()) return fast->second;
+        std::vector<uint32_t> key(parts, parts + 6);
         auto it = shaders_.find(key);
-        if (it != shaders_.end()) return &it->second;
+        if (it != shaders_.end()) {
+            shaders_fast_[fk.h] = &it->second;
+            return &it->second;
+        }
         Shader& s = shaders_[key];
         shader::TranslateResult r = shader::Translate(code.code.data(), code.code.size(), opt);
         if (!r.ok) {
@@ -1796,8 +1837,17 @@ private:
     }
 
     VkDescriptorSetLayout SetLayout(VkShaderStageFlags stage, const shader::ShaderInfo& info) {
+        const uint64_t fast_key = (uint64_t(info.cbuf_mask) << 40) ^ (uint64_t(info.texture_mask) << 20) ^
+                                  (uint64_t(info.shadow_mask) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(info.image_mask) << 58) ^
+                                  uint64_t(stage);
+        auto fast = set_layouts_fast_.find(fast_key);
+        if (fast != set_layouts_fast_.end() && fast->second.first.size() == 5 && fast->second.first[0] == uint32_t(stage) &&
+            fast->second.first[1] == info.cbuf_mask && fast->second.first[2] == info.texture_mask &&
+            fast->second.first[3] == info.shadow_mask && fast->second.first[4] == info.image_mask)
+            return fast->second.second;
         std::vector<uint32_t> key = {uint32_t(stage), info.cbuf_mask, info.texture_mask, info.shadow_mask, info.image_mask};
         auto it = set_layouts_.find(key);
+        if (it != set_layouts_.end()) set_layouts_fast_[fast_key] = {key, it->second};
         if (it != set_layouts_.end()) return it->second;
         std::vector<VkDescriptorSetLayoutBinding> b;
         for (uint32_t i = 0; i < 18; i++)
@@ -1818,6 +1868,13 @@ private:
     }
 
     VkPipelineLayout PipelineLayout(VkDescriptorSetLayout vs, VkDescriptorSetLayout fs) {
+        if (vs == last_pl_vs_ && fs == last_pl_fs_ && last_pl_) return last_pl_;
+        last_pl_vs_ = vs;
+        last_pl_fs_ = fs;
+        last_pl_ = PipelineLayoutLookup(vs, fs);
+        return last_pl_;
+    }
+    VkPipelineLayout PipelineLayoutLookup(VkDescriptorSetLayout vs, VkDescriptorSetLayout fs) {
         std::vector<uint32_t> key = {uint32_t(reinterpret_cast<uintptr_t>(vs)), uint32_t(uint64_t(reinterpret_cast<uintptr_t>(vs)) >> 32),
                                      uint32_t(reinterpret_cast<uintptr_t>(fs)), uint32_t(uint64_t(reinterpret_cast<uintptr_t>(fs)) >> 32)};
         auto it = pipeline_layouts_.find(key);
@@ -2351,18 +2408,42 @@ private:
         // ---- descriptors -------------------------------------------------------------------------------------
         VkDescriptorSet sets[2] = {};
         VkDescriptorSetLayout layouts[2] = {vsl, fsl};
+        // Identical bindings (same layouts, buffers, offsets, images and samplers) reuse one pair of sets within
+        // the list; the pool is reset with the list.
+        Key64 dk;
+        dk.Add(vsl);
+        dk.Add(fsl);
+        for (const UboWrite& u : ubo_writes) {
+            dk.Add(u.set);
+            dk.Add(u.binding);
+            dk.Add(u.info);
+        }
+        for (const TexWrite& t : tex_writes) {
+            dk.Add(t.set);
+            dk.Add(t.binding);
+            dk.Add(t.info.sampler);
+            dk.Add(t.info.imageView);
+            dk.Add(t.info.imageLayout);
+        }
+        auto cached_sets = desc_cache_.find(dk.h);
+        const bool reuse = cached_sets != desc_cache_.end();
+        if (reuse) {
+            sets[0] = cached_sets->second.first;
+            sets[1] = cached_sets->second.second;
+            desc_reused_++;
+        }
         VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         dai.descriptorPool = desc_pool_;
         dai.descriptorSetCount = 2;
         dai.pSetLayouts = layouts;
-        if (vkAllocateDescriptorSets(device_, &dai, sets) != VK_SUCCESS) {
+        if (!reuse && vkAllocateDescriptorSets(device_, &dai, sets) != VK_SUCCESS) {
             // Pool exhausted: everything recorded so far must run first. Retry this draw from the top.
             Flush();
             if (vkAllocateDescriptorSets(device_, &dai, sets) != VK_SUCCESS) return Skip("descriptor allocation failed");
             return Draw(p);
         }
         std::vector<VkWriteDescriptorSet> writes;
-        for (const UboWrite& u : ubo_writes) {
+        if (!reuse) for (const UboWrite& u : ubo_writes) {
             VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             w.dstSet = sets[u.set];
             w.dstBinding = u.binding;
@@ -2371,7 +2452,7 @@ private:
             w.pBufferInfo = &u.info;
             writes.push_back(w);
         }
-        for (const TexWrite& t : tex_writes) {
+        if (!reuse) for (const TexWrite& t : tex_writes) {
             VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             w.dstSet = sets[t.set];
             w.dstBinding = t.binding;
@@ -2380,12 +2461,23 @@ private:
             w.pImageInfo = &t.info;
             writes.push_back(w);
         }
-        if (!writes.empty()) vkUpdateDescriptorSets(device_, uint32_t(writes.size()), writes.data(), 0, nullptr);
+        if (!reuse) {
+            if (!writes.empty()) vkUpdateDescriptorSets(device_, uint32_t(writes.size()), writes.data(), 0, nullptr);
+            desc_cache_[dk.h] = {sets[0], sets[1]};
+        }
 
         // ---- record --------------------------------------------------------------------------------------------
         if (!EnsureRendering(colors, depth, &extent)) return Skip("no render target");
-        vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-        vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 2, sets, 0, nullptr);
+        if (pipeline != bound_pipeline_) {
+            vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            bound_pipeline_ = pipeline;
+        }
+        if (layout != bound_layout_ || sets[0] != bound_sets_[0] || sets[1] != bound_sets_[1]) {
+            vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 2, sets, 0, nullptr);
+            bound_layout_ = layout;
+            bound_sets_[0] = sets[0];
+            bound_sets_[1] = sets[1];
+        }
         for (const VkVertexInputBindingDescription& b : vin.bindings)
             vkCmdBindVertexBuffers(cmd_, b.binding, 1, &stream_, &vb_offsets[b.binding]);
         float push[4] = {st_.alpha_ref, 0, 0, 0};
@@ -2496,7 +2588,24 @@ private:
     VkPipeline GetPipeline(Shader* vs, Shader* fs, const VertexInput& vin, VkPrimitiveTopology topology,
                            const std::vector<VkFormat>& color_formats, int depth_nvn_format, VkFormat depth_format,
                            VkPipelineLayout layout) {
-        // Key: everything that shapes the pipeline.
+        // Key: everything that shapes the pipeline. Hashed first (no allocation); the full key only on a miss.
+        Key64 fk;
+        fk.Add(vs->module);
+        fk.Add(fs->module);
+        fk.Add(vin.bindings.data(), vin.bindings.size() * sizeof(VkVertexInputBindingDescription));
+        fk.Add(uint32_t(0xFFFF));
+        fk.Add(vin.attributes.data(), vin.attributes.size() * sizeof(VkVertexInputAttributeDescription));
+        fk.Add(topology);
+        fk.Add(color_formats.data(), color_formats.size() * sizeof(VkFormat));
+        fk.Add(depth_format);
+        fk.Add(&st_.polygon, sizeof(st_.polygon));
+        fk.Add(&st_.depth, sizeof(st_.depth));
+        fk.Add(&st_.color, sizeof(st_.color));
+        fk.Add(&st_.channel, sizeof(st_.channel));
+        for (size_t i = 0; i < color_formats.size(); i++) fk.Add(&st_.blend[i], sizeof(BlendStateObj));
+        fk.Add(layout);
+        auto fast = pipelines_fast_.find(fk.h);
+        if (fast != pipelines_fast_.end()) return fast->second;
         std::vector<uint32_t> key;
         auto add = [&](const void* p, size_t n) {
             const size_t at = key.size();
@@ -2517,7 +2626,10 @@ private:
         add(&st_.channel, sizeof(st_.channel));
         for (size_t i = 0; i < color_formats.size(); i++) add(&st_.blend[i], sizeof(BlendStateObj));
         auto it = pipelines_.find(key);
-        if (it != pipelines_.end()) return it->second;
+        if (it != pipelines_.end()) {
+            pipelines_fast_[fk.h] = it->second;
+            return it->second;
+        }
 
         VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                                      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
@@ -2615,6 +2727,7 @@ private:
             pipeline = VK_NULL_HANDLE;
         }
         pipelines_[key] = pipeline;
+        if (pipeline) pipelines_fast_[fk.h] = pipeline;
         if (pipeline && pipelines_.size() <= 8)
             LOGI(kTag, "pipeline %zu: %zu attributes, %zu targets, depth format %d, topology %d, blend %s",
                  pipelines_.size(), vin.attributes.size(), color_formats.size(), int(depth_format), int(topology),
@@ -2713,6 +2826,11 @@ private:
             LOGI(kTag, "memory: process %ld MB resident, %zu GPU images using %llu MB, %zu index ranges cached", rss_kb / 1024,
                  images_.size(), (unsigned long long)(gpu >> 20), index_ranges_.size());
         }
+        if (big_checks_) {
+            LOGI(kTag, "game-written textures (>= 512x512): %llu checks, %llu changed and re-uploaded",
+                 (unsigned long long)big_checks_, (unsigned long long)big_changes_);
+            big_checks_ = big_changes_ = 0;
+        }
         LOGI(kTag, "last 10 s: %.0f ms executing lists (%.0f ms of it waiting for the GPU), %.1f MB streamed, %llu cached uploads",
              exec_ms_, wait_ms_, upload_bytes_ / 1048576.0, (unsigned long long)upload_hits_);
         std::string phases;
@@ -2720,8 +2838,9 @@ private:
             phases += " " + std::string(kPhaseNames[i]) + "=" + std::to_string(int(phase_ms_[i]));
             phase_ms_[i] = 0;
         }
-        LOGI(kTag, "draw time by phase (ms):%s | %d pipelines compiled in %.0f ms | %llu fast-path draws", phases.c_str(),
-             new_pipelines_, compile_ms_, (unsigned long long)fast_draws_);
+        LOGI(kTag, "draw time by phase (ms):%s | %d pipelines compiled in %.0f ms | %llu fast-path draws | %llu descriptor sets reused",
+             phases.c_str(), new_pipelines_, compile_ms_, (unsigned long long)fast_draws_, (unsigned long long)desc_reused_);
+        desc_reused_ = 0;
         if (new_pipelines_) SavePipelineCache();
         new_pipelines_ = 0;
         compile_ms_ = 0;
@@ -2803,7 +2922,7 @@ private:
     uint64_t tex_desc_draw_ = ~0ull;
     std::vector<CaptureItem> capture_items_;
     VkExtent2D no_attachment_extent_{0, 0};  // render area for a draw with no attachments (storage-only)
-    uint64_t fast_draws_ = 0;
+    uint64_t fast_draws_ = 0, big_checks_ = 0, big_changes_ = 0;
     std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> index_ranges_;
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     int new_pipelines_ = 0;
@@ -2830,6 +2949,18 @@ private:
     std::unordered_map<std::vector<uint32_t>, VkPipelineLayout, VecHash> pipeline_layouts_;
     std::unordered_map<std::vector<uint32_t>, VkPipeline, VecHash> pipelines_;
     std::map<std::vector<uint32_t>, VkSampler> samplers_;
+    // Hashed fronts of the caches above (no allocation per lookup).
+    std::unordered_map<uint64_t, VkSampler> samplers_fast_;
+    std::unordered_map<uint64_t, Shader*> shaders_fast_;
+    std::unordered_map<uint64_t, VkPipeline> pipelines_fast_;
+    std::unordered_map<uint64_t, std::pair<std::vector<uint32_t>, VkDescriptorSetLayout>> set_layouts_fast_;
+    VkDescriptorSetLayout last_pl_vs_ = VK_NULL_HANDLE, last_pl_fs_ = VK_NULL_HANDLE;
+    VkPipelineLayout last_pl_ = VK_NULL_HANDLE;
+    std::unordered_map<uint64_t, std::pair<VkDescriptorSet, VkDescriptorSet>> desc_cache_;
+    uint64_t desc_reused_ = 0;
+    VkPipeline bound_pipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout bound_layout_ = VK_NULL_HANDLE;
+    VkDescriptorSet bound_sets_[2] = {};
 
     // diagnostics
     uint64_t presented_ = 0, drawn_ = 0, list_counter_ = 0, reuploads_ = 0;
