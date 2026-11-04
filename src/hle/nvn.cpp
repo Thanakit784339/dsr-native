@@ -36,7 +36,10 @@ std::unordered_map<std::string, void*>& Handed() {  // name -> thunk given to th
 
 void RegisterNvnProc(const char* name, void* host_fn) {
     std::lock_guard<std::mutex> lk(g_mutex);
-    Impls()[name] = host_fn;
+    auto [it, inserted] = Impls().emplace(name, host_fn);
+    // Two implementations of one entry point would make the winner depend on static-init order.
+    if (!inserted && it->second != host_fn) LOGE("nvn", "NVN entry point %s registered twice", name);
+    it->second = host_fn;
 }
 
 void RegisterNvnPrefix(const char* prefix, void* host_fn) {

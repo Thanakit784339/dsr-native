@@ -6,11 +6,13 @@
 #include <cstring>
 #include <random>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "arch/arch.h"
 #include "hle/nvn.h"
 #include "hle/nvn/backend.h"
+#include "hle/nvn/layout.h"
 #include "hle/nvn/shader/translator.h"
 #include "hle/registry.h"
 #include "loader/dynamic_thunks.h"
@@ -393,6 +395,43 @@ static void TestShaderTranslator() {
     CHECK(!Translate(br.data(), br.size(), TranslateOptions{}).ok);
 }
 
+// Block-linear layout: exact sizes and a swizzle/deswizzle round trip over awkward sizes and mips.
+static void TestBlockLinear() {
+    using namespace dsr::hle::nvn;
+    TextureState t;
+    t.width = 1280;
+    t.height = 720;
+    t.format = 37;  // RGBA8: 5120-byte rows = 80 GOBs; 720 rows -> 16-GOB blocks (128 rows) x 6
+    TextureLayout l = ComputeLayout(t);
+    CHECK(l.levels.size() == 1 && l.levels[0].bh_log2 == 4);
+    CHECK(l.total == size_t(80) * 6 * 512 * 16);
+
+    for (auto [w, h, d, fmt, levels, target] : std::vector<std::tuple<int, int, int, int, int, int>>{
+             {37, 13, 1, 37, 3, kTarget2D}, {256, 256, 1, 68, 9, kTarget2D}, {64, 64, 6, 37, 1, kTargetCubemap},
+             {32, 16, 8, 41, 2, kTarget3D}, {100, 3, 4, 1, 1, kTarget2DArray}}) {
+        TextureState s;
+        s.width = w;
+        s.height = h;
+        s.depth = d;
+        s.format = fmt;
+        s.levels = levels;
+        s.target = target;
+        TextureLayout tl = ComputeLayout(s);
+        std::vector<uint8_t> swz(tl.total, 0);
+        for (size_t layer = 0; layer < size_t(tl.layers); layer++)
+            for (const LevelLayout& lv : tl.levels) {
+                const size_t n = size_t(lv.row_bytes) * lv.rows * lv.depth;
+                CHECK(lv.offset + lv.size <= tl.layer_stride);
+                std::vector<uint8_t> lin(n), back(n);
+                for (size_t k = 0; k < n; k++) lin[k] = uint8_t(k * 131 + layer * 7 + lv.offset);
+                uint8_t* base = swz.data() + layer * tl.layer_stride + lv.offset;
+                SwizzleLevel(base, lin.data(), lv);
+                DeswizzleLevel(back.data(), base, lv);
+                CHECK(lin == back);
+            }
+    }
+}
+
 // ---- arm64 ABI glue ----------------------------------------------------------------------------
 #if defined(__aarch64__)
 extern "C" {
@@ -472,6 +511,7 @@ int main() {
         {"null_nvn", TestNullNvn},
         {"nvn_commands", TestNvnCommands},
         {"shader_translator", TestShaderTranslator},
+        {"block_linear", TestBlockLinear},
 #if defined(__aarch64__)
         {"abi_arm64", TestAbi},
 #endif

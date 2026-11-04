@@ -11,7 +11,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <memory>
 #include <mutex>
+#include <vector>
 #include <unordered_map>
 
 namespace dsr::hle::nvn {
@@ -62,6 +65,65 @@ struct TextureState {
     int samples = 0;
     int flags = 0;
     int stride = 0;
+    uint8_t swizzle[4] = {2, 3, 4, 5};  // NVNtextureSwizzle: 0 ZERO, 1 ONE, 2 R, 3 G, 4 B, 5 A
+    const void* packaged_data = nullptr;
+    uint8_t packaged_layout[8] = {};
+};
+
+// ---- draw state objects (NVN keeps these in game memory; we mirror them, keyed by address) -------------
+// Enum values follow NVN (GL-style ordering; see vk_backend.cpp for the Vulkan mapping).
+struct BlendStateObj {
+    int target = 0;
+    int src_rgb = 2, dst_rgb = 1, src_a = 2, dst_a = 1;  // ONE, ZERO
+    int eq_rgb = 1, eq_a = 1;                             // ADD
+};
+struct ColorStateObj {
+    uint32_t blend_enable = 0;  // bit per render target
+    int logic_op = 3;           // COPY
+    int alpha_func = 8;         // ALWAYS
+};
+struct ChannelMaskStateObj {
+    uint32_t mask = 0xFFFFFFFF;  // 4 bits (RGBA) per render target
+};
+struct DepthStencilStateObj {
+    bool depth_test = false, depth_write = true, stencil_test = false;
+    int depth_func = 2;  // LESS
+    int stencil_func[2] = {8, 8};
+    int stencil_fail[2] = {1, 1}, depth_fail[2] = {1, 1}, depth_pass[2] = {1, 1};  // KEEP
+};
+struct PolygonStateObj {
+    int cull = 0;        // NONE
+    int front_face = 1;  // CCW
+    int mode = 2;        // FILL
+    int offset_enables = 0;
+};
+struct MultisampleStateObj {
+    bool enable = false;
+    int samples = 0;
+};
+struct VertexAttribObj {
+    int format = 0;
+    int offset = 0;
+    int stream = 0;
+};
+struct VertexStreamObj {
+    int stride = 0;
+    int divisor = 0;
+};
+struct SamplerObj {
+    int min_filter = 1, mag_filter = 1;  // LINEAR
+    int wrap[3] = {1, 1, 1};             // REPEAT
+    float lod_min = -1000.0f, lod_max = 1000.0f, lod_bias = 0.0f;
+    int compare_mode = 0, compare_func = 8;
+    float max_anisotropy = 1.0f;
+    bool operator==(const SamplerObj& o) const { return memcmp(this, &o, sizeof(*this)) == 0; }
+};
+
+struct ShaderCode {
+    uint64_t hash = 0;
+    int stage = -1;  // 0 vertex, 1 fragment (from the SPH)
+    std::vector<uint8_t> code;
+    std::vector<uint8_t> control;  // NVN control section (header + compiler constants, see ShaderConstants)
 };
 
 struct WindowState {

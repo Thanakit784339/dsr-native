@@ -31,7 +31,8 @@ struct TranslateOptions {
     uint32_t int_attrib_mask = 0;     // vertex attributes fetched as integers (format is *I / *UI)
     uint32_t signed_attrib_mask = 0;  // ... of which signed
     bool gl_depth_range = true;       // NVN depth mode -1..1: remap clip z to Vulkan's 0..1
-};
+    int alpha_func = 8;               // NVN alpha test (1 NEVER .. 8 ALWAYS); reference in push constant
+};                                    // block offset 0 (fragment stage)
 
 struct ShaderInfo {
     Stage stage = Stage::Vertex;

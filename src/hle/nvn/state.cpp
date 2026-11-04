@@ -1,0 +1,275 @@
+// NVN state-object setters and lookups. NVN state objects live in game memory and are configured with
+// setter calls; we mirror each object's settings in a table keyed by its address. Values are logged the
+// first time each distinct setting is seen, which is how the NVN enum mappings are confirmed on device.
+
+#include "hle/nvn/state.h"
+
+#include <atomic>
+#include <set>
+#include <unordered_map>
+
+#include "common/log.h"
+#include "hle/nvn.h"
+
+namespace dsr::hle::nvn {
+namespace {
+constexpr const char* kTag = "nvn.state";
+
+Table<BlendStateObj> g_blend;
+Table<ColorStateObj> g_color;
+Table<ChannelMaskStateObj> g_channel;
+Table<DepthStencilStateObj> g_depth;
+Table<PolygonStateObj> g_polygon;
+Table<MultisampleStateObj> g_ms;
+Table<VertexAttribObj> g_attrib;
+Table<VertexStreamObj> g_stream;
+Table<SamplerObj> g_sampler_builders, g_samplers;
+
+std::mutex g_pool_mutex;
+std::unordered_map<int, TexRef> g_texture_ids;
+std::unordered_map<int, SamplerObj> g_sampler_ids;
+std::unordered_map<const void*, std::shared_ptr<const ShaderCode>> g_programs;
+std::atomic<int> g_depth_mode{0}, g_origin_mode{0};
+
+// Logs each distinct (what, value) once.
+void Seen(const char* what, int a, int b = 0, int c = 0, int d = 0) {
+    static std::mutex m;
+    static std::set<std::tuple<std::string, int, int, int, int>> seen;
+    std::lock_guard<std::mutex> lk(m);
+    if (seen.size() < 400 && seen.insert({what, a, b, c, d}).second)
+        LOGI(kTag, "%s: %d %d %d %d", what, a, b, c, d);
+}
+
+// ---- blend ----------------------------------------------------------------------------------------------
+void BlendSetDefaults(void* s) { g_blend.Reset(s); }
+void BlendSetTarget(void* s, int t) { g_blend.Get(s).target = t; }
+void BlendSetFunc(void* s, int src_rgb, int dst_rgb, int src_a, int dst_a) {
+    auto& b = g_blend.Get(s);
+    b.src_rgb = src_rgb;
+    b.dst_rgb = dst_rgb;
+    b.src_a = src_a;
+    b.dst_a = dst_a;
+    Seen("blend func", src_rgb, dst_rgb, src_a, dst_a);
+}
+void BlendSetEquation(void* s, int rgb, int a) {
+    auto& b = g_blend.Get(s);
+    b.eq_rgb = rgb;
+    b.eq_a = a;
+    Seen("blend equation", rgb, a);
+}
+// ---- color ----------------------------------------------------------------------------------------------
+void ColorSetDefaults(void* s) { g_color.Reset(s); }
+void ColorSetBlendEnable(void* s, int index, bool enable) {
+    auto& c = g_color.Get(s);
+    if (index < 0 || index >= 8) return;
+    if (enable)
+        c.blend_enable |= 1u << index;
+    else
+        c.blend_enable &= ~(1u << index);
+}
+void ColorSetLogicOp(void* s, int op) { g_color.Get(s).logic_op = op; }
+void ColorSetAlphaTest(void* s, int func) {
+    g_color.Get(s).alpha_func = func;
+    Seen("alpha test", func);
+}
+// ---- channel mask --------------------------------------------------------------------------------------
+void ChannelSetDefaults(void* s) { g_channel.Reset(s); }
+void ChannelSetMask(void* s, int index, bool r, bool g, bool b, bool a) {
+    if (index < 0 || index >= 8) return;
+    auto& c = g_channel.Get(s);
+    uint32_t bits = (r ? 1u : 0) | (g ? 2u : 0) | (b ? 4u : 0) | (a ? 8u : 0);
+    c.mask = (c.mask & ~(0xFu << (4 * index))) | (bits << (4 * index));
+}
+// ---- depth / stencil -----------------------------------------------------------------------------------
+void DepthSetDefaults(void* s) { g_depth.Reset(s); }
+void DepthSetTest(void* s, bool e) { g_depth.Get(s).depth_test = e; }
+void DepthSetWrite(void* s, bool e) { g_depth.Get(s).depth_write = e; }
+void DepthSetFunc(void* s, int f) {
+    g_depth.Get(s).depth_func = f;
+    Seen("depth func", f);
+}
+void StencilSetTest(void* s, bool e) { g_depth.Get(s).stencil_test = e; }
+// face: 1 FRONT, 2 BACK, 3 FRONT_AND_BACK
+void StencilSetFunc(void* s, int face, int func) {
+    auto& d = g_depth.Get(s);
+    if (face & 1) d.stencil_func[0] = func;
+    if (face & 2) d.stencil_func[1] = func;
+    Seen("stencil func", face, func);
+}
+void StencilSetOp(void* s, int face, int fail, int dfail, int dpass) {
+    auto& d = g_depth.Get(s);
+    for (int i = 0; i < 2; i++)
+        if (face & (1 << i)) {
+            d.stencil_fail[i] = fail;
+            d.depth_fail[i] = dfail;
+            d.depth_pass[i] = dpass;
+        }
+    Seen("stencil op", face, fail, dfail, dpass);
+}
+// ---- polygon -------------------------------------------------------------------------------------------
+void PolygonSetDefaults(void* s) { g_polygon.Reset(s); }
+void PolygonSetCull(void* s, int face) {
+    g_polygon.Get(s).cull = face;
+    Seen("cull face", face);
+}
+void PolygonSetFront(void* s, int ff) {
+    g_polygon.Get(s).front_face = ff;
+    Seen("front face", ff);
+}
+void PolygonSetMode(void* s, int m) { g_polygon.Get(s).mode = m; }
+void PolygonSetOffsetEnables(void* s, int e) { g_polygon.Get(s).offset_enables = e; }
+// ---- multisample ---------------------------------------------------------------------------------------
+void MsSetDefaults(void* s) { g_ms.Reset(s); }
+void MsSetEnable(void* s, bool e) { g_ms.Get(s).enable = e; }
+void MsSetSamples(void* s, int n) { g_ms.Get(s).samples = n; }
+// ---- vertex layout -------------------------------------------------------------------------------------
+void AttribSetDefaults(void* s) { g_attrib.Reset(s); }
+void AttribSetFormat(void* s, int format, int64_t offset) {
+    auto& a = g_attrib.Get(s);
+    a.format = format;
+    a.offset = int(offset);
+    Seen("vertex format", format);
+}
+void AttribSetStream(void* s, int stream) { g_attrib.Get(s).stream = stream; }
+int AttribGetFormat(const void* s) { return g_attrib.Copy(s).format; }
+int AttribGetStream(const void* s) { return g_attrib.Copy(s).stream; }
+void StreamSetDefaults(void* s) { g_stream.Reset(s); }
+void StreamSetStride(void* s, int64_t stride) { g_stream.Get(s).stride = int(stride); }
+void StreamSetDivisor(void* s, int d) { g_stream.Get(s).divisor = d; }
+int64_t StreamGetStride(const void* s) { return g_stream.Copy(s).stride; }
+int StreamGetDivisor(const void* s) { return g_stream.Copy(s).divisor; }
+// ---- samplers ------------------------------------------------------------------------------------------
+void SamplerBuilderSetDefaults(void* b) { g_sampler_builders.Reset(b); }
+void SamplerBuilderSetMinMag(void* b, int min, int mag) {
+    auto& s = g_sampler_builders.Get(b);
+    s.min_filter = min;
+    s.mag_filter = mag;
+    Seen("sampler filter", min, mag);
+}
+void SamplerBuilderSetWrap(void* b, int s_, int t, int r) {
+    auto& s = g_sampler_builders.Get(b);
+    s.wrap[0] = s_;
+    s.wrap[1] = t;
+    s.wrap[2] = r;
+    Seen("sampler wrap", s_, t, r);
+}
+void SamplerBuilderSetLodClamp(void* b, float mn, float mx) {
+    auto& s = g_sampler_builders.Get(b);
+    s.lod_min = mn;
+    s.lod_max = mx;
+}
+void SamplerBuilderSetLodBias(void* b, float bias) { g_sampler_builders.Get(b).lod_bias = bias; }
+void SamplerBuilderSetCompare(void* b, int mode, int func) {
+    auto& s = g_sampler_builders.Get(b);
+    s.compare_mode = mode;
+    s.compare_func = func;
+    Seen("sampler compare", mode, func);
+}
+void SamplerBuilderSetAniso(void* b, float a) { g_sampler_builders.Get(b).max_anisotropy = a; }
+bool SamplerInitialize(void* sampler, const void* builder) {
+    g_samplers.Get(sampler) = g_sampler_builders.Copy(builder);
+    return true;
+}
+void SamplerFinalize(void* sampler) { g_samplers.Erase(sampler); }
+// ---- pools ---------------------------------------------------------------------------------------------
+void TexturePoolRegisterTexture(void* pool, int id, const void* texture, const void* view) {
+    TexRef r = MakeTexRef(texture);
+    std::lock_guard<std::mutex> lk(g_pool_mutex);
+    g_texture_ids[id] = r;
+}
+void SamplerPoolRegisterSampler(void* pool, int id, const void* sampler) {
+    SamplerObj s = g_samplers.Copy(sampler);
+    std::lock_guard<std::mutex> lk(g_pool_mutex);
+    g_sampler_ids[id] = s;
+}
+void SamplerPoolRegisterBuilder(void* pool, int id, const void* builder) {
+    SamplerObj s = g_sampler_builders.Copy(builder);
+    std::lock_guard<std::mutex> lk(g_pool_mutex);
+    g_sampler_ids[id] = s;
+}
+// ---- device modes --------------------------------------------------------------------------------------
+void DeviceSetDepthMode(void* dev, int mode) {
+    g_depth_mode = mode;
+    LOGI(kTag, "depth mode %d (%s)", mode, mode ? "near is zero" : "OpenGL -1..1");
+}
+void DeviceSetWindowOriginMode(void* dev, int mode) {
+    g_origin_mode = mode;
+    LOGI(kTag, "window origin mode %d (%s)", mode, mode ? "upper left" : "lower left");
+}
+
+struct Proc {
+    const char* name;
+    void* fn;
+};
+#define P(n, f) {n, reinterpret_cast<void*>(&f)}
+const Proc kProcs[] = {
+    P("nvnBlendStateSetDefaults", BlendSetDefaults), P("nvnBlendStateSetBlendTarget", BlendSetTarget),
+    P("nvnBlendStateSetBlendFunc", BlendSetFunc), P("nvnBlendStateSetBlendEquation", BlendSetEquation),
+    P("nvnColorStateSetDefaults", ColorSetDefaults), P("nvnColorStateSetBlendEnable", ColorSetBlendEnable),
+    P("nvnColorStateSetLogicOp", ColorSetLogicOp), P("nvnColorStateSetAlphaTest", ColorSetAlphaTest),
+    P("nvnChannelMaskStateSetDefaults", ChannelSetDefaults), P("nvnChannelMaskStateSetChannelMask", ChannelSetMask),
+    P("nvnDepthStencilStateSetDefaults", DepthSetDefaults), P("nvnDepthStencilStateSetDepthTestEnable", DepthSetTest),
+    P("nvnDepthStencilStateSetDepthWriteEnable", DepthSetWrite), P("nvnDepthStencilStateSetDepthFunc", DepthSetFunc),
+    P("nvnDepthStencilStateSetStencilTestEnable", StencilSetTest), P("nvnDepthStencilStateSetStencilFunc", StencilSetFunc),
+    P("nvnDepthStencilStateSetStencilOp", StencilSetOp),
+    P("nvnPolygonStateSetDefaults", PolygonSetDefaults), P("nvnPolygonStateSetCullFace", PolygonSetCull),
+    P("nvnPolygonStateSetFrontFace", PolygonSetFront), P("nvnPolygonStateSetPolygonMode", PolygonSetMode),
+    P("nvnPolygonStateSetPolygonOffsetEnables", PolygonSetOffsetEnables),
+    P("nvnMultisampleStateSetDefaults", MsSetDefaults), P("nvnMultisampleStateSetMultisampleEnable", MsSetEnable),
+    P("nvnMultisampleStateSetSamples", MsSetSamples),
+    P("nvnVertexAttribStateSetDefaults", AttribSetDefaults), P("nvnVertexAttribStateSetFormat", AttribSetFormat),
+    P("nvnVertexAttribStateSetStreamIndex", AttribSetStream), P("nvnVertexAttribStateGetFormat", AttribGetFormat),
+    P("nvnVertexAttribStateGetStreamIndex", AttribGetStream),
+    P("nvnVertexStreamStateSetDefaults", StreamSetDefaults), P("nvnVertexStreamStateSetStride", StreamSetStride),
+    P("nvnVertexStreamStateSetDivisor", StreamSetDivisor), P("nvnVertexStreamStateGetStride", StreamGetStride),
+    P("nvnVertexStreamStateGetDivisor", StreamGetDivisor),
+    P("nvnSamplerBuilderSetDefaults", SamplerBuilderSetDefaults), P("nvnSamplerBuilderSetMinMagFilter", SamplerBuilderSetMinMag),
+    P("nvnSamplerBuilderSetWrapMode", SamplerBuilderSetWrap), P("nvnSamplerBuilderSetLodClamp", SamplerBuilderSetLodClamp),
+    P("nvnSamplerBuilderSetLodBias", SamplerBuilderSetLodBias), P("nvnSamplerBuilderSetCompare", SamplerBuilderSetCompare),
+    P("nvnSamplerBuilderSetMaxAnisotropy", SamplerBuilderSetAniso),
+    P("nvnSamplerInitialize", SamplerInitialize), P("nvnSamplerFinalize", SamplerFinalize),
+    P("nvnTexturePoolRegisterTexture", TexturePoolRegisterTexture),
+    P("nvnSamplerPoolRegisterSampler", SamplerPoolRegisterSampler),
+    P("nvnSamplerPoolRegisterSamplerBuilder", SamplerPoolRegisterBuilder),
+    P("nvnDeviceSetDepthMode", DeviceSetDepthMode), P("nvnDeviceSetWindowOriginMode", DeviceSetWindowOriginMode),
+};
+#undef P
+
+struct Registrar {
+    Registrar() {
+        for (const Proc& p : kProcs) RegisterNvnProc(p.name, p.fn);
+    }
+} g_registrar;
+}  // namespace
+
+BlendStateObj GetBlendState(const void* o) { return g_blend.Copy(o); }
+ColorStateObj GetColorState(const void* o) { return g_color.Copy(o); }
+ChannelMaskStateObj GetChannelMaskState(const void* o) { return g_channel.Copy(o); }
+DepthStencilStateObj GetDepthStencilState(const void* o) { return g_depth.Copy(o); }
+PolygonStateObj GetPolygonState(const void* o) { return g_polygon.Copy(o); }
+MultisampleStateObj GetMultisampleState(const void* o) { return g_ms.Copy(o); }
+VertexAttribObj GetVertexAttrib(const void* o) { return g_attrib.Copy(o); }
+VertexStreamObj GetVertexStream(const void* o) { return g_stream.Copy(o); }
+
+TexRef TextureById(int id) {
+    std::lock_guard<std::mutex> lk(g_pool_mutex);
+    auto it = g_texture_ids.find(id);
+    return it == g_texture_ids.end() ? TexRef{} : it->second;
+}
+SamplerObj SamplerById(int id) {
+    std::lock_guard<std::mutex> lk(g_pool_mutex);
+    auto it = g_sampler_ids.find(id);
+    return it == g_sampler_ids.end() ? SamplerObj{} : it->second;
+}
+void SetProgramCode(const void* program, std::shared_ptr<const ShaderCode> code) {
+    std::lock_guard<std::mutex> lk(g_pool_mutex);
+    g_programs[program] = std::move(code);
+}
+std::shared_ptr<const ShaderCode> GetProgramCode(const void* program) {
+    std::lock_guard<std::mutex> lk(g_pool_mutex);
+    auto it = g_programs.find(program);
+    return it == g_programs.end() ? nullptr : it->second;
+}
+DeviceModes GetDeviceModes() { return {g_depth_mode.load(), g_origin_mode.load()}; }
+
+}  // namespace dsr::hle::nvn

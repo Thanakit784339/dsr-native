@@ -29,7 +29,46 @@ enum class CmdType : uint8_t {
     ClearDepthStencil,  // depth, depth_mask, stencil, stencil_mask
     ClearTexture,       // dst, dst_region, color, kind, mask
     CopyTexture,        // src, src_region, dst, dst_region, flags
-    Draw,               // counted only (shaders come later)
+    Draw,               // draw (see `draw`)
+    BindProgram,        // obj: ShaderCode, index: stage bits
+    BindVertexAttribs,  // obj: std::vector<VertexAttribObj>
+    BindVertexStreams,  // obj: std::vector<VertexStreamObj>
+    BindVertexBuffers,  // index: first, obj: std::vector<BufferRange>
+    BindUniformBuffers, // stage, index: first, obj: std::vector<BufferRange>
+    BindTextures,       // stage, index: first, obj: std::vector<BoundTexture>
+    BindBlend,          // obj: BlendStateObj
+    BindColor,          // obj: ColorStateObj
+    BindChannelMask,    // obj: ChannelMaskStateObj
+    BindDepthStencil,   // obj: DepthStencilStateObj
+    BindPolygon,        // obj: PolygonStateObj
+    BindMultisample,    // obj: MultisampleStateObj
+    SetViewport,        // f[0..3] = x, y, w, h
+    SetScissor,         // f[0..3] = x, y, w, h
+    SetDepthRange,      // f[0..1] = near, far
+    SetAlphaRef,        // f[0]
+    SetBlendColor,      // f[0..3]
+    SetStencil,         // index: 0 ref, 1 write mask, 2 compare mask; stage: face; mask: value
+    UpdateUniform,      // dst_addr; obj: std::vector<uint8_t>
+    CopyBufferToTexture,// src_addr, dst, dst_region, flags, f[0] = row stride, f[1] = image stride
+};
+
+struct BufferRange {  // NVNbufferRange
+    uint64_t address = 0;
+    uint64_t size = 0;
+};
+
+struct BoundTexture {
+    TexRef texture;
+    SamplerObj sampler;
+    bool valid = false;
+};
+
+struct DrawParams {
+    int mode = 4;           // NVNdrawPrimitive (4 = TRIANGLES)
+    int index_type = -1;    // -1: non-indexed; 0 u8, 1 u16, 2 u32
+    int first = 0, count = 0;
+    uint64_t index_address = 0;
+    int base_vertex = 0, base_instance = 0, instances = 1;
 };
 
 enum ClearKind : uint8_t { kClearFloat = 0, kClearInt = 1, kClearUint = 2 };
@@ -41,6 +80,11 @@ struct Cmd {
     int index = 0, mask = 0, stencil = 0, stencil_mask = 0, flags = 0;
     uint32_t color[4] = {};
     float depth = 0;
+    int stage = 0;
+    float f[4] = {};
+    uint64_t src_addr = 0, dst_addr = 0;
+    DrawParams draw;
+    std::shared_ptr<const void> obj;  // type-specific payload (see CmdType)
     // SetRenderTargets
     int num_rt = 0;
     std::shared_ptr<const std::vector<TexRef>> rts;  // colors[0..num_rt) then depth at [num_rt]
@@ -67,6 +111,8 @@ Backend* CreatePlatformBackend();       // Vulkan on Android, null elsewhere
 // Lookups provided by null_driver.cpp.
 TexRef MakeTexRef(const void* nvn_texture);
 TexRef WindowTexture(const void* nvn_window, int index);
+// True if [addr, addr+size) lies inside one registered NVN memory pool (safe to read).
+bool GuestRangeValid(uint64_t addr, size_t size);
 
 // Per-frame statistics, reported every 10 s by the present path.
 struct GpuStats {

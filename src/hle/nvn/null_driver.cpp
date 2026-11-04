@@ -17,6 +17,8 @@
 #include "common/log.h"
 #include "hle/nvn.h"
 #include "hle/nvn/backend.h"
+#include "hle/nvn/layout.h"
+#include "hle/nvn/state.h"
 #include "hle/nvn/shader_dump.h"
 #include "hle/nvn/nvn_types.h"
 #include "hle/os/os.h"
@@ -60,22 +62,8 @@ Table<QueueBuilderState> g_queue_builders;
 
 size_t AlignUp(size_t v, size_t a) { return (v + a - 1) / a * a; }
 
-// Conservative storage estimate: real NVN storage is block-linear (padded), so pad rows and heights.
-size_t StorageSize(const TextureState& t) {
-    FormatInfo fi = GetFormatInfo(t.format);
-    int layers = std::max(1, t.depth);
-    if (t.target == kTargetCubemap) layers = std::max(6, layers);
-    size_t total = 0;
-    for (int l = 0; l < std::max(1, t.levels); l++) {
-        int w = std::max(1, t.width >> l), h = std::max(1, t.height >> l);
-        size_t bw = (w + fi.block_w - 1) / fi.block_w, bh = (h + fi.block_h - 1) / fi.block_h;
-        size_t row = AlignUp(bw * fi.bytes_per_block, 64);
-        total += row * AlignUp(bh, 8) * (t.target == kTarget3D ? std::max(1, t.depth >> l) : 1);
-    }
-    if (t.target != kTarget3D) total *= layers;
-    total *= std::max(1, t.samples);
-    return AlignUp(std::max<size_t>(total, 512), 512);
-}
+// Exact Tegra block-linear (or pitch) size, so pool allocations and packaged data line up.
+size_t StorageSize(const TextureState& t) { return AlignUp(std::max<size_t>(ComputeLayout(t).total, 512), 512); }
 
 uintptr_t PoolBase(const void* pool) { return reinterpret_cast<uintptr_t>(g_pools.Copy(pool).storage); }
 
@@ -149,11 +137,26 @@ void PoolBuilderSetStorage(void* b, void* mem, size_t size) {
     s.storage = static_cast<uint8_t*>(mem);
     s.size = size;
 }
+std::mutex g_pool_range_mutex;
+std::map<uintptr_t, size_t> g_pool_ranges;  // storage base -> size
+
 bool PoolInitialize(void* pool, const void* b) {
-    g_pools.Get(pool) = g_pool_builders.Copy(b);
+    MemoryPoolState s = g_pool_builders.Copy(b);
+    g_pools.Get(pool) = s;
+    if (s.storage) {
+        std::lock_guard<std::mutex> lk(g_pool_range_mutex);
+        g_pool_ranges[reinterpret_cast<uintptr_t>(s.storage)] = s.size;
+    }
     return true;
 }
-void PoolFinalize(void* pool) { g_pools.Erase(pool); }
+void PoolFinalize(void* pool) {
+    MemoryPoolState s = g_pools.Copy(pool);
+    if (s.storage) {
+        std::lock_guard<std::mutex> lk(g_pool_range_mutex);
+        g_pool_ranges.erase(reinterpret_cast<uintptr_t>(s.storage));
+    }
+    g_pools.Erase(pool);
+}
 void* PoolMap(const void* pool) { return g_pools.Copy(pool).storage; }
 uint64_t PoolGetBufferAddress(const void* pool) { return PoolBase(pool); }
 size_t PoolGetSize(const void* pool) { return g_pools.Copy(pool).size; }
@@ -186,8 +189,7 @@ size_t BufferBytesFrom(uint64_t addr) {
 }
 
 // nvnProgramSetShaders(program, count, const NVNshaderData*): NVNshaderData = { u64 code address; const
-// void* control }. Shaders are not translated yet; record them so the translator can be built from the
-// game's real binaries.
+// void* control }. The code is kept per program for the backend (and dumped for offline work).
 struct ShaderData {
     uint64_t address;
     const void* control;
@@ -206,7 +208,31 @@ bool ProgramSetShaders(void* program, int count, const ShaderData* stages) {
                     break;
                 }
         }
-        DumpShader(a, reinterpret_cast<const void*>(a), n, stages[i].control, stages[i].control ? 0x800 : 0);
+        // Control section: header word 5 is its size (magic 0x98761234).
+        size_t control_size = 0;
+        if (stages[i].control) {
+            uint32_t hdr[6];
+            memcpy(hdr, stages[i].control, sizeof(hdr));
+            control_size = (hdr[0] == 0x98761234u && hdr[5] >= 24 && hdr[5] <= 0x10000) ? hdr[5] : 0x800;
+        }
+        DumpShader(a, reinterpret_cast<const void*>(a), n, stages[i].control, control_size);
+        if (a && n >= 0x88) {
+            auto sc = std::make_shared<ShaderCode>();
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(a);
+            sc->code.assign(p, p + n);
+            if (stages[i].control) {
+                const uint8_t* c = static_cast<const uint8_t*>(stages[i].control);
+                sc->control.assign(c, c + control_size);
+            }
+            uint64_t h = 1469598103934665603ull;
+            for (uint8_t c : sc->code) h = (h ^ c) * 1099511628211ull;
+            sc->hash = h;
+            uint32_t sph0;
+            memcpy(&sph0, p + 0x30, 4);
+            const uint32_t type = (sph0 >> 10) & 0xF;
+            sc->stage = type == 1 ? 0 : type == 5 ? 1 : -1;
+            SetProgramCode(program, std::move(sc));
+        }
     }
     return true;
 }
@@ -255,6 +281,17 @@ void TexBuilderSetStorage(void* b, const void* pool, int64_t offset) {
     t.pool = pool;
     t.offset = offset;
 }
+void TexBuilderSetSwizzle(void* b, int r, int g, int bl, int a) {
+    auto& t = g_texture_builders.Get(b);
+    t.swizzle[0] = uint8_t(r);
+    t.swizzle[1] = uint8_t(g);
+    t.swizzle[2] = uint8_t(bl);
+    t.swizzle[3] = uint8_t(a);
+}
+void TexBuilderSetPackagedData(void* b, const void* data) { g_texture_builders.Get(b).packaged_data = data; }
+void TexBuilderSetPackagedLayout(void* b, const void* layout) {
+    if (layout) memcpy(g_texture_builders.Get(b).packaged_layout, layout, 8);
+}
 size_t TexBuilderGetStorageSize(const void* b) { return StorageSize(g_texture_builders.Copy(b)); }
 size_t TexBuilderGetStorageAlignment(const void* b) { return 512; }
 int TexBuilderGetWidth(const void* b) { return g_texture_builders.Copy(b).width; }
@@ -265,7 +302,21 @@ int TexBuilderGetFormat(const void* b) { return g_texture_builders.Copy(b).forma
 int TexBuilderGetTarget(const void* b) { return g_texture_builders.Copy(b).target; }
 
 bool TexInitialize(void* tex, const void* b) {
-    g_textures.Get(tex) = g_texture_builders.Copy(b);
+    TextureState t = g_texture_builders.Copy(b);
+    // Textures built from a texture package: NVN copies the (already tiled) data into the storage.
+    if (t.packaged_data && t.pool) {
+        uint8_t* dst = reinterpret_cast<uint8_t*>(PoolBase(t.pool) + uint64_t(t.offset));
+        const size_t n = ComputeLayout(t).total;
+        if (dst && dst != t.packaged_data) memcpy(dst, t.packaged_data, n);
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 6)
+            LOGI(kTag, "packaged texture %dx%dx%d format %d levels %d: %zu bytes, layout %02x %02x %02x %02x %02x %02x %02x %02x",
+                 t.width, t.height, t.depth, t.format, t.levels, n, t.packaged_layout[0], t.packaged_layout[1],
+                 t.packaged_layout[2], t.packaged_layout[3], t.packaged_layout[4], t.packaged_layout[5],
+                 t.packaged_layout[6], t.packaged_layout[7]);
+    }
+    t.packaged_data = nullptr;
+    g_textures.Get(tex) = t;
     return true;
 }
 void TexFinalize(void* tex) { g_textures.Erase(tex); }
@@ -368,6 +419,14 @@ int WindowGetNumTextures(const void* w) { return g_windows.Copy(w).num_textures;
 
 }  // namespace
 
+bool GuestRangeValid(uint64_t addr, size_t size) {
+    std::lock_guard<std::mutex> lk(g_pool_range_mutex);
+    auto it = g_pool_ranges.upper_bound(uintptr_t(addr));
+    if (it == g_pool_ranges.begin()) return false;
+    --it;
+    return addr >= it->first && addr + size <= it->first + it->second && addr + size >= addr;
+}
+
 TexRef MakeTexRef(const void* nvn_texture) {
     TexRef r;
     if (!nvn_texture) return r;
@@ -399,7 +458,7 @@ const Proc kProcs[] = {
     P("nvnDeviceGetSeparateTextureHandle", DeviceGetSeparateHandle),
     P("nvnDeviceGetSeparateSamplerHandle", DeviceGetSeparateHandle),
     P("nvnDeviceGetCurrentTimestampInNanoseconds", DeviceGetTimestampNs),
-    P("nvnDeviceSetDepthMode", Nop), P("nvnDeviceSetWindowOriginMode", Nop),
+    
     // memory pools
     P("nvnMemoryPoolBuilderSetDefaults", PoolBuilderSetDefaults), P("nvnMemoryPoolBuilderSetDevice", Nop),
     P("nvnMemoryPoolBuilderSetFlags", PoolBuilderSetFlags), P("nvnMemoryPoolBuilderSetStorage", PoolBuilderSetStorage),
@@ -420,8 +479,8 @@ const Proc kProcs[] = {
     P("nvnTextureBuilderSetSize2D", TexBuilderSetSize2D), P("nvnTextureBuilderSetSize3D", TexBuilderSetSize3D),
     P("nvnTextureBuilderSetLevels", TexBuilderSetLevels), P("nvnTextureBuilderSetFormat", TexBuilderSetFormat),
     P("nvnTextureBuilderSetSamples", TexBuilderSetSamples), P("nvnTextureBuilderSetStride", TexBuilderSetStride),
-    P("nvnTextureBuilderSetStorage", TexBuilderSetStorage), P("nvnTextureBuilderSetPackagedTextureData", Nop),
-    P("nvnTextureBuilderSetPackagedTextureLayout", Nop), P("nvnTextureBuilderSetSwizzle", Nop),
+    P("nvnTextureBuilderSetStorage", TexBuilderSetStorage), P("nvnTextureBuilderSetPackagedTextureData", TexBuilderSetPackagedData),
+    P("nvnTextureBuilderSetPackagedTextureLayout", TexBuilderSetPackagedLayout), P("nvnTextureBuilderSetSwizzle", TexBuilderSetSwizzle),
     P("nvnTextureBuilderSetDepthStencilMode", Nop), P("nvnTextureBuilderSetGLTextureName", Nop),
     P("nvnTextureBuilderGetStorageSize", TexBuilderGetStorageSize),
     P("nvnTextureBuilderGetStorageAlignment", TexBuilderGetStorageAlignment),
@@ -436,10 +495,8 @@ const Proc kProcs[] = {
     P("nvnTextureGetTextureAddress", TexGetTextureAddress), P("nvnTextureFlushTexels", Nop),
     P("nvnTextureInvalidateTexels", Nop), P("nvnTextureWriteTexels", Nop), P("nvnTextureReadTexels", Nop),
     // pools of descriptors, samplers, programs
-    P("nvnTexturePoolInitialize", True), P("nvnTexturePoolFinalize", Nop), P("nvnTexturePoolRegisterTexture", Nop),
-    P("nvnTexturePoolRegisterImage", Nop), P("nvnSamplerPoolInitialize", True), P("nvnSamplerPoolFinalize", Nop),
-    P("nvnSamplerPoolRegisterSampler", Nop), P("nvnSamplerPoolRegisterSamplerBuilder", Nop),
-    P("nvnSamplerInitialize", True), P("nvnSamplerFinalize", Nop),
+    P("nvnTexturePoolInitialize", True), P("nvnTexturePoolFinalize", Nop), P("nvnTexturePoolRegisterImage", Nop), P("nvnSamplerPoolInitialize", True), P("nvnSamplerPoolFinalize", Nop),
+   
     P("nvnProgramInitialize", True), P("nvnProgramFinalize", Nop), P("nvnProgramSetShaders", ProgramSetShaders),
     P("nvnEventInitialize", True), P("nvnEventFinalize", Nop),
     // queues

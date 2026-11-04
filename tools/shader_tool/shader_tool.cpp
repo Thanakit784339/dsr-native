@@ -44,7 +44,9 @@ int main(int argc, char** argv) {
         off += sizeof(h) + h.code_size + h.control_size;
         if (!only.empty() && std::find(only.begin(), only.end(), int(h.index)) == only.end()) continue;
         total++;
-        TranslateResult r = Translate(code, h.code_size, TranslateOptions{});
+        TranslateOptions opt;
+        if (const char* a = getenv("DSR_ALPHA_FUNC")) opt.alpha_func = atoi(a);  // validate alpha-test variants
+        TranslateResult r = Translate(code, h.code_size, opt);
         if (!r.ok) {
             std::string key = r.error.substr(0, r.error.find(" (at"));
             failures[key]++;

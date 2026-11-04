@@ -554,6 +554,30 @@ private:
             uint32_t omap, omap2;
             memcpy(&omap, code_ + kSphOffset + 18 * 4, 4);
             memcpy(&omap2, code_ + kSphOffset + 19 * 4, 4);
+            // Alpha test (no fixed-function equivalent in Vulkan): compare RT0 alpha with the reference.
+            if (opt_.alpha_func != 8 && (omap & 0x8)) {
+                uint32_t alpha_reg = uint32_t(__builtin_popcount(omap & 0x7));
+                Id alpha = GetF(alpha_reg);
+                Id ref = AlphaRef();
+                Id pass;
+                switch (opt_.alpha_func) {
+                    case 1: pass = b_.ConstBool(false); break;
+                    case 2: pass = b_.OpResult(SpvOpFOrdLessThan, t_bool_, {alpha, ref}); break;
+                    case 3: pass = b_.OpResult(SpvOpFOrdEqual, t_bool_, {alpha, ref}); break;
+                    case 4: pass = b_.OpResult(SpvOpFOrdLessThanEqual, t_bool_, {alpha, ref}); break;
+                    case 5: pass = b_.OpResult(SpvOpFOrdGreaterThan, t_bool_, {alpha, ref}); break;
+                    case 6: pass = b_.OpResult(SpvOpFOrdNotEqual, t_bool_, {alpha, ref}); break;
+                    case 7: pass = b_.OpResult(SpvOpFOrdGreaterThanEqual, t_bool_, {alpha, ref}); break;
+                    default: pass = b_.ConstBool(true); break;
+                }
+                Id kill = b_.NewId(), cont = b_.NewId();
+                b_.Op(SpvOpSelectionMerge, {cont, uint32_t(SpvSelectionControlMaskNone)});
+                b_.Op(SpvOpBranchConditional, {pass, cont, kill});
+                b_.Label(kill);
+                b_.Op(SpvOpKill, {});
+                b_.Label(cont);
+                info_.uses_discard = true;
+            }
             uint32_t reg = 0;
             for (uint32_t t = 0; t < 8; t++) {
                 uint32_t mask = (omap >> (t * 4)) & 0xF;
@@ -583,6 +607,18 @@ private:
             b_.Op(SpvOpStore, {pz, b_.OpResult(SpvOpFMul, t_f32_, {sum, b_.ConstFloat(0.5f)})});
         }
         b_.Op(SpvOpReturn, {});
+    }
+
+    Id AlphaRef() {
+        if (!push_) {
+            Id st = b_.TypeStruct({t_f32_});
+            b_.Decorate(st, SpvDecorationBlock);
+            b_.MemberDecorate(st, 0, SpvDecorationOffset, {0});
+            push_ = b_.Variable(b_.TypePointer(SpvStorageClassPushConstant, st), SpvStorageClassPushConstant);
+            b_.Name(push_, "push");
+        }
+        Id p = b_.OpResult(SpvOpAccessChain, b_.TypePointer(SpvStorageClassPushConstant, t_f32_), {push_, b_.ConstUint(0)});
+        return b_.OpResult(SpvOpLoad, t_f32_, {p});
     }
 
     // ---- textures -------------------------------------------------------------------------------------------
@@ -1195,6 +1231,7 @@ private:
     Id reg_[256] = {}, pred_[8] = {}, cbuf_[kMaxCbufs] = {};
     Id in_[32] = {}, in_type_[32] = {}, out_[32] = {};
     Id tex_[32] = {}, tex_type_[32] = {}, shadow_[32] = {}, shadow_type_[32] = {};
+    Id push_ = 0;
     Id position_ = 0, point_size_ = 0, frag_coord_ = 0, frag_depth_ = 0, point_coord_ = 0, vertex_index_ = 0,
        instance_index_ = 0;
     std::vector<Id> interface_;

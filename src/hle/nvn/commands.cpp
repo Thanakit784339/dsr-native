@@ -18,6 +18,7 @@
 #include "common/log.h"
 #include "hle/nvn.h"
 #include "hle/nvn/backend.h"
+#include "hle/nvn/state.h"
 
 namespace dsr::hle::nvn {
 namespace {
@@ -167,10 +168,177 @@ void CopyTextureToTexture(void* cb, const void* src, const void* /*src_view*/, c
     Append(cb, std::move(c));
 }
 
-// All draw entry points: counted for now. Arguments are ignored, so one function serves every signature.
-void Draw(void* cb) {
+// ---- binds ----------------------------------------------------------------------------------------------
+template <typename T>
+std::shared_ptr<const void> Obj(T v) {
+    return std::make_shared<const T>(std::move(v));
+}
+void Bind(void* cb, CmdType t, std::shared_ptr<const void> obj, int stage = 0, int index = 0) {
+    Cmd c;
+    c.type = t;
+    c.obj = std::move(obj);
+    c.stage = stage;
+    c.index = index;
+    Append(cb, std::move(c));
+}
+void BindProgram(void* cb, const void* program, int stage_bits) {
+    Bind(cb, CmdType::BindProgram, GetProgramCode(program), 0, stage_bits);
+}
+// NVNvertexAttribState is 4 bytes and NVNvertexStreamState 8 bytes in game memory.
+void BindVertexAttribState(void* cb, int n, const uint8_t* states) {
+    std::vector<VertexAttribObj> v;
+    for (int i = 0; i < n && states; i++) v.push_back(GetVertexAttrib(states + 4 * i));
+    Bind(cb, CmdType::BindVertexAttribs, Obj(std::move(v)));
+}
+void BindVertexStreamState(void* cb, int n, const uint8_t* states) {
+    std::vector<VertexStreamObj> v;
+    for (int i = 0; i < n && states; i++) v.push_back(GetVertexStream(states + 8 * i));
+    Bind(cb, CmdType::BindVertexStreams, Obj(std::move(v)));
+}
+void BindVertexBuffer(void* cb, int index, uint64_t addr, uint64_t size) {
+    Bind(cb, CmdType::BindVertexBuffers, Obj(std::vector<BufferRange>{{addr, size}}), 0, index);
+}
+void BindVertexBuffers(void* cb, int first, int n, const BufferRange* ranges) {
+    Bind(cb, CmdType::BindVertexBuffers, Obj(std::vector<BufferRange>(ranges, ranges + std::max(0, n))), 0, first);
+}
+void BindUniformBuffer(void* cb, int stage, int index, uint64_t addr, uint64_t size) {
+    Bind(cb, CmdType::BindUniformBuffers, Obj(std::vector<BufferRange>{{addr, size}}), stage, index);
+}
+void BindUniformBuffers(void* cb, int stage, int first, int n, const BufferRange* ranges) {
+    Bind(cb, CmdType::BindUniformBuffers, Obj(std::vector<BufferRange>(ranges, ranges + std::max(0, n))), stage, first);
+}
+// NVN texture handles: texture ID in the low 20 bits, sampler ID above (see DeviceGetTextureHandle).
+BoundTexture ResolveHandle(uint64_t handle) {
+    BoundTexture b;
+    b.texture = TextureById(int(handle & 0xFFFFF));
+    b.sampler = SamplerById(int(handle >> 20));
+    b.valid = b.texture.valid;
+    return b;
+}
+void BindTexture(void* cb, int stage, int index, uint64_t handle) {
+    Bind(cb, CmdType::BindTextures, Obj(std::vector<BoundTexture>{ResolveHandle(handle)}), stage, index);
+}
+void BindTextures(void* cb, int stage, int first, int n, const uint64_t* handles) {
+    std::vector<BoundTexture> v;
+    for (int i = 0; i < n && handles; i++) v.push_back(ResolveHandle(handles[i]));
+    Bind(cb, CmdType::BindTextures, Obj(std::move(v)), stage, first);
+}
+void BindBlendState(void* cb, const void* s) { Bind(cb, CmdType::BindBlend, Obj(GetBlendState(s))); }
+void BindColorState(void* cb, const void* s) { Bind(cb, CmdType::BindColor, Obj(GetColorState(s))); }
+void BindChannelMaskState(void* cb, const void* s) { Bind(cb, CmdType::BindChannelMask, Obj(GetChannelMaskState(s))); }
+void BindDepthStencilState(void* cb, const void* s) { Bind(cb, CmdType::BindDepthStencil, Obj(GetDepthStencilState(s))); }
+void BindPolygonState(void* cb, const void* s) { Bind(cb, CmdType::BindPolygon, Obj(GetPolygonState(s))); }
+void BindMultisampleState(void* cb, const void* s) { Bind(cb, CmdType::BindMultisample, Obj(GetMultisampleState(s))); }
+
+// ---- dynamic state ------------------------------------------------------------------------------------
+void SetF(void* cb, CmdType t, float a, float b = 0, float c = 0, float d = 0) {
+    Cmd cmd;
+    cmd.type = t;
+    cmd.f[0] = a;
+    cmd.f[1] = b;
+    cmd.f[2] = c;
+    cmd.f[3] = d;
+    Append(cb, std::move(cmd));
+}
+void SetViewport(void* cb, int x, int y, int w, int h) { SetF(cb, CmdType::SetViewport, float(x), float(y), float(w), float(h)); }
+void SetViewports(void* cb, int first, int n, const float* v) {
+    if (first == 0 && n > 0 && v) SetF(cb, CmdType::SetViewport, v[0], v[1], v[2], v[3]);
+}
+void SetScissor(void* cb, int x, int y, int w, int h) { SetF(cb, CmdType::SetScissor, float(x), float(y), float(w), float(h)); }
+void SetScissors(void* cb, int first, int n, const int* v) {
+    if (first == 0 && n > 0 && v) SetF(cb, CmdType::SetScissor, float(v[0]), float(v[1]), float(v[2]), float(v[3]));
+}
+void SetDepthRange(void* cb, float n, float f) { SetF(cb, CmdType::SetDepthRange, n, f); }
+void SetAlphaRef(void* cb, float ref) { SetF(cb, CmdType::SetAlphaRef, ref); }
+void SetBlendColor(void* cb, const float* c) { SetF(cb, CmdType::SetBlendColor, c[0], c[1], c[2], c[3]); }
+void SetStencil(void* cb, int which, int face, int value) {
+    Cmd c;
+    c.type = CmdType::SetStencil;
+    c.index = which;
+    c.stage = face;
+    c.mask = value;
+    Append(cb, std::move(c));
+}
+void SetStencilRef(void* cb, int face, int v) { SetStencil(cb, 0, face, v); }
+void SetStencilMask(void* cb, int face, int v) { SetStencil(cb, 1, face, v); }
+void SetStencilValueMask(void* cb, int face, int v) { SetStencil(cb, 2, face, v); }
+
+// ---- draws --------------------------------------------------------------------------------------------
+void RecordDraw(void* cb, const DrawParams& p) {
     Cmd c;
     c.type = CmdType::Draw;
+    c.draw = p;
+    Append(cb, std::move(c));
+}
+void DrawArrays(void* cb, int mode, int first, int count) {
+    DrawParams p;
+    p.mode = mode;
+    p.first = first;
+    p.count = count;
+    RecordDraw(cb, p);
+}
+void DrawArraysInstanced(void* cb, int mode, int first, int count, int base_instance, int instances) {
+    DrawParams p;
+    p.mode = mode;
+    p.first = first;
+    p.count = count;
+    p.base_instance = base_instance;
+    p.instances = instances;
+    RecordDraw(cb, p);
+}
+void DrawElementsBaseVertex(void* cb, int mode, int type, int count, uint64_t index_addr, int base_vertex) {
+    DrawParams p;
+    p.mode = mode;
+    p.index_type = type;
+    p.count = count;
+    p.index_address = index_addr;
+    p.base_vertex = base_vertex;
+    RecordDraw(cb, p);
+}
+void DrawElements(void* cb, int mode, int type, int count, uint64_t index_addr) {
+    DrawElementsBaseVertex(cb, mode, type, count, index_addr, 0);
+}
+void DrawElementsInstanced(void* cb, int mode, int type, int count, uint64_t index_addr, int base_vertex,
+                           int base_instance, int instances) {
+    DrawParams p;
+    p.mode = mode;
+    p.index_type = type;
+    p.count = count;
+    p.index_address = index_addr;
+    p.base_vertex = base_vertex;
+    p.base_instance = base_instance;
+    p.instances = instances;
+    RecordDraw(cb, p);
+}
+// Not implemented yet; recorded as draws with no vertices so they are counted.
+void DrawUnsupported(void* cb) { RecordDraw(cb, DrawParams{0, -1, 0, 0, 0, 0, 0, 0}); }
+
+// ---- data updates ---------------------------------------------------------------------------------------
+// The update lands in the buffer when the command executes, as on the GPU.
+void UpdateUniformBuffer(void* cb, uint64_t buffer, size_t buffer_size, int64_t offset, size_t size, const void* data) {
+    if (!data || !size || offset < 0 || size_t(offset) + size > buffer_size) return;
+    Cmd c;
+    c.type = CmdType::UpdateUniform;
+    c.dst_addr = buffer + uint64_t(offset);
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    c.obj = Obj(std::vector<uint8_t>(p, p + size));
+    Append(cb, std::move(c));
+}
+std::atomic<int64_t> g_copy_row_stride{0}, g_copy_image_stride{0};
+void SetCopyRowStride(void* cb, int64_t v) { g_copy_row_stride = v; }
+void SetCopyImageStride(void* cb, int64_t v) { g_copy_image_stride = v; }
+int64_t GetCopyRowStride(const void*) { return g_copy_row_stride; }
+int64_t GetCopyImageStride(const void*) { return g_copy_image_stride; }
+void CopyBufferToTexture(void* cb, uint64_t src, const void* dst, const void* /*view*/, const CopyRegion* region,
+                         int flags) {
+    Cmd c;
+    c.type = CmdType::CopyBufferToTexture;
+    c.src_addr = src;
+    c.dst = MakeTexRef(dst);
+    if (region) c.dst_region = *region;
+    c.flags = flags;
+    c.f[0] = float(g_copy_row_stride.load());
+    c.f[1] = float(g_copy_image_stride.load());
     Append(cb, std::move(c));
 }
 
@@ -188,6 +356,7 @@ void QueueSubmitCommands(void* /*queue*/, int n, const uint64_t* handles) {
         for (const Cmd& c : *list) {
             switch (c.type) {
                 case CmdType::Draw: g_stats.draws++; break;
+                default: break;
                 case CmdType::ClearColor:
                 case CmdType::ClearDepthStencil:
                 case CmdType::ClearTexture: g_stats.clears++; break;
@@ -223,17 +392,48 @@ const Proc kProcs[] = {
     P("nvnCommandBufferClearTexturei", ClearTexturei),
     P("nvnCommandBufferClearTextureui", ClearTextureui),
     P("nvnCommandBufferCopyTextureToTexture", CopyTextureToTexture),
-    P("nvnCommandBufferDrawArrays", Draw),
-    P("nvnCommandBufferDrawArraysInstanced", Draw),
-    P("nvnCommandBufferDrawArraysIndirect", Draw),
-    P("nvnCommandBufferDrawElements", Draw),
-    P("nvnCommandBufferDrawElementsBaseVertex", Draw),
-    P("nvnCommandBufferDrawElementsInstanced", Draw),
-    P("nvnCommandBufferDrawElementsIndirect", Draw),
-    P("nvnCommandBufferMultiDrawArraysIndirectCount", Draw),
-    P("nvnCommandBufferMultiDrawElementsIndirectCount", Draw),
-    P("nvnCommandBufferDrawTexture", Draw),
-    P("nvnCommandBufferDrawTransformFeedback", Draw),
+    P("nvnCommandBufferDrawArrays", DrawArrays),
+    P("nvnCommandBufferDrawArraysInstanced", DrawArraysInstanced),
+    P("nvnCommandBufferDrawElements", DrawElements),
+    P("nvnCommandBufferDrawElementsBaseVertex", DrawElementsBaseVertex),
+    P("nvnCommandBufferDrawElementsInstanced", DrawElementsInstanced),
+    P("nvnCommandBufferDrawArraysIndirect", DrawUnsupported),
+    P("nvnCommandBufferDrawElementsIndirect", DrawUnsupported),
+    P("nvnCommandBufferMultiDrawArraysIndirectCount", DrawUnsupported),
+    P("nvnCommandBufferMultiDrawElementsIndirectCount", DrawUnsupported),
+    P("nvnCommandBufferDrawTexture", DrawUnsupported),
+    P("nvnCommandBufferDrawTransformFeedback", DrawUnsupported),
+    P("nvnCommandBufferBindProgram", BindProgram),
+    P("nvnCommandBufferBindVertexAttribState", BindVertexAttribState),
+    P("nvnCommandBufferBindVertexStreamState", BindVertexStreamState),
+    P("nvnCommandBufferBindVertexBuffer", BindVertexBuffer),
+    P("nvnCommandBufferBindVertexBuffers", BindVertexBuffers),
+    P("nvnCommandBufferBindUniformBuffer", BindUniformBuffer),
+    P("nvnCommandBufferBindUniformBuffers", BindUniformBuffers),
+    P("nvnCommandBufferBindTexture", BindTexture),
+    P("nvnCommandBufferBindTextures", BindTextures),
+    P("nvnCommandBufferBindBlendState", BindBlendState),
+    P("nvnCommandBufferBindColorState", BindColorState),
+    P("nvnCommandBufferBindChannelMaskState", BindChannelMaskState),
+    P("nvnCommandBufferBindDepthStencilState", BindDepthStencilState),
+    P("nvnCommandBufferBindPolygonState", BindPolygonState),
+    P("nvnCommandBufferBindMultisampleState", BindMultisampleState),
+    P("nvnCommandBufferSetViewport", SetViewport),
+    P("nvnCommandBufferSetViewports", SetViewports),
+    P("nvnCommandBufferSetScissor", SetScissor),
+    P("nvnCommandBufferSetScissors", SetScissors),
+    P("nvnCommandBufferSetDepthRange", SetDepthRange),
+    P("nvnCommandBufferSetAlphaRef", SetAlphaRef),
+    P("nvnCommandBufferSetBlendColor", SetBlendColor),
+    P("nvnCommandBufferSetStencilRef", SetStencilRef),
+    P("nvnCommandBufferSetStencilMask", SetStencilMask),
+    P("nvnCommandBufferSetStencilValueMask", SetStencilValueMask),
+    P("nvnCommandBufferUpdateUniformBuffer", UpdateUniformBuffer),
+    P("nvnCommandBufferSetCopyRowStride", SetCopyRowStride),
+    P("nvnCommandBufferSetCopyImageStride", SetCopyImageStride),
+    P("nvnCommandBufferGetCopyRowStride", GetCopyRowStride),
+    P("nvnCommandBufferGetCopyImageStride", GetCopyImageStride),
+    P("nvnCommandBufferCopyBufferToTexture", CopyBufferToTexture),
     P("nvnQueueSubmitCommands", QueueSubmitCommands),
 };
 #undef P
