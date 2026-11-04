@@ -234,7 +234,7 @@ public:
         r = vkQueuePresentKHR(queue_, &pi);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR)
             swapchain_dirty_ = true;
-        else if (r != VK_SUCCESS)
+        else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
             LogOnce("present", "vkQueuePresentKHR failed: %d", r);
         if (++presented_ == 1) LOGI(kTag, "first frame on screen");
     }

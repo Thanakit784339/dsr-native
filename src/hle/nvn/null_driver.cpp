@@ -10,11 +10,14 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <thread>
 
 #include "common/log.h"
 #include "hle/nvn.h"
 #include "hle/nvn/backend.h"
+#include "hle/nvn/shader_dump.h"
 #include "hle/nvn/nvn_types.h"
 #include "hle/os/os.h"
 
@@ -161,8 +164,50 @@ void BufferBuilderSetDefaults(void* b) { g_buffer_builders.Reset(b); }
 void BufferBuilderSetStorage(void* b, const void* pool, int64_t offset, size_t size) {
     g_buffer_builders.Get(b) = {pool, offset, size};
 }
+// GPU address -> buffer size, so shader code handed over by address can be sized exactly.
+std::mutex g_buffer_addr_mutex;
+std::map<uint64_t, size_t> g_buffer_by_addr;
+
 bool BufferInitialize(void* buf, const void* b) {
-    g_buffers.Get(buf) = g_buffer_builders.Copy(b);
+    BufferState s = g_buffer_builders.Copy(b);
+    g_buffers.Get(buf) = s;
+    std::lock_guard<std::mutex> lk(g_buffer_addr_mutex);
+    g_buffer_by_addr[PoolBase(s.pool) + uint64_t(s.offset)] = s.size;
+    return true;
+}
+// Size of the buffer region containing addr (0 if none).
+size_t BufferBytesFrom(uint64_t addr) {
+    std::lock_guard<std::mutex> lk(g_buffer_addr_mutex);
+    auto it = g_buffer_by_addr.upper_bound(addr);
+    if (it == g_buffer_by_addr.begin()) return 0;
+    --it;
+    if (addr >= it->first + it->second) return 0;
+    return size_t(it->first + it->second - addr);
+}
+
+// nvnProgramSetShaders(program, count, const NVNshaderData*): NVNshaderData = { u64 code address; const
+// void* control }. Shaders are not translated yet; record them so the translator can be built from the
+// game's real binaries.
+struct ShaderData {
+    uint64_t address;
+    const void* control;
+};
+bool ProgramSetShaders(void* program, int count, const ShaderData* stages) {
+    for (int i = 0; i < count && stages; i++) {
+        uint64_t a = stages[i].address;
+        size_t n = BufferBytesFrom(a);
+        if (!n || n > (4u << 20)) {
+            // Not inside a known buffer: scan for the end-of-program self-branch (BRA to itself).
+            n = 0;
+            const uint64_t* q = reinterpret_cast<const uint64_t*>(a);
+            for (size_t k = 0; a && k < 0x4000 / 8; k++)
+                if ((q[k] & 0xFFFFFFFFFF0FFFFFull) == 0xE2400FFFFF07000Full) {
+                    n = (k + 1) * 8;
+                    break;
+                }
+        }
+        DumpShader(a, reinterpret_cast<const void*>(a), n, stages[i].control, stages[i].control ? 0x800 : 0);
+    }
     return true;
 }
 void BufferFinalize(void* buf) { g_buffers.Erase(buf); }
@@ -395,7 +440,7 @@ const Proc kProcs[] = {
     P("nvnTexturePoolRegisterImage", Nop), P("nvnSamplerPoolInitialize", True), P("nvnSamplerPoolFinalize", Nop),
     P("nvnSamplerPoolRegisterSampler", Nop), P("nvnSamplerPoolRegisterSamplerBuilder", Nop),
     P("nvnSamplerInitialize", True), P("nvnSamplerFinalize", Nop),
-    P("nvnProgramInitialize", True), P("nvnProgramFinalize", Nop), P("nvnProgramSetShaders", True),
+    P("nvnProgramInitialize", True), P("nvnProgramFinalize", Nop), P("nvnProgramSetShaders", ProgramSetShaders),
     P("nvnEventInitialize", True), P("nvnEventFinalize", Nop),
     // queues
     P("nvnQueueBuilderSetDefaults", QueueBuilderSetDefaults), P("nvnQueueBuilderSetDevice", Nop),

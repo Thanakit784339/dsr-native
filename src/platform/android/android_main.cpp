@@ -27,6 +27,7 @@
 
 #include "common/crash.h"
 #include "common/log.h"
+#include "common/platform.h"
 #include "hle/input.h"
 #include "hle/video.h"
 #include "runtime/runtime.h"
@@ -62,12 +63,18 @@ bool JniFailed(JNIEnv* env, std::string* why, const char* step) {
 }
 
 // Creates Download/DSRNative/<name> through MediaStore and returns a writable fd, or -1.
-int CreateDownloadViaMediaStore(android_app* app, const char* name, std::string* why) {
+int CreateDownloadViaMediaStore(android_app* app, const char* name, std::string* why,
+                                const char* mime_type = "text/plain") {
     JavaVM* vm = app->activity->vm;
     JNIEnv* env = nullptr;
-    if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) {
-        *why = "AttachCurrentThread failed";
-        return -1;
+    // Only detach afterwards if this call attached the thread.
+    bool attached_here = false;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK || !env) {
+        if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) {
+            *why = "AttachCurrentThread failed";
+            return -1;
+        }
+        attached_here = true;
     }
     int fd = -1;
     jobject activity = app->activity->clazz;
@@ -79,7 +86,7 @@ int CreateDownloadViaMediaStore(android_app* app, const char* name, std::string*
         if (JniFailed(env, why, "ContentValues methods")) break;
         jobject values = env->NewObject(cv_cls, cv_ctor);
         if (JniFailed(env, why, "new ContentValues")) break;
-        const char* kv[][2] = {{"_display_name", name}, {"mime_type", "text/plain"}, {"relative_path", "Download/DSRNative"}};
+        const char* kv[][2] = {{"_display_name", name}, {"mime_type", mime_type}, {"relative_path", "Download/DSRNative"}};
         for (auto& p : kv) {
             jstring k = env->NewStringUTF(p[0]);
             jstring v = env->NewStringUTF(p[1]);
@@ -119,7 +126,7 @@ int CreateDownloadViaMediaStore(android_app* app, const char* name, std::string*
         fd = env->CallIntMethod(pfd, detach);
         if (JniFailed(env, why, "detachFd")) fd = -1;
     } while (false);
-    vm->DetachCurrentThread();
+    if (attached_here) vm->DetachCurrentThread();
     return fd;
 }
 
@@ -147,7 +154,18 @@ void StartLogcatMirror(int fd) {
         LOGW(kTag, "logcat mirror failed to start: %s", strerror(rc));
 }
 
+android_app* g_app_for_files = nullptr;
+int CreateUserFileImpl(const char* name, const char* mime_type) {
+    if (!g_app_for_files) return -1;
+    std::string why;
+    int fd = CreateDownloadViaMediaStore(g_app_for_files, name, &why, mime_type);
+    if (fd < 0) LOGW(kTag, "could not create %s: %s", name, why.c_str());
+    return fd;
+}
+
 void SetupLogFile(android_app* app) {
+    g_app_for_files = app;
+    dsr::platform::SetCreateUserFile(&CreateUserFileImpl);
     time_t now = time(nullptr);
     tm t;
     localtime_r(&now, &t);
