@@ -327,8 +327,12 @@ private:
         }
         return cbuf_[idx];
     }
+    void CbufReach(uint32_t idx, uint32_t bytes) {
+        if (idx < 18) info_.cbuf_bytes[idx] = std::max(info_.cbuf_bytes[idx], std::min<uint32_t>(bytes, kCbufVec4s * 16));
+    }
     Id Cbuf(uint32_t idx, uint32_t byte_offset) {
         Id var = CbufVar(idx);
+        CbufReach(idx, ((byte_offset % (kCbufVec4s * 16)) | 15) + 1);
         Id p = b_.OpResult(SpvOpAccessChain, b_.TypePointer(SpvStorageClassUniform, t_u32_),
                            {var, b_.ConstUint(0), b_.ConstUint((byte_offset >> 4) % kCbufVec4s),
                             b_.ConstUint((byte_offset >> 2) & 3)});
@@ -336,6 +340,7 @@ private:
     }
     Id CbufDynamic(uint32_t idx, Id byte_offset) {
         Id var = CbufVar(idx);
+        CbufReach(idx, kCbufVec4s * 16);
         Id vec_index = b_.OpResult(SpvOpShiftRightLogical, t_u32_, {byte_offset, b_.ConstUint(4)});
         vec_index = b_.OpResult(SpvOpBitwiseAnd, t_u32_, {vec_index, b_.ConstUint(kCbufVec4s - 1)});
         Id comp = b_.OpResult(SpvOpShiftRightLogical, t_u32_, {byte_offset, b_.ConstUint(2)});

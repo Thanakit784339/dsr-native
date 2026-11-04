@@ -123,7 +123,10 @@ struct ShaderCode {
     uint64_t hash = 0;
     int stage = -1;  // 0 vertex, 1 fragment (from the SPH)
     std::vector<uint8_t> code;
-    std::vector<uint8_t> control;  // NVN control section (header + compiler constants, see ShaderConstants)
+    std::vector<uint8_t> control;  // NVN control section
+    // The compiler's literal pool, read by the shader as c[1]. It lives in the GPU section after the code, at
+    // the offset/size given by control words 0x700 / 0x6fc.
+    std::vector<uint8_t> constants;
 };
 
 struct WindowState {

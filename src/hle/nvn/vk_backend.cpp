@@ -326,8 +326,16 @@ class VulkanBackend final : public Backend {
 public:
     const char* Name() const override { return "vulkan"; }
 
+    struct MsTimer {
+        double& total;
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        explicit MsTimer(double& t) : total(t) {}
+        ~MsTimer() { total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
+    };
+
     void Execute(const CmdList& cmds) override {
         std::lock_guard<std::mutex> lk(m_);
+        MsTimer timer(exec_ms_);
         if (!EnsureDevice()) return;
         ResetTransient();
         list_counter_++;
@@ -367,8 +375,10 @@ public:
                 case CmdType::CopyBufferToTexture: CopyBufferToTexture(c); break;
                 case CmdType::UpdateUniform: {
                     auto data = std::static_pointer_cast<const std::vector<uint8_t>>(c.obj);
-                    if (data && GuestRangeValid(c.dst_addr, data->size()))
+                    if (data && GuestRangeValid(c.dst_addr, data->size())) {
                         memcpy(reinterpret_cast<void*>(c.dst_addr), data->data(), data->size());
+                        stream_cache_.clear();  // cached copies may include the old bytes
+                    }
                     break;
                 }
                 case CmdType::BindProgram: {
@@ -1138,7 +1148,10 @@ private:
             LogOnce("submit", "vkQueueSubmit failed: %d", r);
             return;
         }
-        r = vkWaitForFences(device_, 1, &fence_, VK_TRUE, 5000000000ull);
+        {
+            MsTimer wait_timer(wait_ms_);
+            r = vkWaitForFences(device_, 1, &fence_, VK_TRUE, 5000000000ull);
+        }
         if (r != VK_SUCCESS) LogOnce("fence", "GPU did not finish within 5 s (%d)", r);
         vkResetFences(device_, 1, &fence_);
     }
@@ -1191,6 +1204,7 @@ private:
         if (st_.rts.size() <= size_t(st_.num_rt)) return;
         Image* img = GetImage(st_.rts[size_t(st_.num_rt)], false);
         if (!img) return;
+        depth_gen_++;
         VkImageAspectFlags a = 0;
         if (c.depth_mask && HasDepth(img->nvn_format)) a |= VK_IMAGE_ASPECT_DEPTH_BIT;
         if (c.stencil_mask && HasStencil(img->nvn_format)) a |= VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -1442,6 +1456,33 @@ private:
     // draws
     // ======================================================================================================
     // 1x1 opaque white image for the dimension a shader expects (6 layers for cubes).
+    // A copy of a depth buffer, refreshed when depth has been written since the last copy.
+    Image* DepthSnapshot(Image& depth, const TexRef& ref) {
+        TexRef snap_ref = ref;
+        snap_ref.addr = ref.addr ^ (1ull << 62);
+        auto it = images_.find(snap_ref.addr);
+        Image* snap = nullptr;
+        if (it != images_.end() && it->second.width == depth.width && it->second.height == depth.height &&
+            it->second.vk_format == depth.vk_format)
+            snap = &it->second;
+        else
+            snap = CreateImage(snap_ref);
+        if (!snap) return nullptr;
+        auto& gen = snapshot_gen_[snap_ref.addr];
+        if (gen != depth_gen_ + 1) {
+            EndRendering();
+            CopyImage(depth, CopyRegion{}, *snap, CopyRegion{}, 0);
+            snap->written = true;
+            gen = depth_gen_ + 1;
+            Transition(depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        }
+        if (snap->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+            EndRendering();
+            Transition(*snap, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
+        return snap;
+    }
+
     Image* Fallback(shader::TexDim dim, bool array) {
         const int key = int(dim) * 2 + (array ? 1 : 0);
         auto it = fallbacks_.find(key);
@@ -1581,7 +1622,11 @@ private:
                 }
                 for (Image* c : colors)
                     if (c == img) return Skip("texture is also a render target");
-                if (depth == img) return Skip("texture is also the depth target");
+                if (depth == img) {
+                    // Sampling the bound depth buffer (soft particles, fog): read a snapshot copy instead.
+                    img = DepthSnapshot(*depth, st_.rts[size_t(st_.num_rt)]);
+                    if (!img) return Skip("texture is also the depth target");
+                }
                 if (img->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
                     EndRendering();
                     Transition(*img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -1622,6 +1667,8 @@ private:
                 } else if (n >= kCbufBase) {
                     const BufferRange& r = st_.uniforms[stage][n - kCbufBase];
                     size = size_t(std::min<uint64_t>(r.size, kMaxUniformRange));
+                    // Only what the shader can read.
+                    if (info.cbuf_bytes[n]) size = std::min<size_t>(size, info.cbuf_bytes[n]);
                     if (r.address && size && GuestRangeValid(r.address, size))
                         src = reinterpret_cast<const uint8_t*>(r.address);
                     else
@@ -1629,9 +1676,20 @@ private:
                 }
                 VkDescriptorBufferInfo bi{stream_, zero_offset_, kMaxUniformRange};
                 if (src && size) {
-                    VkDeviceSize off = StreamAlloc((size + 15) & ~size_t(15), ubo_align);
-                    memcpy(stream_ptr_ + off, src, size);
-                    bi = {stream_, off, (size + 15) & ~size_t(15)};
+                    // Pad to 16 bytes from guest memory when possible (the shader reads whole vec4s).
+                    size_t padded = (size + 15) & ~size_t(15);
+                    if (padded != size && n != kCompilerConstants && GuestRangeValid(uint64_t(uintptr_t(src)), padded)) size = padded;
+                    VkDeviceSize off;
+                    if (size == padded) {
+                        off = UploadCached(src, size, ubo_align);
+                    } else {
+                        off = StreamAlloc(padded, ubo_align);
+                        if (off != VK_WHOLE_SIZE) {
+                            memset(stream_ptr_ + off, 0, padded);
+                            memcpy(stream_ptr_ + off, src, size);
+                        }
+                    }
+                    if (off != VK_WHOLE_SIZE) bi = {stream_, off, padded};
                 } else {
                     MissingUniform(stage, n);
                 }
@@ -1714,8 +1772,8 @@ private:
             if (!r.address) return Skip("vertex buffer not bound");
             if (start + bytes > r.size || !GuestRangeValid(r.address + start, size_t(bytes)))
                 return Skip("vertex data outside the bound buffer");
-            VkDeviceSize off = StreamAlloc(bytes, 16);
-            memcpy(stream_ptr_ + off, reinterpret_cast<const uint8_t*>(r.address + start), size_t(bytes));
+            VkDeviceSize off = UploadCached(reinterpret_cast<const uint8_t*>(r.address + start), size_t(bytes), 16);
+            if (off == VK_WHOLE_SIZE) return Skip("vertex data too large");
             vb_offsets[b.binding] = off;
         }
         VkDeviceSize index_off = 0;
@@ -1787,6 +1845,7 @@ private:
             vkCmdDraw(cmd_, uint32_t(p.count), uint32_t(p.instances), 0, uint32_t(p.base_instance));
         }
         drawn_++;
+        if (depth && st_.depth.depth_test && st_.depth.depth_write) depth_gen_++;
         if (drawn_ == 1) LOGI(kTag, "first draw recorded");
     }
 
@@ -1974,21 +2033,27 @@ private:
     // c[1]: the literal constants NVN's compiler stored with the shader. The control section header gives
     // its size (word 5) and the constants' size (word 11); the constants sit at the end of the section.
     void ShaderConstants(const ShaderCode& code, const uint8_t** data, size_t* size) {
-        *data = nullptr;
-        *size = 0;
-        if (code.control.size() < 64) return;
-        uint32_t hdr[16];
-        memcpy(hdr, code.control.data(), sizeof(hdr));
-        const uint32_t total = hdr[5], csize = hdr[11];
-        if (hdr[0] != 0x98761234u || !csize || csize > total || total > code.control.size()) return;
-        *data = code.control.data() + (total - csize);
-        *size = csize;
-        if (constants_logged_ < 4) {
-            constants_logged_++;
-            float f[4] = {};
-            memcpy(f, *data, std::min<size_t>(16, csize));
-            LOGI(kTag, "shader constants c[1] (%u bytes): %g %g %g %g ...", csize, f[0], f[1], f[2], f[3]);
+        *data = code.constants.empty() ? nullptr : code.constants.data();
+        *size = code.constants.size();
+    }
+
+    // Copies guest data into the stream once per list: the same range bound by several draws (UBOs reused
+    // across passes, a mesh drawn into depth, shadow and color) is uploaded once. Guest memory only changes
+    // during a list through UpdateUniform, which clears the cache.
+    VkDeviceSize UploadCached(const uint8_t* src, size_t size, VkDeviceSize align) {
+        const uint64_t key = (uint64_t(reinterpret_cast<uintptr_t>(src)) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(size) << 1) ^ align;
+        auto it = stream_cache_.find(key);
+        if (it != stream_cache_.end()) {
+            upload_hits_++;
+            return it->second;
         }
+        bool flushed = false;
+        VkDeviceSize off = StreamAlloc(size, align, &flushed);
+        if (off == VK_WHOLE_SIZE) return off;
+        memcpy(stream_ptr_ + off, src, size);
+        upload_bytes_ += size;
+        stream_cache_[key] = off;
+        return off;
     }
 
     void MissingUniform(int stage, uint32_t n) {
@@ -2011,6 +2076,10 @@ private:
         for (auto& [reason, n] : skipped_) skipped += " | " + std::to_string(n) + " " + reason;
         LOGI(kTag, "draws: %llu drawn, %zu pipelines, %d shaders, %d uploads, %d flushes%s", (unsigned long long)drawn_,
              pipelines_.size(), shaders_translated_, uploads_, flushes_, skipped.c_str());
+        LOGI(kTag, "last 10 s: %.0f ms executing lists (%.0f ms of it waiting for the GPU), %.1f MB streamed, %llu cached uploads",
+             exec_ms_, wait_ms_, upload_bytes_ / 1048576.0, (unsigned long long)upload_hits_);
+        exec_ms_ = wait_ms_ = 0;
+        upload_bytes_ = upload_hits_ = 0;
     }
 
     void LogTargets(const std::vector<TexRef>& rts, int num_rt) {
@@ -2064,6 +2133,10 @@ private:
     uint8_t* stream_ptr_ = nullptr;
     VkDeviceSize stream_off_ = 0, zero_offset_ = 0;
     std::unordered_map<uint64_t, VkDeviceSize> stream_cache_;
+    uint64_t upload_hits_ = 0, upload_bytes_ = 0;
+    uint64_t depth_gen_ = 0;  // bumped by every depth write (draw or clear)
+    std::unordered_map<uint64_t, uint64_t> snapshot_gen_;
+    double exec_ms_ = 0, wait_ms_ = 0;
     VkDescriptorPool desc_pool_ = VK_NULL_HANDLE;
 
     void* window_ = nullptr;

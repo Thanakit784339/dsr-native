@@ -37,6 +37,7 @@ struct TranslateOptions {
 struct ShaderInfo {
     Stage stage = Stage::Vertex;
     uint32_t cbuf_mask = 0;             // constant buffers read
+    uint32_t cbuf_bytes[18] = {};       // bytes of each one that can be read (65536 if indexed dynamically)
     uint32_t texture_mask = 0;          // texture slots sampled without compare
     uint32_t shadow_mask = 0;           // texture slots sampled with depth compare
     TexDim texture_dim[32] = {};        // per slot

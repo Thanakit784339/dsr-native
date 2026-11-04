@@ -234,6 +234,21 @@ bool ProgramSetShaders(void* program, int count, const ShaderData* stages) {
             if (stages[i].control) {
                 const uint8_t* c = static_cast<const uint8_t*>(stages[i].control);
                 sc->control.assign(c, c + control_size);
+                if (control_size >= 0x704) {
+                    uint32_t csize, coff;
+                    memcpy(&csize, c + 0x6fc, 4);
+                    memcpy(&coff, c + 0x700, 4);
+                    if (csize && csize <= 0x10000 && coff >= n && coff < 0x100000 && GuestRangeValid(a + coff, csize))
+                        sc->constants.assign(p + coff, p + coff + csize);
+                    static int logged = 0;
+                    if (csize && logged < 6) {
+                        logged++;
+                        float f[2] = {};
+                        if (sc->constants.size() >= 8) memcpy(f, sc->constants.data(), 8);
+                        LOGI("nvn.null", "shader constants: %u bytes at +0x%x%s (%g, %g, ...)", csize, coff,
+                             sc->constants.empty() ? " NOT READABLE" : "", f[0], f[1]);
+                    }
+                }
             }
             uint64_t h = 1469598103934665603ull;
             for (uint8_t c : sc->code) h = (h ^ c) * 1099511628211ull;
