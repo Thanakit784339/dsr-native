@@ -358,7 +358,7 @@ public:
                     if (Image* img = GetImage(st_.rts[c.index], false)) {
                         Begin();
                         EndRendering();
-                        ClearColorImage(*img, c.color, c.kind);
+                        ClearColorImage(*img, c.color, c.kind, st_.rts[c.index].layer, st_.rts[c.index].level);
                     }
                     break;
                 case CmdType::ClearTexture:
@@ -1315,8 +1315,8 @@ private:
     }
 
     VkImageView View(Image& img, VkImageViewType type, uint32_t base_layer, uint32_t layers, uint32_t levels,
-                     VkImageAspectFlags aspect, const uint8_t swz[4]) {
-        std::vector<uint32_t> key = {uint32_t(type), base_layer, layers, levels, aspect, swz[0], swz[1], swz[2], swz[3]};
+                     VkImageAspectFlags aspect, const uint8_t swz[4], uint32_t base_level = 0) {
+        std::vector<uint32_t> key = {uint32_t(type), base_layer, layers, levels, aspect, swz[0], swz[1], swz[2], swz[3], base_level};
         auto it = img.views.find(key);
         if (it != img.views.end()) return it->second;
         VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -1324,7 +1324,7 @@ private:
         ci.viewType = type;
         ci.format = img.vk_format;
         ci.components = {Swizzle(swz[0]), Swizzle(swz[1]), Swizzle(swz[2]), Swizzle(swz[3])};
-        ci.subresourceRange = {aspect, 0, levels, base_layer, layers};
+        ci.subresourceRange = {aspect, base_level, levels, base_layer, layers};
         VkImageView v = VK_NULL_HANDLE;
         if (vkCreateImageView(device_, &ci, nullptr, &v) != VK_SUCCESS) {
             LogOnce("view", "vkCreateImageView failed (format %d, type %d)", img.nvn_format, int(type));
@@ -1333,13 +1333,18 @@ private:
         img.views[key] = v;
         return v;
     }
-    VkImageView AttachmentView(Image& img) {
+    // The level/layer a render target view selects (clamped to the image).
+    static uint32_t SubLevel(const Image& img, int level) { return uint32_t(std::clamp(level, 0, img.levels - 1)); }
+    static uint32_t SubLayer(const Image& img, int layer) {
+        return uint32_t(std::clamp(layer, 0, (img.type == VK_IMAGE_TYPE_3D ? img.depth : img.layers) - 1));
+    }
+    VkImageView AttachmentView(Image& img, int layer = 0, int level = 0) {
         static const uint8_t kIdentity[4] = {2, 3, 4, 5};
-        return View(img, img.type == VK_IMAGE_TYPE_1D ? VK_IMAGE_VIEW_TYPE_1D : VK_IMAGE_VIEW_TYPE_2D, 0, 1, 1,
-                    img.aspect, kIdentity);
+        return View(img, img.type == VK_IMAGE_TYPE_1D ? VK_IMAGE_VIEW_TYPE_1D : VK_IMAGE_VIEW_TYPE_2D,
+                    img.type == VK_IMAGE_TYPE_3D ? 0 : SubLayer(img, layer), 1, 1, img.aspect, kIdentity, SubLevel(img, level));
     }
     // View matching what the shader declared for the slot.
-    VkImageView SampledView(Image& img, shader::TexDim dim, bool array, const uint8_t swz[4]) {
+    VkImageView SampledView(Image& img, shader::TexDim dim, bool array, const uint8_t swz[4], const TexRef* ref = nullptr) {
         VkImageViewType type;
         uint32_t layers = 1;
         switch (dim) {
@@ -1351,14 +1356,23 @@ private:
                 break;
             default: type = array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D; break;
         }
-        if (array && dim != shader::TexDim::Cube) layers = uint32_t(img.layers);
+        // A texture view registered with the texture picks the first level/layer (and counts).
+        const uint32_t base_level = ref ? SubLevel(img, ref->level) : 0;
+        uint32_t levels = uint32_t(img.levels) - base_level;
+        if (ref && ref->view_levels > 0) levels = std::min<uint32_t>(levels, uint32_t(ref->view_levels));
+        uint32_t base_layer = 0;
+        if (ref && img.type != VK_IMAGE_TYPE_3D && dim != shader::TexDim::Cube) base_layer = SubLayer(img, ref->layer);
+        if (array && dim != shader::TexDim::Cube) {
+            layers = uint32_t(img.layers) - base_layer;
+            if (ref && ref->view_layers > 0) layers = std::min<uint32_t>(layers, uint32_t(ref->view_layers));
+        }
         const bool type_ok = (dim == shader::TexDim::D3) == (img.type == VK_IMAGE_TYPE_3D) &&
                              (dim == shader::TexDim::D1) == (img.type == VK_IMAGE_TYPE_1D) &&
-                             (dim != shader::TexDim::Cube || img.layers >= 6) && layers <= uint32_t(img.layers);
+                             (dim != shader::TexDim::Cube || img.layers >= 6) && base_layer + layers <= uint32_t(img.layers);
         if (!type_ok) return VK_NULL_HANDLE;
         VkImageAspectFlags aspect = img.aspect;
         if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
-        return View(img, type, 0, layers, uint32_t(img.levels), aspect, swz);
+        return View(img, type, base_layer, layers, levels, aspect, swz, base_level);
     }
 
     // Formats the GPU cannot filter linearly (32-bit float on Adreno, unlike the Switch): sampling them with a
@@ -1468,12 +1482,13 @@ private:
     // ======================================================================================================
     // clears / copies
     // ======================================================================================================
-    void ClearColorImage(Image& img, const uint32_t color[4], uint8_t kind) {
+    void ClearColorImage(Image& img, const uint32_t color[4], uint8_t kind, int layer = 0, int level = 0) {
         if (IsDepthFormat(img.nvn_format)) return;
         Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkClearColorValue v;
         memcpy(v.uint32, color, sizeof(v.uint32));  // float/int/uint share the bits
-        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, SubLevel(img, level), 1,
+                                      img.type == VK_IMAGE_TYPE_3D ? 0 : SubLayer(img, layer), 1};
         vkCmdClearColorImage(cmd_, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &range);
         img.written = true;
         img.cpu_source = false;
@@ -1503,7 +1518,8 @@ private:
         EndRendering();
         Transition(*img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkClearDepthStencilValue v{std::clamp(c.depth, 0.0f, 1.0f), uint32_t(c.stencil)};
-        VkImageSubresourceRange range{a, 0, 1, 0, 1};
+        const TexRef& ref = st_.rts[size_t(st_.num_rt)];
+        VkImageSubresourceRange range{a, SubLevel(*img, ref.level), 1, SubLayer(*img, ref.layer), 1};
         vkCmdClearDepthStencilImage(cmd_, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &range);
         img->written = true;
         img->cpu_source = false;
@@ -1608,19 +1624,31 @@ private:
     }
 
     // Starts rendering into the current render targets (or keeps the current pass if they match).
+    // Layer and level of render target i of the current set (8: depth).
+    std::pair<int, int> RtSub(size_t i) const {
+        const size_t idx = i == 8 ? size_t(st_.num_rt) : i;
+        if (idx >= st_.rts.size() || (i != 8 && int(i) >= st_.num_rt)) return {0, 0};
+        return {st_.rts[idx].layer, st_.rts[idx].level};
+    }
     bool EnsureRendering(const std::vector<Image*>& colors, Image* depth, VkExtent2D* extent) {
         std::vector<uint64_t> key;
-        for (Image* c : colors) key.push_back(reinterpret_cast<uint64_t>(c ? c->image : VK_NULL_HANDLE));
+        for (size_t i = 0; i < colors.size(); i++) {
+            key.push_back(reinterpret_cast<uint64_t>(colors[i] ? colors[i]->image : VK_NULL_HANDLE));
+            key.push_back(uint64_t(RtSub(i).first) << 32 | uint32_t(RtSub(i).second));
+        }
         key.push_back(reinterpret_cast<uint64_t>(depth ? depth->image : VK_NULL_HANDLE));
+        key.push_back(uint64_t(RtSub(8).first) << 32 | uint32_t(RtSub(8).second));
         uint32_t w = UINT32_MAX, h = UINT32_MAX;
-        for (Image* c : colors)
-            if (c) {
-                w = std::min(w, uint32_t(c->width));
-                h = std::min(h, uint32_t(c->height));
+        for (size_t i = 0; i < colors.size(); i++)
+            if (Image* c = colors[i]) {
+                const uint32_t lv = SubLevel(*c, RtSub(i).second);
+                w = std::min(w, std::max(1u, uint32_t(c->width) >> lv));
+                h = std::min(h, std::max(1u, uint32_t(c->height) >> lv));
             }
         if (depth) {
-            w = std::min(w, uint32_t(depth->width));
-            h = std::min(h, uint32_t(depth->height));
+            const uint32_t lv = SubLevel(*depth, RtSub(8).second);
+            w = std::min(w, std::max(1u, uint32_t(depth->width) >> lv));
+            h = std::min(h, std::max(1u, uint32_t(depth->height) >> lv));
         }
         if (w == UINT32_MAX) {
             if (!no_attachment_extent_.width) return false;
@@ -1632,11 +1660,12 @@ private:
         if (rendering_ && key == rendering_key_) return true;
         EndRendering();
         std::vector<VkRenderingAttachmentInfo> atts;
-        for (Image* c : colors) {
+        for (size_t ci = 0; ci < colors.size(); ci++) {
+            Image* c = colors[ci];
             VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
             if (c) {
                 Transition(*c, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-                a.imageView = AttachmentView(*c);
+                a.imageView = AttachmentView(*c, RtSub(ci).first, RtSub(ci).second);
                 a.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                 a.loadOp = c->written ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
                 a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -1649,7 +1678,7 @@ private:
         VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         if (depth) {
             Transition(*depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-            da.imageView = AttachmentView(*depth);
+            da.imageView = AttachmentView(*depth, RtSub(8).first, RtSub(8).second);
             da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
             da.loadOp = depth->written ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
             da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -1969,7 +1998,8 @@ private:
                     }
                     pass_tex_desc_ += d;
                 }
-                VkImageView view = SampledView(*img, info.texture_dim[slot], info.texture_array[slot], swz);
+                VkImageView view = SampledView(*img, info.texture_dim[slot], info.texture_array[slot], swz,
+                                               bt.valid ? &bt.texture : nullptr);
                 if (!view) return Skip("texture view does not match the shader");
                 if (plain)
                     tex_writes.push_back({uint32_t(stage), 32 + slot,

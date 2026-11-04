@@ -114,15 +114,25 @@ void CallCommands(void* cb, int n, const uint64_t* handles) {
         if (auto list = FindHandle(handles[i])) r.cmds.insert(r.cmds.end(), list->begin(), list->end());
 }
 
-void SetRenderTargets(void* cb, int n, const void* const* colors, const void* const* /*color_views*/,
-                      const void* depth, const void* /*depth_view*/) {
+// A render target's view picks the mip level and array layer that is rendered into.
+static TexRef TargetRef(const void* texture, const void* view) {
+    TexRef r = MakeTexRef(texture);
+    if (view) {
+        const TextureViewObj v = GetTextureView(view);
+        if (v.has_levels) r.level = v.base_level;
+        if (v.has_layers) r.layer = v.base_layer;
+    }
+    return r;
+}
+void SetRenderTargets(void* cb, int n, const void* const* colors, const void* const* color_views,
+                      const void* depth, const void* depth_view) {
     Cmd c;
     c.type = CmdType::SetRenderTargets;
     c.num_rt = n < 0 ? 0 : (n > 8 ? 8 : n);
     auto rts = std::make_shared<std::vector<TexRef>>(c.num_rt + 1);
     for (int i = 0; i < c.num_rt; i++)
-        if (colors && colors[i]) (*rts)[i] = MakeTexRef(colors[i]);
-    if (depth) (*rts)[c.num_rt] = MakeTexRef(depth);
+        if (colors && colors[i]) (*rts)[i] = TargetRef(colors[i], color_views ? color_views[i] : nullptr);
+    if (depth) (*rts)[c.num_rt] = TargetRef(depth, depth_view);
     c.rts = std::move(rts);
     Append(cb, std::move(c));
 }

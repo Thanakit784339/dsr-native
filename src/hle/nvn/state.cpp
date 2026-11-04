@@ -16,6 +16,7 @@ namespace {
 constexpr const char* kTag = "nvn.state";
 
 Table<BlendStateObj> g_blend;
+Table<TextureViewObj> g_views;
 Table<ColorStateObj> g_color;
 Table<ChannelMaskStateObj> g_channel;
 Table<DepthStencilStateObj> g_depth;
@@ -134,6 +135,20 @@ void AttribSetFormat(void* s, int format, int64_t offset) {
 void AttribSetStream(void* s, int stream) { g_attrib.Get(s).stream = stream; }
 int AttribGetFormat(const void* s) { return g_attrib.Copy(s).format; }
 int AttribGetStream(const void* s) { return g_attrib.Copy(s).stream; }
+void ViewSetDefaults(void* v) { g_views.Reset(v); }
+void ViewSetLevels(void* v, int base, int num) {
+    auto& o = g_views.Get(v);
+    o.base_level = base;
+    o.num_levels = num;
+    o.has_levels = true;
+}
+void ViewSetLayers(void* v, int base, int num) {
+    auto& o = g_views.Get(v);
+    o.base_layer = base;
+    o.num_layers = num;
+    o.has_layers = true;
+}
+void ViewSetTarget(void* v, int target) { g_views.Get(v).target = target; }
 void StreamSetDefaults(void* s) { g_stream.Reset(s); }
 void StreamSetStride(void* s, int64_t stride) { g_stream.Get(s).stride = int(stride); }
 void StreamSetDivisor(void* s, int d) { g_stream.Get(s).divisor = d; }
@@ -175,6 +190,17 @@ void SamplerFinalize(void* sampler) { g_samplers.Erase(sampler); }
 // ---- pools ---------------------------------------------------------------------------------------------
 void TexturePoolRegisterTexture(void* pool, int id, const void* texture, const void* view) {
     TexRef r = MakeTexRef(texture);
+    if (view) {  // a view registered with the texture limits what shaders see (one mip, a layer range)
+        const TextureViewObj v = g_views.Copy(view);
+        if (v.has_levels) {
+            r.level = v.base_level;
+            r.view_levels = v.num_levels;
+        }
+        if (v.has_layers) {
+            r.layer = v.base_layer;
+            r.view_layers = v.num_layers;
+        }
+    }
     std::lock_guard<std::mutex> lk(g_pool_mutex);
     g_texture_ids[id] = r;
 }
@@ -230,6 +256,8 @@ const Proc kProcs[] = {
     P("nvnVertexAttribStateSetDefaults", AttribSetDefaults), P("nvnVertexAttribStateSetFormat", AttribSetFormat),
     P("nvnVertexAttribStateSetStreamIndex", AttribSetStream), P("nvnVertexAttribStateGetFormat", AttribGetFormat),
     P("nvnVertexAttribStateGetStreamIndex", AttribGetStream),
+    P("nvnTextureViewSetDefaults", ViewSetDefaults), P("nvnTextureViewSetLevels", ViewSetLevels),
+    P("nvnTextureViewSetLayers", ViewSetLayers), P("nvnTextureViewSetTarget", ViewSetTarget),
     P("nvnVertexStreamStateSetDefaults", StreamSetDefaults), P("nvnVertexStreamStateSetStride", StreamSetStride),
     P("nvnVertexStreamStateSetDivisor", StreamSetDivisor), P("nvnVertexStreamStateGetStride", StreamGetStride),
     P("nvnVertexStreamStateGetDivisor", StreamGetDivisor),
@@ -256,6 +284,7 @@ struct Registrar {
 BlendStateObj GetBlendState(const void* o) { return g_blend.Copy(o); }
 ColorStateObj GetColorState(const void* o) { return g_color.Copy(o); }
 ChannelMaskStateObj GetChannelMaskState(const void* o) { return g_channel.Copy(o); }
+TextureViewObj GetTextureView(const void* o) { return g_views.Copy(o); }
 DepthStencilStateObj GetDepthStencilState(const void* o) { return g_depth.Copy(o); }
 PolygonStateObj GetPolygonState(const void* o) { return g_polygon.Copy(o); }
 MultisampleStateObj GetMultisampleState(const void* o) { return g_ms.Copy(o); }

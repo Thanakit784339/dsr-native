@@ -17,6 +17,9 @@ struct TexRef {
     bool valid = false;
     TextureState tex;
     uint64_t addr = 0;
+    // From an NVNtextureView: the subresource used (render targets render into this level/layer).
+    int level = 0, layer = 0;
+    int view_levels = 0, view_layers = 0;  // 0: all from level/layer on
 };
 
 struct CopyRegion {  // NVNcopyRegion

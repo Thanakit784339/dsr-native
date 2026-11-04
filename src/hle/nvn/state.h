@@ -13,6 +13,7 @@ BlendStateObj GetBlendState(const void* obj);
 ColorStateObj GetColorState(const void* obj);
 ChannelMaskStateObj GetChannelMaskState(const void* obj);
 DepthStencilStateObj GetDepthStencilState(const void* obj);
+TextureViewObj GetTextureView(const void* view);
 PolygonStateObj GetPolygonState(const void* obj);
 MultisampleStateObj GetMultisampleState(const void* obj);
 VertexAttribObj GetVertexAttrib(const void* obj);

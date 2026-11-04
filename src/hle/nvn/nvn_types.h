@@ -106,6 +106,13 @@ struct VertexAttribObj {
     int offset = 0;
     int stream = 0;
 };
+// NVNtextureView: selects part of a texture (one mip level / a layer range), or reinterprets it.
+struct TextureViewObj {
+    int base_level = 0, num_levels = 0;  // 0 levels: all (view leaves levels alone)
+    int base_layer = 0, num_layers = 0;  // 0 layers: all
+    int target = -1;                      // -1: the texture's own
+    bool has_levels = false, has_layers = false;
+};
 struct VertexStreamObj {
     int stride = 0;
     int divisor = 0;
