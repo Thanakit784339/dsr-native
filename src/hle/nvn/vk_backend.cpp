@@ -1863,6 +1863,29 @@ private:
         return smp;
     }
 
+    // Viewport, scissor, blend constants and stencil values of a draw.
+    struct DynState {
+        VkViewport vp;
+        VkRect2D sc;
+        float blend[4];
+        uint32_t stencil[6];
+    };
+    // One draw for the recorder: everything it needs, worked out on the render thread.
+    struct DrawPacket {
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkDescriptorSetLayout set_layouts[2] = {};
+        DynState dyn{};
+        float push[4] = {};
+        VkBuffer index_buf = VK_NULL_HANDLE;
+        VkDeviceSize index_off = 0;
+        VkIndexType index_type = VK_INDEX_TYPE_UINT32;
+        bool indexed = false;
+        uint32_t count = 0, instances = 0, first_vertex = 0, base_instance = 0;
+        int32_t vertex_offset = 0;
+        uint32_t query = UINT32_MAX;  // occlusion query index (captures)
+        uint16_t n_vb = 0, n_tex = 0, n_ubo = 0;
+    };
     // ======================================================================================================
     // recorder thread
     // ======================================================================================================
@@ -4607,30 +4630,8 @@ private:
     uint64_t desc_reused_ = 0;
     VkPipeline bound_pipeline_ = VK_NULL_HANDLE;
     // Last recorded dynamic state, vertex/index bindings and push constants (skipped when unchanged).
-    struct DynState {
-        VkViewport vp;
-        VkRect2D sc;
-        float blend[4];
-        uint32_t stencil[6];
-    };
     DynState dyn_{};
     bool dyn_valid_ = false;
-    // One draw for the recorder: everything it needs, worked out on the render thread.
-    struct DrawPacket {
-        VkPipeline pipeline = VK_NULL_HANDLE;
-        VkPipelineLayout layout = VK_NULL_HANDLE;
-        VkDescriptorSetLayout set_layouts[2] = {};
-        DynState dyn{};
-        float push[4] = {};
-        VkBuffer index_buf = VK_NULL_HANDLE;
-        VkDeviceSize index_off = 0;
-        VkIndexType index_type = VK_INDEX_TYPE_UINT32;
-        bool indexed = false;
-        uint32_t count = 0, instances = 0, first_vertex = 0, base_instance = 0;
-        int32_t vertex_offset = 0;
-        uint32_t query = UINT32_MAX;  // occlusion query index (captures)
-        uint16_t n_vb = 0, n_tex = 0, n_ubo = 0;
-    };
     bool persist_full_ = false;      // set by the recorder; the render thread empties the pool
     uint64_t skipped_desc_ = 0, desc_pools_added_ = 0;
     std::pair<VkBuffer, VkDeviceSize> bound_vb_[16] = {};
