@@ -161,5 +161,7 @@ GpuStats& Stats();
 uint64_t GpuEnqueue(std::function<void()> task);  // returns the task's sequence number
 void GpuWait(uint64_t seq);                         // until task `seq` (and all before it) has run
 uint64_t GpuSubmitted();
+// Milliseconds game threads waited for the render thread since the last call (presents, sync waits).
+void TakeGameWaits(double* present_ms, double* sync_ms);
 
 }  // namespace dsr::hle::nvn

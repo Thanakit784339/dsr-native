@@ -619,6 +619,18 @@ void SyncFinalize(void* sync) {
     g_sync_targets.erase(sync);
 }
 // NVNsyncWaitResult: 0 already signalled, 1 condition satisfied, 2 timeout expired.
+// Time game threads spend waiting for the render thread: [0] at present (frames queued ahead), [1] in
+// nvnSyncWait / nvnQueueFinish. Reported with the frame times: shows whether the game or the render side sets
+// the frame rate.
+std::atomic<uint64_t> g_game_wait_ns[2];
+struct WaitTimer {
+    int which;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~WaitTimer() {
+        g_game_wait_ns[which] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - t0).count());
+    }
+};
 int SyncWait(const void* sync, uint64_t timeout_ns) {
     uint64_t target = 0;
     {
@@ -627,11 +639,15 @@ int SyncWait(const void* sync, uint64_t timeout_ns) {
         if (it != g_sync_targets.end()) target = it->second;
     }
     if (!target || Queue().Completed() >= target) return 0;
+    WaitTimer wt{1};
     const auto timeout = timeout_ns >= uint64_t(INT64_MAX) ? std::chrono::nanoseconds::max()
                                                            : std::chrono::nanoseconds(int64_t(timeout_ns));
     return Queue().Wait(target, timeout) ? 1 : 2;
 }
-void QueueFinish(void* /*queue*/) { Queue().Wait(Queue().Submitted()); }
+void QueueFinish(void* /*queue*/) {
+    WaitTimer wt{1};
+    Queue().Wait(Queue().Submitted());
+}
 
 void QueueSubmitCommands(void* /*queue*/, int n, const uint64_t* handles) {
     g_submit_calls++;
@@ -762,7 +778,15 @@ GpuStats& Stats() {
 }
 
 uint64_t GpuEnqueue(std::function<void()> task) { return Queue().Enqueue(std::move(task)); }
-void GpuWait(uint64_t seq) { Queue().Wait(seq); }
+void GpuWait(uint64_t seq) {
+    if (Queue().Completed() >= seq) return;
+    WaitTimer wt{0};
+    Queue().Wait(seq);
+}
+void TakeGameWaits(double* present_ms, double* sync_ms) {
+    *present_ms = g_game_wait_ns[0].exchange(0) / 1e6;
+    *sync_ms = g_game_wait_ns[1].exchange(0) / 1e6;
+}
 uint64_t GpuSubmitted() { return Queue().Submitted(); }
 
 Backend& GetBackend() {

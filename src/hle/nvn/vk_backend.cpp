@@ -1060,6 +1060,7 @@ public:
         sl.ts_written = sl.ts != VK_NULL_HANDLE;
         sl.pending = true;
         sl.submits_queued++;
+        sl.seq = ++submit_seq_;
         Rec([this, i = slot_, pj](VkCommandBuffer) { PresentSlot(i, pj); });
         Publish();
         NextSlot();
@@ -1628,9 +1629,7 @@ private:
         }
         auto old = images_.find(t.addr);
         if (old != images_.end()) {
-            if (recording_) Flush();  // the old image may be referenced by recorded work
-            vkQueueWaitIdle(queue_);
-            DestroyImage(old->second);
+            DestroyImage(old->second);  // retired: destroyed once the GPU is done with it
             images_.erase(old);
         }
         const TextureLayout layout = ComputeLayout(t.tex);
@@ -1709,15 +1708,42 @@ private:
         InvalidateBoundState();
         persist_resets_++;
     }
+    // An image the game no longer uses (its memory now holds another texture). Frames still on the GPU, or
+    // still queued for the recorder, may read it: its Vulkan objects are destroyed once the submission being
+    // recorded now has finished. (Destroying at once, and emptying the descriptor-set pool the GPU was still
+    // reading, showed grey textures for a frame when the game streamed in new textures.)
+    struct Retired {
+        uint64_t seq;
+        VkImage image;
+        VkDeviceMemory memory;
+        std::vector<VkImageView> views;
+    };
+    std::deque<Retired> retired_;
+    uint64_t submit_seq_ = 0;     // submissions queued (render thread)
+    uint64_t completed_seq_ = 0;  // submissions known finished on the GPU
+    uint64_t images_retired_ = 0;
     void DestroyImage(Image& img) {
-        Drain();
+        if (InOpenPass(&img)) EndRendering();  // the pass bookkeeping points at it
         small_rts_.erase(&img);
-        // Called with the GPU idle: sets that may reference this image's views are dropped with it.
-        ResetPersistentSets();
-        for (auto& [k, v] : img.views) vkDestroyImageView(device_, v, nullptr);
-        if (img.image) vkDestroyImage(device_, img.image, nullptr);
-        if (img.memory) vkFreeMemory(device_, img.memory, nullptr);
+        Retired r{submit_seq_ + 1, img.image, img.memory, {}};
+        for (auto& [k, v] : img.views) r.views.push_back(v);
+        retired_.push_back(std::move(r));
+        images_retired_++;
+        // Cached descriptor sets may name its views: forgotten (their pool is emptied when full, GPU idle).
+        Rec([this](VkCommandBuffer) {
+            persist_cache_.clear();
+            desc_cache_.clear();
+        });
         img = Image{};
+    }
+    void ReapRetired() {
+        while (!retired_.empty() && retired_.front().seq <= completed_seq_) {
+            Retired& r = retired_.front();
+            for (VkImageView v : r.views) vkDestroyImageView(device_, v, nullptr);
+            if (r.image) vkDestroyImage(device_, r.image, nullptr);
+            if (r.memory) vkFreeMemory(device_, r.memory, nullptr);
+            retired_.pop_front();
+        }
     }
 
     // Cheap change detector for game-memory textures: 64 bytes at 64 spots plus both ends.
@@ -2229,6 +2255,7 @@ private:
         sl.ts_written = sl.ts != VK_NULL_HANDLE;
         sl.pending = true;
         sl.submits_queued++;
+        sl.seq = ++submit_seq_;
         Rec([this, i = slot_, wait, signal](VkCommandBuffer) { SubmitSlot(i, wait, signal); });
         Publish();  // the GPU gets it as soon as the recorder is done
         NextSlot();
@@ -2345,6 +2372,8 @@ private:
             CollectGpuTime(sl);
             vkResetFences(device_, 1, &sl.fence);
             sl.pending = false;
+            completed_seq_ = std::max(completed_seq_, sl.seq);  // one queue: earlier submissions are done too
+            ReapRetired();
         }
         UseSlot(n);
         ResetTransient();
@@ -2361,6 +2390,8 @@ private:
                 vkResetFences(device_, 1, &sl.fence);
                 sl.pending = false;
             }
+        completed_seq_ = submit_seq_;
+        ReapRetired();
     }
 
     void RawBarrier(VkImage image, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to,
@@ -4639,6 +4670,11 @@ private:
         }
         LOGI(kTag, "descriptor sets: %llu reused from earlier frames, %zu kept, %llu resets", (unsigned long long)persist_hits_,
              persist_cache_.size(), (unsigned long long)persist_resets_);
+        if (images_retired_) {
+            LOGI(kTag, "images replaced by new textures in the same memory: %llu (destroyed after the GPU is done)",
+                 (unsigned long long)images_retired_);
+            images_retired_ = 0;
+        }
         persist_hits_ = 0;
         LOGI(kTag, "draw time by phase (ms):%s | %d pipelines compiled in %.0f ms (%llu draws waited for one) | %llu fast-path draws | %llu descriptor sets reused",
              phases.c_str(), new_pipelines_, compile_ms_, (unsigned long long)pipeline_waits_,
@@ -4793,6 +4829,7 @@ private:
         VkDescriptorPool pool = VK_NULL_HANDLE;
         std::vector<VkDescriptorPool> extra_pools;  // when `pool` fills up (recorder thread)
         uint64_t submits_queued = 0;                // render thread
+        uint64_t seq = 0;                           // submit_seq_ of its last submission
         std::atomic<uint64_t> submits_done{0};      // recorder, after vkQueueSubmit
         size_t extra_used = 0;
         VkBuffer stream = VK_NULL_HANDLE;
