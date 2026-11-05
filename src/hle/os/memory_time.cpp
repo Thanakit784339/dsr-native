@@ -136,21 +136,27 @@ HLE_FUNC(_ZN2nn2os15QueryMemoryInfoEPNS0_10MemoryInfoE, void, nn_os_QueryMemoryI
 }
 
 // ---- ticks ---------------------------------------------------------------------------------------
-// Some game threads poll the clock in a tight loop (a timer/job thread was seen spending most of a core in
-// clock_gettime). Such a thread gets a 50 us nap every 512 back-to-back reads, so it stops hogging a fast core
-// the frame and render threads need; anything that reads the clock at a normal rate is unaffected.
+// Some game threads poll the clock in a tight loop (the NexusRevolution network thread spent ~45% of a core in
+// clock_gettime). A thread that has read the clock back to back (under 5 us apart) for more than 1 ms gets a
+// 0.5 ms nap every 32 reads from then on, so it stops taking a fast core from the frame and render threads.
+// A thread that reads the clock at a normal rate never qualifies; a spin-wait may overshoot by up to 0.5 ms.
 HLE_FUNC(_ZN2nn2os13GetSystemTickEv, int64_t, nn_os_GetSystemTick, ()) {
     const int64_t t = NowTicks();
-    thread_local int64_t last = 0;
+    thread_local int64_t last = 0, streak_start = 0;
     thread_local int dense = 0;
-    if (t - last < 96) {  // under 5 us (19.2 MHz ticks) since the previous read
-        if (++dense >= 512) {
+    thread_local bool napped = false;
+    if (t - last < 96 || napped) {  // 96 ticks = 5 us at 19.2 MHz; our own nap does not end a streak
+        napped = false;
+        if (!streak_start) streak_start = t;
+        if (++dense >= 32 && t - streak_start > 19200) {
             dense = 0;
-            timespec ts{0, 50'000};
+            timespec ts{0, 500'000};
             nanosleep(&ts, nullptr);
+            napped = true;
         }
     } else {
         dense = 0;
+        streak_start = 0;
     }
     last = t;
     return t;
