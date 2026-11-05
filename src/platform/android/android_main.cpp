@@ -315,7 +315,9 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "exposure = %.2f\n"
                     "# pin_render_thread: 1 = keep the render thread on the fastest CPU core (was slower on an\n"
                     "# 8 Gen 2: the GPU then waited; 0 = let Android choose)\n"
-                    "pin_render_thread = 0\n",
+                    "pin_render_thread = 0\n"
+                    "# record_thread: 1 = record GPU commands on a second CPU thread (faster), 0 = all on one thread\n"
+                    "record_thread = 1\n",
                     cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0,
                     cfg->gamma, cfg->exposure);
             fclose(w);
@@ -332,6 +334,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "auto_capture")) cfg->auto_capture = v != 0;
             else if (!strcmp(key, "profile")) cfg->profile = v != 0;
             else if (!strcmp(key, "pin_render_thread")) cfg->pin_render_thread = v != 0;
+            else if (!strcmp(key, "record_thread")) cfg->record_thread = v != 0;
             else if (!strcmp(key, "gamma")) {
                 const float g = float(atof(value));
                 cfg->gamma = g >= 0.5f && g <= 3.0f ? g : 1.0f;

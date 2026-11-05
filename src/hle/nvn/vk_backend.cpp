@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "common/log.h"
+#include "common/profiler.h"
 #include "common/platform.h"
 #include "hle/nvn/backend.h"
 #include "runtime/runtime.h"
@@ -414,8 +415,8 @@ public:
                                 pass_color_sub_[c.index] == std::make_pair(layer, level)) {
                                 // Target of the open pass: cleared inside it.
                                 VkClearAttachment ca{VK_IMAGE_ASPECT_COLOR_BIT, uint32_t(c.index), v};
-                                VkClearRect rect{{{0, 0}, pass_extent_}, 0, 1};
-                                vkCmdClearAttachments(cmd_, 1, &ca, 1, &rect);
+                                const VkClearRect rect{{{0, 0}, pass_extent_}, 0, 1};
+                                Rec([ca, rect](VkCommandBuffer cb) { vkCmdClearAttachments(cb, 1, &ca, 1, &rect); });
                                 clears_in_pass_++;
                             } else {
                                 if (InOpenPass(img)) EndRendering();  // draws after the clear must see it
@@ -577,6 +578,7 @@ public:
         std::lock_guard<std::mutex> lk(m_);
         MsTimer timer(exec_ms_);
         if (!EnsureDevice()) return;
+        StartRecorder();
         ResetTransient();
         list_counter_++;
         MaybeArmCapture();
@@ -591,6 +593,11 @@ public:
             EndRendering();
             SubmitAndWait(VK_NULL_HANDLE, VK_NULL_HANDLE);
             recording_ = false;
+        }
+        if (persist_full_) {  // the recorder found the kept descriptor sets full: empty them (GPU idle)
+            WaitGpuIdle();
+            ResetPersistentSets();
+            persist_full_ = false;
         }
         if (capture_active_) FinishCapture();
         last_list_draws_ = drawn_ - list_start_draws_;
@@ -681,7 +688,9 @@ public:
         r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         r.imageExtent = {uint32_t(w), uint32_t(h), 1};
         Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        vkCmdCopyBufferToImage(cmd_, stream_, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+        Rec([r, buf = stream_, image = img.image](VkCommandBuffer cb) {
+            vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+        });
         // The texture's game memory is not updated: keep the change detector from re-uploading it.
         img.uploaded = true;
         img.written = true;
@@ -711,7 +720,7 @@ public:
             if (query_pool_) {
                 Begin();
                 EndRendering();
-                vkCmdResetQueryPool(cmd_, query_pool_, 0, kMaxQueries);
+                vkCmdResetQueryPool(SyncCmd(), query_pool_, 0, kMaxQueries);
             }
             StartPassTimestamps();
             LOGI(kTag, "frame capture (requested): recording this frame's passes");
@@ -738,7 +747,7 @@ public:
         if (query_pool_) {
             Begin();
             EndRendering();
-            vkCmdResetQueryPool(cmd_, query_pool_, 0, kMaxQueries);
+            vkCmdResetQueryPool(SyncCmd(), query_pool_, 0, kMaxQueries);
         }
         query_pass_.clear();
         StartPassTimestamps();
@@ -762,13 +771,13 @@ public:
         if (!ts_pool_) return;
         Begin();
         EndRendering();
-        vkCmdResetQueryPool(cmd_, ts_pool_, 0, kMaxTimestamps);
+        vkCmdResetQueryPool(SyncCmd(), ts_pool_, 0, kMaxTimestamps);
         WriteTimestamp();
     }
     void WriteTimestamp() {
         if (!ts_pool_ || ts_count_ >= kMaxTimestamps) return;
         Begin();
-        vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool_, ts_count_);
+        vkCmdWriteTimestamp(SyncCmd(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool_, ts_count_);
         ts_pass_[ts_count_] = capture_pass_;
         ts_count_++;
     }
@@ -840,7 +849,7 @@ public:
             VkBufferImageCopy c{};
             c.imageSubresource = {depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT) : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, layers};
             c.imageExtent = {it.w, it.src_h, 1};
-            vkCmdCopyImageToBuffer(cmd_, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, it.buffer, 1, &c);
+            vkCmdCopyImageToBuffer(SyncCmd(), img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, it.buffer, 1, &c);
             if (restore != VK_IMAGE_LAYOUT_UNDEFINED) Transition(img, restore);
             capture_items_.push_back(it);
             return;
@@ -900,13 +909,13 @@ public:
         b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         b.dstOffsets[1] = {int32_t(w), int32_t(h), 1};
         const bool linear = img.features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
-        vkCmdBlitImage(cmd_, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, it.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        vkCmdBlitImage(SyncCmd(), img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, it.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        1, &b, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
         RawBarrier(it.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         VkBufferImageCopy c{};
         c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         c.imageExtent = {w, h, 1};
-        vkCmdCopyImageToBuffer(cmd_, it.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, it.buffer, 1, &c);
+        vkCmdCopyImageToBuffer(SyncCmd(), it.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, it.buffer, 1, &c);
         if (restore != VK_IMAGE_LAYOUT_UNDEFINED) Transition(img, restore);
         capture_items_.push_back(it);
     }
@@ -1006,7 +1015,9 @@ public:
         RawBarrier(sc, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkClearColorValue black{};
         VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdClearColorImage(cmd_, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+        Rec([sc, black, range](VkCommandBuffer cb) {
+            vkCmdClearColorImage(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+        });
 
         Image* src = tex.valid ? FindImage(tex) : nullptr;
         if (src && src->written && !IsDepthFormat(src->nvn_format)) {
@@ -1026,8 +1037,10 @@ public:
             blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             blit.dstOffsets[0] = {x, y, 0};
             blit.dstOffsets[1] = {x + w, y + h, 1};
-            vkCmdBlitImage(cmd_, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+            Rec([blit, sc, image = src->image](VkCommandBuffer cb) {
+                vkCmdBlitImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                               &blit, VK_FILTER_LINEAR);
+            });
             if (!logged_first_image_) {
                 logged_first_image_ = true;
                 LOGI(kTag, "showing the game's frame: %dx%d (format %d) -> %dx%d at %d,%d", sw, sh, src->nvn_format, w,
@@ -1177,7 +1190,8 @@ private:
                 qi.queryCount = 2;
                 if (vkCreateQueryPool(device_, &qi, nullptr, &sl.ts) != VK_SUCCESS) sl.ts = VK_NULL_HANDLE;
             }
-            if (!CreateStream() || !CreateDescriptorPool()) return false;
+            desc_pool_ = MakeDescriptorPool();
+            if (!CreateStream() || !desc_pool_) return false;
             if (!persist_pool_) CreatePersistentPool();
             sl.stream = stream_;
             sl.mem = stream_memory_;
@@ -1296,7 +1310,7 @@ private:
         if (vkCreateDescriptorPool(device_, &ci, nullptr, &persist_pool_) != VK_SUCCESS) persist_pool_ = VK_NULL_HANDLE;
         return true;
     }
-    bool CreateDescriptorPool() {
+    VkDescriptorPool MakeDescriptorPool() {
         LOGI(kTag, "uniform buffers: up to %u with dynamic offsets per pipeline layout, alignment %llu, range %u",
              props_.limits.maxDescriptorSetUniformBuffersDynamic,
              (unsigned long long)props_.limits.minUniformBufferOffsetAlignment, props_.limits.maxUniformBufferRange);
@@ -1308,12 +1322,19 @@ private:
         ci.maxSets = 4096;
         ci.poolSizeCount = 4;
         ci.pPoolSizes = sizes;
-        return vkCreateDescriptorPool(device_, &ci, nullptr, &desc_pool_) == VK_SUCCESS;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        if (vkCreateDescriptorPool(device_, &ci, nullptr, &pool) != VK_SUCCESS) return VK_NULL_HANDLE;
+        return pool;
     }
 
     void ResetTransient() {
+        Drain();
         stream_off_ = kMaxUniformRange;  // [0, 64K) is the zero buffer
+        Slot& sl = slots_[slot_];
+        if (sl.pool) desc_pool_ = sl.pool;
         vkResetDescriptorPool(device_, desc_pool_, 0);
+        for (size_t i = 0; i < sl.extra_used; i++) vkResetDescriptorPool(device_, sl.extra_pools[i], 0);
+        sl.extra_used = 0;
         desc_cache_.clear();
         stream_cache_.clear();
     }
@@ -1593,6 +1614,7 @@ private:
 
     void ResetPersistentSets() {
         if (!persist_pool_) return;
+        Drain();
         vkResetDescriptorPool(device_, persist_pool_, 0);
         persist_cache_.clear();
         desc_cache_.clear();  // may hold sets from the persistent pool
@@ -1600,6 +1622,7 @@ private:
         persist_resets_++;
     }
     void DestroyImage(Image& img) {
+        Drain();
         small_rts_.erase(&img);
         // Called with the GPU idle: sets that may reference this image's views are dropped with it.
         ResetPersistentSets();
@@ -1678,8 +1701,10 @@ private:
             }
         }
         Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        vkCmdCopyBufferToImage(cmd_, stream_, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()),
-                               regions.data());
+        Rec([regions = std::move(regions), buf = stream_, image = img.image](VkCommandBuffer cb) {
+            vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()),
+                                   regions.data());
+        });
         img.written = true;
         uploads_++;
         if (img.width == 256 && img.height == 1 && fi.bytes_per_block == 16 && GuestRangeValid(t.addr, 4096)) {
@@ -1839,6 +1864,154 @@ private:
     }
 
     // ======================================================================================================
+    // recorder thread
+    // ======================================================================================================
+    // The render thread works out each draw (shaders, textures, uniform and vertex data, pipeline, render pass)
+    // and queues the result; the recorder thread builds the descriptor sets and records the Vulkan commands, so
+    // the two halves of a draw run on two cores. Commands keep their order: every command goes through Rec(), or
+    // through SyncCmd() which first waits for the recorder. The recorder alone uses the command buffer, the
+    // descriptor pools and caches and the bound-state trackers while it runs; the render thread touches them only
+    // after Drain() (submits, resets, statistics). Diagnostics captures record everything on the render thread.
+    using OpRun = void (*)(VulkanBackend*, uint8_t*);
+    using OpDestroy = void (*)(uint8_t*);
+    struct OpHead {
+        OpRun run;
+        OpDestroy destroy;
+        size_t bytes;  // header and payload
+    };
+    struct OpBatch {
+        std::unique_ptr<uint8_t[]> buf;
+        size_t cap = 0, used = 0;
+        uint32_t ops = 0;
+    };
+    static constexpr size_t kHeadBytes = (sizeof(OpHead) + 15) & ~size_t(15);
+    static constexpr size_t kBatchBytes = 64 << 10;
+    OpBatch* rec_batch_ = nullptr;     // being filled (render thread)
+    std::deque<OpBatch*> rec_queue_;   // under rec_mutex_
+    std::vector<OpBatch*> rec_free_;   // under rec_mutex_
+    bool rec_busy_ = false;            // under rec_mutex_
+    std::mutex rec_mutex_;
+    std::condition_variable rec_cv_, rec_idle_cv_;
+    bool rec_started_ = false;
+    std::atomic<uint64_t> rec_ns_{0};  // recorder busy time
+    double drain_ms_ = 0;              // render thread waiting for the recorder
+    uint64_t rec_batches_ = 0;
+
+    bool Async() const { return rec_started_ && !capture_active_; }
+    void StartRecorder() {
+        if (rec_started_ || !dsr::GetRuntime().config.record_thread) return;
+        rec_started_ = true;
+        std::thread([this] {
+            pthread_setname_np(pthread_self(), "dsr-record");
+            profiler::RegisterCurrentThread("dsr-record");
+            for (;;) {
+                OpBatch* b;
+                {
+                    std::unique_lock<std::mutex> lk(rec_mutex_);
+                    rec_cv_.wait(lk, [&] { return !rec_queue_.empty(); });
+                    b = rec_queue_.front();
+                    rec_queue_.pop_front();
+                    rec_busy_ = true;
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                RunBatch(*b);
+                rec_ns_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - t0).count());
+                {
+                    std::lock_guard<std::mutex> lk(rec_mutex_);
+                    rec_free_.push_back(b);
+                    if (rec_queue_.empty()) rec_busy_ = false;
+                }
+                rec_idle_cv_.notify_all();
+            }
+        }).detach();
+        LOGI(kTag, "recorder thread on: draws are prepared on the render thread and recorded on a second thread");
+    }
+    void RunBatch(OpBatch& b) {
+        for (size_t at = 0; at < b.used;) {
+            auto* h = reinterpret_cast<OpHead*>(b.buf.get() + at);
+            uint8_t* p = b.buf.get() + at + kHeadBytes;
+            h->run(this, p);
+            if (h->destroy) h->destroy(p);
+            at += h->bytes;
+        }
+        b.used = 0;
+        b.ops = 0;
+    }
+    // Space for one queued command (render thread).
+    uint8_t* RecAlloc(size_t payload, OpRun run, OpDestroy destroy) {
+        const size_t total = kHeadBytes + ((payload + 15) & ~size_t(15));
+        if (rec_batch_ && rec_batch_->used + total > rec_batch_->cap) Publish();
+        if (!rec_batch_) {
+            {
+                std::lock_guard<std::mutex> lk(rec_mutex_);
+                if (!rec_free_.empty()) {
+                    rec_batch_ = rec_free_.back();
+                    rec_free_.pop_back();
+                }
+            }
+            if (!rec_batch_) rec_batch_ = new OpBatch;
+            const size_t cap = std::max(total, kBatchBytes);
+            if (rec_batch_->cap < cap) {
+                rec_batch_->buf.reset(new uint8_t[cap]);  // 16-byte aligned (operator new[] on arm64)
+                rec_batch_->cap = cap;
+            }
+        }
+        uint8_t* p = rec_batch_->buf.get() + rec_batch_->used;
+        *reinterpret_cast<OpHead*>(p) = {run, destroy, total};
+        rec_batch_->used += total;
+        rec_batch_->ops++;
+        return p + kHeadBytes;
+    }
+    // Hands the batch being filled to the recorder.
+    void Publish() {
+        if (!rec_batch_) return;
+        if (!rec_batch_->ops) return;
+        {
+            std::lock_guard<std::mutex> lk(rec_mutex_);
+            rec_queue_.push_back(rec_batch_);
+        }
+        rec_batch_ = nullptr;
+        rec_batches_++;
+        rec_cv_.notify_one();
+    }
+    // Publishes small batches so the recorder starts early (about 32 draws' worth).
+    void MaybePublish() {
+        if (rec_batch_ && (rec_batch_->used >= (24u << 10) || rec_batch_->ops >= 96)) Publish();
+    }
+    // Waits until everything queued is recorded (render thread).
+    void Drain() {
+        if (!rec_started_) return;
+        Publish();
+        std::unique_lock<std::mutex> lk(rec_mutex_);
+        if (rec_queue_.empty() && !rec_busy_) return;
+        MsTimer t(drain_ms_);
+        rec_idle_cv_.wait(lk, [&] { return rec_queue_.empty() && !rec_busy_; });
+    }
+    // Records `f(command buffer)`: on the recorder, or here when it is off.
+    template <class F>
+    void Rec(F&& f) {
+        using T = std::decay_t<F>;
+        static_assert(alignof(T) <= 16, "queued command over-aligned");
+        if (!Async()) {
+            Drain();
+            f(cmd_);
+            return;
+        }
+        OpDestroy destroy = nullptr;
+        if constexpr (!std::is_trivially_destructible_v<T>) destroy = [](uint8_t* q) { reinterpret_cast<T*>(q)->~T(); };
+        uint8_t* p = RecAlloc(sizeof(T), [](VulkanBackend* self, uint8_t* q) { (*reinterpret_cast<T*>(q))(self->cmd_); },
+                              destroy);
+        new (p) T(std::forward<F>(f));
+        MaybePublish();
+    }
+    // The command buffer, for recording here directly (diagnostics): the recorder is idle.
+    VkCommandBuffer SyncCmd() {
+        Drain();
+        return cmd_;
+    }
+
+    // ======================================================================================================
     // command buffer helpers
     // ======================================================================================================
     // Everything recorded state-skipping relies on starts over with a new command buffer.
@@ -1853,6 +2026,7 @@ private:
         push_valid_ = false;
     }
     void BeginCommands() {
+        Drain();  // the recorder is idle from here (nothing is queued until this returns)
         InvalidateBoundState();
         vkResetCommandBuffer(cmd_, 0);
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1877,6 +2051,7 @@ private:
     // Submits the current slot's commands and moves to the other slot. The CPU waits only if that slot's
     // previous submission is still running (so CPU recording and GPU execution overlap by one submission).
     void SubmitAndWait(VkSemaphore wait, VkSemaphore signal) {
+        Drain();  // everything queued is recorded before the buffer ends
         if (VkQueryPool ts = slots_[slot_].ts) {
             vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts, 1);
             slots_[slot_].ts_written = true;
@@ -1985,6 +2160,7 @@ private:
     }
     // Waits for all submitted work (CPU readback of GPU results).
     void WaitGpuIdle() {
+        Drain();
         MsTimer wait_timer(wait_ms_);
         vkQueueWaitIdle(queue_);
         for (Slot& sl : slots_)
@@ -2008,8 +2184,10 @@ private:
         b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.image = image;
         b.subresourceRange = {aspect, 0, levels, 0, layers};
-        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
-                             0, nullptr, 1, &b);
+        Rec([b](VkCommandBuffer cb) {
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                                 nullptr, 1, &b);
+        });
     }
     void Transition(Image& img, VkImageLayout to) {
         if (img.clear_pending) FlushClear(img);
@@ -2032,10 +2210,13 @@ private:
         }
         VkImageSubresourceRange range{img.clear_aspect, SubLevel(img, img.clear_level), 1,
                                       img.type == VK_IMAGE_TYPE_3D ? 0 : SubLayer(img, img.clear_layer), 1};
-        if (img.clear_aspect & VK_IMAGE_ASPECT_COLOR_BIT)
-            vkCmdClearColorImage(cmd_, img.image, dst, &img.clear_value.color, 1, &range);
-        else
-            vkCmdClearDepthStencilImage(cmd_, img.image, dst, &img.clear_value.depthStencil, 1, &range);
+        Rec([range, image = img.image, v = img.clear_value,
+             color = (img.clear_aspect & VK_IMAGE_ASPECT_COLOR_BIT) != 0](VkCommandBuffer cb) {
+            if (color)
+                vkCmdClearColorImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v.color, 1, &range);
+            else
+                vkCmdClearDepthStencilImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v.depthStencil, 1, &range);
+        });
         clears_flushed_++;
     }
     uint64_t clears_deferred_ = 0, clears_flushed_ = 0, clears_in_pass_ = 0;
@@ -2059,7 +2240,9 @@ private:
         memcpy(v.uint32, color, sizeof(v.uint32));  // float/int/uint share the bits
         VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, SubLevel(img, level), 1,
                                       img.type == VK_IMAGE_TYPE_3D ? 0 : SubLayer(img, layer), 1};
-        vkCmdClearColorImage(cmd_, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &range);
+        Rec([v, range, image = img.image](VkCommandBuffer cb) {
+            vkCmdClearColorImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &range);
+        });
         img.written = true;
         img.cpu_source = false;
         if (kind == kClearFloat && clear_colors_logged_ < 16) {
@@ -2091,8 +2274,8 @@ private:
             v.depthStencil = {std::clamp(c.depth, 0.0f, 1.0f), uint32_t(c.stencil)};
             if (rendering_ && pass_depth_ == img) {
                 VkClearAttachment ca{a, 0, v};
-                VkClearRect rect{{{0, 0}, pass_extent_}, 0, 1};
-                vkCmdClearAttachments(cmd_, 1, &ca, 1, &rect);
+                const VkClearRect rect{{{0, 0}, pass_extent_}, 0, 1};
+                Rec([ca, rect](VkCommandBuffer cb) { vkCmdClearAttachments(cb, 1, &ca, 1, &rect); });
                 clears_in_pass_++;
             } else {
                 if (InOpenPass(img)) EndRendering();
@@ -2113,7 +2296,9 @@ private:
         VkClearDepthStencilValue v{std::clamp(c.depth, 0.0f, 1.0f), uint32_t(c.stencil)};
         const TexRef& ref = st_.rts[size_t(st_.num_rt)];
         VkImageSubresourceRange range{a, SubLevel(*img, ref.level), 1, SubLayer(*img, ref.layer), 1};
-        vkCmdClearDepthStencilImage(cmd_, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &range);
+        Rec([v, range, image = img->image](VkCommandBuffer cb) {
+            vkCmdClearDepthStencilImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &range);
+        });
         img->written = true;
         img->cpu_source = false;
     }
@@ -2142,8 +2327,10 @@ private:
                                (src.features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))
                                   ? VK_FILTER_LINEAR
                                   : VK_FILTER_NEAREST;
-            vkCmdBlitImage(cmd_, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.image,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, filter);
+            Rec([b, filter, si = src.image, di = dst.image](VkCommandBuffer cb) {
+                vkCmdBlitImage(cb, si, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, di, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
+                               filter);
+            });
         } else if (src.vk_format == dst.vk_format && sw == dw && sh == dh) {
             VkImageCopy c{};
             c.srcSubresource = {src.aspect, 0, 0, 1};
@@ -2151,8 +2338,9 @@ private:
             c.dstSubresource = {dst.aspect, 0, 0, 1};
             c.dstOffset = {dr.x, dr.y, 0};
             c.extent = {uint32_t(sw), uint32_t(sh), 1};
-            vkCmdCopyImage(cmd_, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.image,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+            Rec([c, si = src.image, di = dst.image](VkCommandBuffer cb) {
+                vkCmdCopyImage(cb, si, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, di, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+            });
         } else {
             LogOnce("copy", "cannot copy format %d -> %d yet", src.nvn_format, dst.nvn_format);
             return;
@@ -2235,7 +2423,9 @@ private:
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             region.imageExtent = {uint32_t(img->width), uint32_t(img->height), 1};
             Transition(*img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-            vkCmdCopyImageToBuffer(cmd_, img->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stream_, 1, &region);
+            Rec([region, buf = stream_, image = img->image](VkCommandBuffer cb) {
+                vkCmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &region);
+            });
             Readback rb{off, img->addr, row, rows, 1, row, row * rows};
             rb.texture = true;
             rb.tex = img->tex;
@@ -2245,8 +2435,10 @@ private:
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0,
-                             nullptr);
+        Rec([mb](VkCommandBuffer cb) {
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0,
+                                 nullptr);
+        });
     }
     static uint32_t VkTexelBytes(VkFormat f) {
         switch (f) {
@@ -2296,12 +2488,16 @@ private:
             region.imageSubresource.layerCount = uint32_t(d);
         }
         Transition(*img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        vkCmdCopyImageToBuffer(cmd_, img->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stream_, 1, &region);
+        Rec([region, buf = stream_, image = img->image](VkCommandBuffer cb) {
+            vkCmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &region);
+        });
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0,
-                             nullptr);
+        Rec([mb](VkCommandBuffer cb) {
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0,
+                                 nullptr);
+        });
         slots_[slot_].readbacks.push_back({off, c.dst_addr, row, rows, size_t(d), stride, image_stride});
         readbacks_recorded_++;
         static int logged = 0;
@@ -2363,7 +2559,9 @@ private:
         region.imageExtent = {uint32_t(w), uint32_t(h), uint32_t(img->type == VK_IMAGE_TYPE_3D ? d : 1)};
         if (img->type != VK_IMAGE_TYPE_3D) region.imageSubresource.baseArrayLayer = uint32_t(std::max(0, r.z));
         Transition(*img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        vkCmdCopyBufferToImage(cmd_, stream_, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        Rec([region, buf = stream_, image = img->image](VkCommandBuffer cb) {
+            vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        });
         img->written = true;
         img->uploaded = true;
         // The game may later rewrite this texture's memory with the CPU (the brightness lookup table is filled
@@ -2383,7 +2581,7 @@ private:
     // `line`: the caller (diagnostics: which code path breaks render passes, counted per 10 s).
     void EndRendering(int line = __builtin_LINE()) {
         if (rendering_) {
-            end_rendering_(cmd_);
+            Rec([this](VkCommandBuffer cb) { end_rendering_(cb); });
             rendering_ = false;
             pass_breaks_[line]++;
         }
@@ -2396,6 +2594,13 @@ private:
         if (idx >= st_.rts.size() || (i != 8 && int(i) >= st_.num_rt)) return {0, 0};
         return {st_.rts[idx].layer, st_.rts[idx].level};
     }
+    struct BeginPass {  // a vkCmdBeginRendering, as queued for the recorder
+        VkRenderingAttachmentInfo colors[8];
+        VkRenderingAttachmentInfo depth;
+        uint32_t count = 0;
+        bool has_depth = false, has_stencil = false;
+        VkRect2D area;
+    };
     bool EnsureRendering(const std::vector<Image*>& colors, Image* depth, VkExtent2D* extent) {
         std::vector<uint64_t>& key = scratch_rendering_key_;
         key.clear();
@@ -2427,8 +2632,9 @@ private:
         *extent = {w, h};
         if (rendering_ && key == rendering_key_) return true;
         EndRendering();
-        std::vector<VkRenderingAttachmentInfo> atts;
-        for (size_t ci = 0; ci < colors.size(); ci++) {
+        BeginPass bp;
+        bp.area = {{0, 0}, {w, h}};
+        for (size_t ci = 0; ci < colors.size() && ci < 8; ci++) {
             Image* c = colors[ci];
             VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
             if (c) {
@@ -2454,7 +2660,7 @@ private:
                 if (size_t(c->width) * size_t(c->height) <= kWritebackTexels && c->type == VK_IMAGE_TYPE_2D)
                     small_rts_.insert(c);
             }
-            atts.push_back(a);
+            bp.colors[bp.count++] = a;
         }
         VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         if (depth) {
@@ -2478,14 +2684,19 @@ private:
             depth->written = true;
             depth->cpu_source = false;
         }
-        VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-        ri.renderArea = {{0, 0}, {w, h}};
-        ri.layerCount = 1;
-        ri.colorAttachmentCount = uint32_t(atts.size());
-        ri.pColorAttachments = atts.data();
-        if (depth && HasDepth(depth->nvn_format)) ri.pDepthAttachment = &da;
-        if (depth && HasStencil(depth->nvn_format)) ri.pStencilAttachment = &da;
-        begin_rendering_(cmd_, &ri);
+        bp.depth = da;
+        bp.has_depth = depth && HasDepth(depth->nvn_format);
+        bp.has_stencil = depth && HasStencil(depth->nvn_format);
+        Rec([this, bp](VkCommandBuffer cb) {
+            VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            ri.renderArea = bp.area;
+            ri.layerCount = 1;
+            ri.colorAttachmentCount = bp.count;
+            ri.pColorAttachments = bp.colors;
+            if (bp.has_depth) ri.pDepthAttachment = &bp.depth;
+            if (bp.has_stencil) ri.pStencilAttachment = &bp.depth;
+            begin_rendering_(cb, &ri);
+        });
         pass_color_count_ = std::min<size_t>(colors.size(), 8);
         for (size_t i = 0; i < pass_color_count_; i++) {
             pass_colors_[i] = colors[i];
@@ -2664,7 +2875,9 @@ private:
             VkClearColorValue white;
             white.float32[0] = white.float32[1] = white.float32[2] = white.float32[3] = 1.0f;
             VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, uint32_t(img->layers)};
-            vkCmdClearColorImage(cmd_, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &white, 1, &range);
+            Rec([white, range, image = img->image](VkCommandBuffer cb) {
+                vkCmdClearColorImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &white, 1, &range);
+            });
             img->written = img->uploaded = true;
         }
         fallbacks_[key] = img;
@@ -2707,7 +2920,7 @@ private:
 
     // Draw-path profile: time spent per phase (reported with the 10 s stats).
     static constexpr const char* kPhaseNames[7] = {"setup", "targets", "textures", "uniforms", "vertices",
-                                                   "pipeline", "descriptors+record"};
+                                                   "pipeline", "pass+queue"};
     double phase_ms_[7] = {};
     std::chrono::steady_clock::time_point phase_t_;
     bool phase_timing_ = false;  // one draw in 8 is timed (7 clock reads per draw showed up in profiles)
@@ -3208,152 +3421,32 @@ private:
         }
 
         Phase(5);
-        // ---- descriptors -------------------------------------------------------------------------------------
-        VkDescriptorSet sets[2] = {};
-        VkDescriptorSetLayout layouts[2] = {vsl, fsl};
-        // Identical bindings (same layouts, buffers, offsets, images and samplers) reuse one pair of sets within
-        // the list; the pool is reset with the list.
-        Key64 dk;
-        dk.Add(vsl);
-        dk.Add(fsl);
-        uint32_t dyn_offsets[36];
-        uint32_t dyn_count = 0;
-        for (const UboWrite& u : ubo_writes) {
-            dk.Add(u.set);
-            dk.Add(u.binding);
-            dk.Add(u.info);  // for dynamic ones: buffer, 0, range (the same for every draw of the list)
-            if (u.dynamic && dyn_count < 36) dyn_offsets[dyn_count++] = u.dyn_offset;
-        }
-        for (const TexWrite& t : tex_writes) {
-            dk.Add(t.set);
-            dk.Add(t.binding);
-            dk.Add(t.info.sampler);
-            dk.Add(t.info.imageView);
-            dk.Add(t.info.imageLayout);
-        }
-        auto cached_sets = desc_cache_.find(dk.h);
-        bool reuse = cached_sets != desc_cache_.end();
-        if (!reuse) {
-            auto ps = persist_cache_.find(dk.h);
-            if (ps != persist_cache_.end()) {
-                desc_cache_[dk.h] = ps->second;
-                cached_sets = desc_cache_.find(dk.h);
-                reuse = true;
-                persist_hits_++;
-            }
-        }
-        if (reuse) {
-            sets[0] = cached_sets->second.first;
-            sets[1] = cached_sets->second.second;
-            desc_reused_++;
-        }
-        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        dai.descriptorPool = desc_pool_;
-        dai.descriptorSetCount = 2;
-        dai.pSetLayouts = layouts;
-        bool persistent = false;
-        // Only sets whose uniform buffers all take dynamic offsets can outlive the list: a fixed offset points
-        // at this list's data in the stream, which a later list overwrites.
-        bool persistable = true;
-        for (const UboWrite& u : ubo_writes) persistable &= u.dynamic;
-        if (!reuse && persist_pool_ && persistable) {
-            VkDescriptorSetAllocateInfo pai = dai;
-            pai.descriptorPool = persist_pool_;
-            if (vkAllocateDescriptorSets(device_, &pai, sets) == VK_SUCCESS) {
-                persistent = true;
-            } else if (persist_cache_.size() > 64) {
-                // Full: empty it once the GPU no longer uses any of it, then redo this draw.
-                Flush();
-                WaitGpuIdle();
-                ResetPersistentSets();
-                return Draw(p);
-            }
-        }
-        if (!reuse && !persistent && vkAllocateDescriptorSets(device_, &dai, sets) != VK_SUCCESS) {
-            // Pool exhausted: everything recorded so far must run first. Retry this draw from the top.
-            Flush();
-            if (vkAllocateDescriptorSets(device_, &dai, sets) != VK_SUCCESS) return Skip("descriptor allocation failed");
-            return Draw(p);
-        }
-        std::vector<VkWriteDescriptorSet> writes;
-        if (!reuse) for (const UboWrite& u : ubo_writes) {
-            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            w.dstSet = sets[u.set];
-            w.dstBinding = u.binding;
-            w.descriptorCount = 1;
-            w.descriptorType = u.dynamic ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            w.pBufferInfo = &u.info;
-            writes.push_back(w);
-        }
-        if (!reuse) for (const TexWrite& t : tex_writes) {
-            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            w.dstSet = sets[t.set];
-            w.dstBinding = t.binding;
-            w.descriptorCount = 1;
-            w.descriptorType = t.binding >= 96 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            w.pImageInfo = &t.info;
-            writes.push_back(w);
-        }
-        if (!reuse) {
-            if (!writes.empty()) vkUpdateDescriptorSets(device_, uint32_t(writes.size()), writes.data(), 0, nullptr);
-            desc_cache_[dk.h] = {sets[0], sets[1]};
-            if (persistent) persist_cache_[dk.h] = {sets[0], sets[1]};
-        }
-
-        // ---- record --------------------------------------------------------------------------------------------
+        // ---- queue the draw: the recorder thread builds its descriptor sets and records it --------------------
         if (!EnsureRendering(colors, depth, &extent)) return Skip("no render target");
-        if (pipeline != bound_pipeline_) {
-            vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-            bound_pipeline_ = pipeline;
-        }
-        if (layout != bound_layout_ || sets[0] != bound_sets_[0] || sets[1] != bound_sets_[1] ||
-            dyn_count != bound_dyn_count_ || memcmp(dyn_offsets, bound_dyn_, dyn_count * 4) != 0) {
-            vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 2, sets, dyn_count, dyn_offsets);
-            if (layout != bound_layout_) push_valid_ = false;
-            bound_layout_ = layout;
-            bound_sets_[0] = sets[0];
-            bound_sets_[1] = sets[1];
-            bound_dyn_count_ = dyn_count;
-            memcpy(bound_dyn_, dyn_offsets, dyn_count * 4);
-        }
-        for (const VkVertexInputBindingDescription& b : vin.bindings) {
-            auto& bound = bound_vb_[b.binding];
-            if (bound.first == vb_bufs[b.binding] && bound.second == vb_offsets[b.binding]) continue;
-            vkCmdBindVertexBuffers(cmd_, b.binding, 1, &vb_bufs[b.binding], &vb_offsets[b.binding]);
-            bound = {vb_bufs[b.binding], vb_offsets[b.binding]};
-        }
-        float push[4] = {st_.alpha_ref, 0, 0, 0};
-        if (!push_valid_ || memcmp(push, bound_push_, sizeof(push)) != 0) {
-            vkCmdPushConstants(cmd_, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
-            memcpy(bound_push_, push, sizeof(push));
-            push_valid_ = true;
-        }
-        SetDynamicState(extent, modes);
-        const bool query = capture_active_ && query_pool_ && query_pass_.size() < kMaxQueries;
-        if (query) vkCmdBeginQuery(cmd_, query_pool_, uint32_t(query_pass_.size()), 0);
-        if (fast) {
-            if (use_indices) {
-                if (bound_ib_.first != index_buf || bound_ib_.second != index_off || bound_ib_type_ != index_type) {
-                    vkCmdBindIndexBuffer(cmd_, index_buf, index_off, index_type);
-                    bound_ib_ = {index_buf, index_off};
-                    bound_ib_type_ = index_type;
-                }
-                vkCmdDrawIndexed(cmd_, index_count, uint32_t(p.instances), 0, vertex_offset, uint32_t(p.base_instance));
-            } else {
-                vkCmdDraw(cmd_, uint32_t(p.count), uint32_t(p.instances), first_vertex, uint32_t(p.base_instance));
-            }
-        } else if (use_indices) {
-            vkCmdBindIndexBuffer(cmd_, stream_, index_off, VK_INDEX_TYPE_UINT32);
-            bound_ib_ = {stream_, index_off};
-            bound_ib_type_ = VK_INDEX_TYPE_UINT32;
-            vkCmdDrawIndexed(cmd_, index_count, uint32_t(p.instances), 0, 0, uint32_t(p.base_instance));
-        } else {
-            vkCmdDraw(cmd_, uint32_t(p.count), uint32_t(p.instances), 0, uint32_t(p.base_instance));
-        }
-        if (query) {
-            vkCmdEndQuery(cmd_, query_pool_, uint32_t(query_pass_.size()));
+        DrawPacket d;
+        d.pipeline = pipeline;
+        d.layout = layout;
+        d.set_layouts[0] = vsl;
+        d.set_layouts[1] = fsl;
+        DynamicState(extent, modes, &d.dyn);
+        d.push[0] = st_.alpha_ref;
+        d.indexed = use_indices;
+        d.index_buf = fast ? index_buf : stream_;
+        d.index_off = index_off;
+        d.index_type = fast ? index_type : VK_INDEX_TYPE_UINT32;
+        d.count = use_indices ? index_count : uint32_t(p.count);
+        d.first_vertex = fast ? first_vertex : 0;
+        d.vertex_offset = fast ? vertex_offset : 0;
+        d.instances = uint32_t(p.instances);
+        d.base_instance = uint32_t(p.base_instance);
+        if (capture_active_ && query_pool_ && query_pass_.size() < kMaxQueries) {
+            d.query = uint32_t(query_pass_.size());
             query_pass_.push_back(capture_pass_);
         }
+        VbBind vb[16];
+        for (const VkVertexInputBindingDescription& b : vin.bindings)
+            vb[d.n_vb++] = {b.binding, vb_bufs[b.binding], vb_offsets[b.binding]};
+        QueueDraw(d, vb, tex_writes, ubo_writes);
         if (capture_active_) {
             char d[320];
             snprintf(d, sizeof(d),
@@ -3421,7 +3514,186 @@ private:
         if (drawn_ == 1) LOGI(kTag, "first draw recorded");
     }
 
-    void SetDynamicState(VkExtent2D extent, const DeviceModes& modes) {
+    // ---- the recorder's half of a draw ---------------------------------------------------------------------
+    struct VbBind {
+        uint32_t binding;
+        VkBuffer buf;
+        VkDeviceSize off;
+    };
+    // A draw as queued: the packet, then its vertex bindings, texture writes and uniform writes.
+    void QueueDraw(DrawPacket& d, const VbBind* vb, const std::vector<TexWrite>& tw, const std::vector<UboWrite>& uw) {
+        d.n_tex = uint16_t(tw.size());
+        d.n_ubo = uint16_t(uw.size());
+        if (!Async()) {
+            Drain();
+            RecordDraw(d, vb, tw.data(), uw.data());
+            return;
+        }
+        const size_t head = (sizeof(DrawPacket) + 15) & ~size_t(15);
+        const size_t vb_bytes = sizeof(VbBind) * d.n_vb, tw_bytes = sizeof(TexWrite) * d.n_tex;
+        uint8_t* p = RecAlloc(head + vb_bytes + tw_bytes + sizeof(UboWrite) * d.n_ubo, [](VulkanBackend* self, uint8_t* q) {
+            const DrawPacket& d = *reinterpret_cast<const DrawPacket*>(q);
+            const uint8_t* at = q + ((sizeof(DrawPacket) + 15) & ~size_t(15));
+            const auto* vb = reinterpret_cast<const VbBind*>(at);
+            const auto* tw = reinterpret_cast<const TexWrite*>(at + sizeof(VbBind) * d.n_vb);
+            const auto* uw = reinterpret_cast<const UboWrite*>(at + sizeof(VbBind) * d.n_vb + sizeof(TexWrite) * d.n_tex);
+            self->RecordDraw(d, vb, tw, uw);
+        }, nullptr);
+        memcpy(p, &d, sizeof(d));
+        memcpy(p + head, vb, vb_bytes);
+        memcpy(p + head + vb_bytes, tw.data(), tw_bytes);
+        memcpy(p + head + vb_bytes + tw_bytes, uw.data(), sizeof(UboWrite) * d.n_ubo);
+        MaybePublish();
+    }
+    // Transient descriptor sets; a full pool continues in another one (reset with the slot).
+    bool AllocTransientSets(const VkDescriptorSetLayout layouts[2], VkDescriptorSet sets[2]) {
+        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorSetCount = 2;
+        dai.pSetLayouts = layouts;
+        for (int tries = 0; tries < 3; tries++) {
+            dai.descriptorPool = desc_pool_;
+            if (vkAllocateDescriptorSets(device_, &dai, sets) == VK_SUCCESS) return true;
+            Slot& sl = slots_[slot_];
+            if (sl.extra_used >= sl.extra_pools.size()) {
+                const VkDescriptorPool np = MakeDescriptorPool();
+                if (!np) return false;
+                sl.extra_pools.push_back(np);
+                desc_pools_added_++;
+            }
+            desc_pool_ = sl.extra_pools[sl.extra_used++];
+        }
+        return false;
+    }
+    // Descriptor sets, bindings, dynamic state and the draw command (recorder thread, or inline).
+    void RecordDraw(const DrawPacket& d, const VbBind* vb, const TexWrite* tex_writes, const UboWrite* ubo_writes) {
+        const VkCommandBuffer cb = cmd_;
+        VkDescriptorSet sets[2] = {};
+        const VkDescriptorSetLayout* layouts = d.set_layouts;
+        // Identical bindings (same layouts, buffers, offsets, images and samplers) reuse one pair of sets within
+        // the list; the pool is reset with the list.
+        Key64 dk;
+        dk.Add(layouts[0]);
+        dk.Add(layouts[1]);
+        uint32_t dyn_offsets[36];
+        uint32_t dyn_count = 0;
+        bool persistable = true;
+        for (uint32_t i = 0; i < d.n_ubo; i++) {
+            const UboWrite& u = ubo_writes[i];
+            dk.Add(u.set);
+            dk.Add(u.binding);
+            dk.Add(u.info);  // for dynamic ones: buffer, 0, range (the same for every draw of the list)
+            if (u.dynamic && dyn_count < 36) dyn_offsets[dyn_count++] = u.dyn_offset;
+            // Only sets whose uniform buffers all take dynamic offsets can outlive the list: a fixed offset
+            // points at this list's data in the stream, which a later list overwrites.
+            persistable &= u.dynamic;
+        }
+        for (uint32_t i = 0; i < d.n_tex; i++) {
+            const TexWrite& t = tex_writes[i];
+            dk.Add(t.set);
+            dk.Add(t.binding);
+            dk.Add(t.info.sampler);
+            dk.Add(t.info.imageView);
+            dk.Add(t.info.imageLayout);
+        }
+        auto cached_sets = desc_cache_.find(dk.h);
+        bool reuse = cached_sets != desc_cache_.end();
+        if (!reuse) {
+            auto ps = persist_cache_.find(dk.h);
+            if (ps != persist_cache_.end()) {
+                cached_sets = desc_cache_.emplace(dk.h, ps->second).first;
+                reuse = true;
+                persist_hits_++;
+            }
+        }
+        if (reuse) {
+            sets[0] = cached_sets->second.first;
+            sets[1] = cached_sets->second.second;
+            desc_reused_++;
+        } else {
+            bool persistent = false;
+            if (persist_pool_ && persistable && !persist_full_) {
+                VkDescriptorSetAllocateInfo pai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+                pai.descriptorPool = persist_pool_;
+                pai.descriptorSetCount = 2;
+                pai.pSetLayouts = layouts;
+                if (vkAllocateDescriptorSets(device_, &pai, sets) == VK_SUCCESS)
+                    persistent = true;
+                else if (persist_cache_.size() > 64)
+                    persist_full_ = true;  // emptied by the render thread after this list (the GPU must be idle)
+            }
+            if (!persistent && !AllocTransientSets(layouts, sets)) {
+                skipped_desc_++;
+                return;
+            }
+            VkWriteDescriptorSet writes[192];  // at most 36 uniform + 144 texture/image bindings
+            uint32_t n = 0;
+            for (uint32_t i = 0; i < d.n_ubo && n < 192; i++) {
+                const UboWrite& u = ubo_writes[i];
+                VkWriteDescriptorSet& w = writes[n++];
+                w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                w.dstSet = sets[u.set];
+                w.dstBinding = u.binding;
+                w.descriptorCount = 1;
+                w.descriptorType = u.dynamic ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                w.pBufferInfo = &u.info;
+            }
+            for (uint32_t i = 0; i < d.n_tex && n < 192; i++) {
+                const TexWrite& t = tex_writes[i];
+                VkWriteDescriptorSet& w = writes[n++];
+                w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                w.dstSet = sets[t.set];
+                w.dstBinding = t.binding;
+                w.descriptorCount = 1;
+                w.descriptorType = t.binding >= 96 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                w.pImageInfo = &t.info;
+            }
+            if (n) vkUpdateDescriptorSets(device_, n, writes, 0, nullptr);
+            desc_cache_[dk.h] = {sets[0], sets[1]};
+            if (persistent) persist_cache_[dk.h] = {sets[0], sets[1]};
+        }
+
+        if (d.pipeline != bound_pipeline_) {
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
+            bound_pipeline_ = d.pipeline;
+        }
+        if (d.layout != bound_layout_ || sets[0] != bound_sets_[0] || sets[1] != bound_sets_[1] ||
+            dyn_count != bound_dyn_count_ || memcmp(dyn_offsets, bound_dyn_, dyn_count * 4) != 0) {
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.layout, 0, 2, sets, dyn_count, dyn_offsets);
+            if (d.layout != bound_layout_) push_valid_ = false;
+            bound_layout_ = d.layout;
+            bound_sets_[0] = sets[0];
+            bound_sets_[1] = sets[1];
+            bound_dyn_count_ = dyn_count;
+            memcpy(bound_dyn_, dyn_offsets, dyn_count * 4);
+        }
+        for (uint32_t i = 0; i < d.n_vb; i++) {
+            auto& bound = bound_vb_[vb[i].binding];
+            if (bound.first == vb[i].buf && bound.second == vb[i].off) continue;
+            vkCmdBindVertexBuffers(cb, vb[i].binding, 1, &vb[i].buf, &vb[i].off);
+            bound = {vb[i].buf, vb[i].off};
+        }
+        if (!push_valid_ || memcmp(d.push, bound_push_, sizeof(d.push)) != 0) {
+            vkCmdPushConstants(cb, d.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(d.push), d.push);
+            memcpy(bound_push_, d.push, sizeof(d.push));
+            push_valid_ = true;
+        }
+        ApplyDynamicState(d.dyn);
+        if (d.query != UINT32_MAX) vkCmdBeginQuery(cb, query_pool_, d.query, 0);
+        if (d.indexed) {
+            if (bound_ib_.first != d.index_buf || bound_ib_.second != d.index_off || bound_ib_type_ != d.index_type) {
+                vkCmdBindIndexBuffer(cb, d.index_buf, d.index_off, d.index_type);
+                bound_ib_ = {d.index_buf, d.index_off};
+                bound_ib_type_ = d.index_type;
+            }
+            vkCmdDrawIndexed(cb, d.count, d.instances, 0, d.vertex_offset, d.base_instance);
+        } else {
+            vkCmdDraw(cb, d.count, d.instances, d.first_vertex, d.base_instance);
+        }
+        if (d.query != UINT32_MAX) vkCmdEndQuery(cb, query_pool_, d.query);
+    }
+
+    // Viewport, scissor, blend constants and stencil values of the draw (render thread).
+    void DynamicState(VkExtent2D extent, const DeviceModes& modes, DynState* out) {
         // Y direction. In NVN's upper-left origin mode (Direct3D style), clip-space +Y is the top of the target
         // (row 0); in Vulkan it is the bottom. A negative-height viewport makes the two agree, so images land in
         // memory the way the game expects, and front faces keep their winding as seen on screen. Without it,
@@ -3466,23 +3738,27 @@ private:
             h = std::max(0, std::min(h, int(extent.height) - y));
             sc = {{x, y}, {uint32_t(w), uint32_t(h)}};
         }
-        // Dynamic state lasts for the whole command buffer: record only what changed since the last draw.
+        out->vp = vp;
+        out->sc = sc;
+        memcpy(out->blend, st_.blend_color, sizeof(out->blend));
         const uint32_t stencil[6] = {st_.stencil_ref[0], st_.stencil_ref[1], st_.stencil_write[0], st_.stencil_write[1],
                                      st_.stencil_compare[0], st_.stencil_compare[1]};
+        memcpy(out->stencil, stencil, sizeof(stencil));
+    }
+    // Dynamic state lasts for the whole command buffer: record only what changed since the last draw (recorder).
+    void ApplyDynamicState(const DynState& s) {
+        const VkCommandBuffer cb = cmd_;
         const bool all = !dyn_valid_;
-        if (all || memcmp(&vp, &dyn_.vp, sizeof(vp)) != 0) vkCmdSetViewport(cmd_, 0, 1, &vp);
-        if (all || memcmp(&sc, &dyn_.sc, sizeof(sc)) != 0) vkCmdSetScissor(cmd_, 0, 1, &sc);
-        if (all || memcmp(st_.blend_color, dyn_.blend, sizeof(dyn_.blend)) != 0) vkCmdSetBlendConstants(cmd_, st_.blend_color);
-        if (all || stencil[0] != dyn_.stencil[0]) vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_BIT, stencil[0]);
-        if (all || stencil[1] != dyn_.stencil[1]) vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_BACK_BIT, stencil[1]);
-        if (all || stencil[2] != dyn_.stencil[2]) vkCmdSetStencilWriteMask(cmd_, VK_STENCIL_FACE_FRONT_BIT, stencil[2]);
-        if (all || stencil[3] != dyn_.stencil[3]) vkCmdSetStencilWriteMask(cmd_, VK_STENCIL_FACE_BACK_BIT, stencil[3]);
-        if (all || stencil[4] != dyn_.stencil[4]) vkCmdSetStencilCompareMask(cmd_, VK_STENCIL_FACE_FRONT_BIT, stencil[4]);
-        if (all || stencil[5] != dyn_.stencil[5]) vkCmdSetStencilCompareMask(cmd_, VK_STENCIL_FACE_BACK_BIT, stencil[5]);
-        dyn_.vp = vp;
-        dyn_.sc = sc;
-        memcpy(dyn_.blend, st_.blend_color, sizeof(dyn_.blend));
-        memcpy(dyn_.stencil, stencil, sizeof(stencil));
+        if (all || memcmp(&s.vp, &dyn_.vp, sizeof(s.vp)) != 0) vkCmdSetViewport(cb, 0, 1, &s.vp);
+        if (all || memcmp(&s.sc, &dyn_.sc, sizeof(s.sc)) != 0) vkCmdSetScissor(cb, 0, 1, &s.sc);
+        if (all || memcmp(s.blend, dyn_.blend, sizeof(dyn_.blend)) != 0) vkCmdSetBlendConstants(cb, s.blend);
+        if (all || s.stencil[0] != dyn_.stencil[0]) vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_BIT, s.stencil[0]);
+        if (all || s.stencil[1] != dyn_.stencil[1]) vkCmdSetStencilReference(cb, VK_STENCIL_FACE_BACK_BIT, s.stencil[1]);
+        if (all || s.stencil[2] != dyn_.stencil[2]) vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_BIT, s.stencil[2]);
+        if (all || s.stencil[3] != dyn_.stencil[3]) vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_BACK_BIT, s.stencil[3]);
+        if (all || s.stencil[4] != dyn_.stencil[4]) vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_BIT, s.stencil[4]);
+        if (all || s.stencil[5] != dyn_.stencil[5]) vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_BACK_BIT, s.stencil[5]);
+        dyn_ = s;
         dyn_valid_ = true;
     }
 
@@ -4058,6 +4334,15 @@ private:
         auto now = std::chrono::steady_clock::now();
         if (now - last_report_ < std::chrono::seconds(10)) return;
         last_report_ = now;
+        Drain();  // the recorder's counters below
+        if (rec_started_) {
+            LOGI(kTag, "recorder thread: busy %.0f ms in the last 10 s; render thread waited %.0f ms for it; %llu batches; "
+                 "%llu extra descriptor pools; %llu draws without descriptor sets",
+                 rec_ns_.exchange(0) / 1e6, drain_ms_, (unsigned long long)rec_batches_,
+                 (unsigned long long)desc_pools_added_, (unsigned long long)skipped_desc_);
+            drain_ms_ = 0;
+            rec_batches_ = 0;
+        }
         std::string skipped;
         for (auto& [reason, n] : skipped_) skipped += " | " + std::to_string(n) + " " + reason;
         LOGI(kTag, "draws: %llu drawn, %zu pipelines, %d shaders, %d uploads, %d flushes%s", (unsigned long long)drawn_,
@@ -4295,6 +4580,8 @@ private:
         VkQueryPool ts = VK_NULL_HANDLE;  // GPU time of the submission (start, end)
         bool ts_written = false;
         VkDescriptorPool pool = VK_NULL_HANDLE;
+        std::vector<VkDescriptorPool> extra_pools;  // when `pool` fills up (recorder thread)
+        size_t extra_used = 0;
         VkBuffer stream = VK_NULL_HANDLE;
         VkDeviceMemory mem = VK_NULL_HANDLE;
         uint8_t* ptr = nullptr;
@@ -4328,6 +4615,24 @@ private:
     };
     DynState dyn_{};
     bool dyn_valid_ = false;
+    // One draw for the recorder: everything it needs, worked out on the render thread.
+    struct DrawPacket {
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkDescriptorSetLayout set_layouts[2] = {};
+        DynState dyn{};
+        float push[4] = {};
+        VkBuffer index_buf = VK_NULL_HANDLE;
+        VkDeviceSize index_off = 0;
+        VkIndexType index_type = VK_INDEX_TYPE_UINT32;
+        bool indexed = false;
+        uint32_t count = 0, instances = 0, first_vertex = 0, base_instance = 0;
+        int32_t vertex_offset = 0;
+        uint32_t query = UINT32_MAX;  // occlusion query index (captures)
+        uint16_t n_vb = 0, n_tex = 0, n_ubo = 0;
+    };
+    bool persist_full_ = false;      // set by the recorder; the render thread empties the pool
+    uint64_t skipped_desc_ = 0, desc_pools_added_ = 0;
     std::pair<VkBuffer, VkDeviceSize> bound_vb_[16] = {};
     std::pair<VkBuffer, VkDeviceSize> bound_ib_ = {};
     VkIndexType bound_ib_type_ = VK_INDEX_TYPE_MAX_ENUM;
