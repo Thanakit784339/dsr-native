@@ -21,6 +21,7 @@ struct TexRef {
     // From an NVNtextureView: the subresource used (render targets render into this level/layer).
     int level = 0, layer = 0;
     int view_levels = 0, view_layers = 0;  // 0: all from level/layer on
+    int view_format = 0;                    // NVN format the view reinterprets the texture as (0: its own)
 };
 
 struct CopyRegion {  // NVNcopyRegion

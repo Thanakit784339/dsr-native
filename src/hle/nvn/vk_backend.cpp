@@ -67,6 +67,27 @@ VkImageAspectFlags AspectOf(int f) {
 }
 
 // ---- format tables ------------------------------------------------------------------------------------------
+// The sRGB / linear counterpart of a format (NVN texture views can switch between them), or UNDEFINED.
+VkFormat SrgbTwin(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB;
+        case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+        case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB;
+        case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+        case VK_FORMAT_BC1_RGB_UNORM_BLOCK: return VK_FORMAT_BC1_RGB_SRGB_BLOCK;
+        case VK_FORMAT_BC1_RGB_SRGB_BLOCK: return VK_FORMAT_BC1_RGB_UNORM_BLOCK;
+        case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+        case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        case VK_FORMAT_BC2_UNORM_BLOCK: return VK_FORMAT_BC2_SRGB_BLOCK;
+        case VK_FORMAT_BC2_SRGB_BLOCK: return VK_FORMAT_BC2_UNORM_BLOCK;
+        case VK_FORMAT_BC3_UNORM_BLOCK: return VK_FORMAT_BC3_SRGB_BLOCK;
+        case VK_FORMAT_BC3_SRGB_BLOCK: return VK_FORMAT_BC3_UNORM_BLOCK;
+        case VK_FORMAT_BC7_UNORM_BLOCK: return VK_FORMAT_BC7_SRGB_BLOCK;
+        case VK_FORMAT_BC7_SRGB_BLOCK: return VK_FORMAT_BC7_UNORM_BLOCK;
+        default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
 // NVN format -> candidate Vulkan formats for images, best first.
 std::vector<VkFormat> ImageCandidates(int f) {
     switch (f) {
@@ -313,6 +334,7 @@ struct Image {
     std::unordered_map<uint64_t, VkImageView> fast_views;  // same views by hashed key
     uint64_t addr = 0;     // storage in game memory
     TextureState tex{};    // as the game described it (layout of that storage)
+    VkFormat twin = VK_FORMAT_UNDEFINED;  // sRGB/linear counterpart views may use (image is mutable-format)
 };
 
 struct Shader {
@@ -1477,6 +1499,17 @@ private:
         else if (feats & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)
             ci.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        // Formats with an sRGB/linear counterpart may be viewed as either (NVN texture views): mutable, with the
+        // pair listed so the driver can keep its compression.
+        VkFormat pair[2] = {vf, SrgbTwin(vf)};
+        VkImageFormatListCreateInfo fl{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+        if (pair[1] != VK_FORMAT_UNDEFINED) {
+            ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+            fl.viewFormatCount = 2;
+            fl.pViewFormats = pair;
+            ci.pNext = &fl;
+            img.twin = pair[1];
+        }
         if (vkCreateImage(device_, &ci, nullptr, &img.image) != VK_SUCCESS) {
             LogOnce("image", "vkCreateImage failed for %dx%d format %d", img.width, img.height, img.nvn_format);
             return nullptr;
@@ -1603,20 +1636,40 @@ private:
                  img.nvn_format, img.levels, img.layers, needed);
     }
 
+    // The Vulkan format a view with NVN format `view_nvn` uses on `img` (UNDEFINED: the image's own).
+    VkFormat ViewFormat(const Image& img, int view_nvn) {
+        if (!view_nvn || view_nvn == img.nvn_format) return VK_FORMAT_UNDEFINED;
+        for (VkFormat f : ImageCandidates(view_nvn)) {
+            if (f == img.vk_format) return VK_FORMAT_UNDEFINED;
+            if (f == img.twin && f != VK_FORMAT_UNDEFINED) {
+                if (view_formats_logged_.insert(uint64_t(img.nvn_format) << 32 | uint32_t(view_nvn)).second)
+                    LOGI(kTag, "texture of NVN format %d viewed as NVN format %d (Vulkan %d)", img.nvn_format, view_nvn,
+                         int(f));
+                return f;
+            }
+        }
+        if (view_formats_logged_.insert(uint64_t(img.nvn_format) << 32 | uint32_t(view_nvn) | 1ull << 63).second)
+            LOGW(kTag, "texture of NVN format %d viewed as NVN format %d: not supported, its own format is used",
+                 img.nvn_format, view_nvn);
+        return VK_FORMAT_UNDEFINED;
+    }
+    std::set<uint64_t> view_formats_logged_;
     VkImageView View(Image& img, VkImageViewType type, uint32_t base_layer, uint32_t layers, uint32_t levels,
-                     VkImageAspectFlags aspect, const uint8_t swz[4], uint32_t base_level = 0) {
+                     VkImageAspectFlags aspect, const uint8_t swz[4], uint32_t base_level = 0,
+                     VkFormat format = VK_FORMAT_UNDEFINED) {
         Key64 k;
-        const uint32_t parts[10] = {uint32_t(type), base_layer, layers, levels, aspect, swz[0], swz[1], swz[2], swz[3], base_level};
+        const uint32_t parts[11] = {uint32_t(type), base_layer, layers, levels, aspect, swz[0], swz[1], swz[2], swz[3],
+                                    base_level, uint32_t(format)};
         k.Add(parts, sizeof(parts));
         auto fast = img.fast_views.find(k.h);
         if (fast != img.fast_views.end()) return fast->second;
-        std::vector<uint32_t> key(parts, parts + 10);
+        std::vector<uint32_t> key(parts, parts + 11);
         auto it = img.views.find(key);
         if (it != img.views.end()) return it->second;
         VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         ci.image = img.image;
         ci.viewType = type;
-        ci.format = img.vk_format;
+        ci.format = format != VK_FORMAT_UNDEFINED ? format : img.vk_format;
         ci.components = {Swizzle(swz[0]), Swizzle(swz[1]), Swizzle(swz[2]), Swizzle(swz[3])};
         ci.subresourceRange = {aspect, base_level, levels, base_layer, layers};
         VkImageView v = VK_NULL_HANDLE;
@@ -1633,10 +1686,11 @@ private:
     static uint32_t SubLayer(const Image& img, int layer) {
         return uint32_t(std::clamp(layer, 0, (img.type == VK_IMAGE_TYPE_3D ? img.depth : img.layers) - 1));
     }
-    VkImageView AttachmentView(Image& img, int layer = 0, int level = 0) {
+    VkImageView AttachmentView(Image& img, int layer = 0, int level = 0, int view_nvn = 0) {
         static const uint8_t kIdentity[4] = {2, 3, 4, 5};
         return View(img, img.type == VK_IMAGE_TYPE_1D ? VK_IMAGE_VIEW_TYPE_1D : VK_IMAGE_VIEW_TYPE_2D,
-                    img.type == VK_IMAGE_TYPE_3D ? 0 : SubLayer(img, layer), 1, 1, img.aspect, kIdentity, SubLevel(img, level));
+                    img.type == VK_IMAGE_TYPE_3D ? 0 : SubLayer(img, layer), 1, 1, img.aspect, kIdentity, SubLevel(img, level),
+                    ViewFormat(img, view_nvn));
     }
     // View matching what the shader declared for the slot.
     VkImageView SampledView(Image& img, shader::TexDim dim, bool array, const uint8_t swz[4], const TexRef* ref = nullptr) {
@@ -1667,7 +1721,8 @@ private:
         if (!type_ok) return VK_NULL_HANDLE;
         VkImageAspectFlags aspect = img.aspect;
         if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
-        return View(img, type, base_layer, layers, levels, aspect, swz, base_level);
+        return View(img, type, base_layer, layers, levels, aspect, swz, base_level,
+                    ref ? ViewFormat(img, ref->view_format) : VK_FORMAT_UNDEFINED);
     }
 
     // Formats the GPU cannot filter linearly (32-bit float on Adreno, unlike the Switch): sampling them with a
@@ -2185,6 +2240,7 @@ private:
         for (size_t i = 0; i < colors.size(); i++) {
             key.push_back(reinterpret_cast<uint64_t>(colors[i] ? colors[i]->image : VK_NULL_HANDLE));
             key.push_back(uint64_t(RtSub(i).first) << 32 | uint32_t(RtSub(i).second));
+            key.push_back(i < st_.rts.size() ? uint64_t(uint32_t(st_.rts[i].view_format)) : 0);
         }
         key.push_back(reinterpret_cast<uint64_t>(depth ? depth->image : VK_NULL_HANDLE));
         key.push_back(uint64_t(RtSub(8).first) << 32 | uint32_t(RtSub(8).second));
@@ -2215,7 +2271,8 @@ private:
             VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
             if (c) {
                 Transition(*c, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-                a.imageView = AttachmentView(*c, RtSub(ci).first, RtSub(ci).second);
+                a.imageView = AttachmentView(*c, RtSub(ci).first, RtSub(ci).second,
+                                             ci < st_.rts.size() ? st_.rts[ci].view_format : 0);
                 a.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                 a.loadOp = c->written ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
                 a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -2898,7 +2955,15 @@ private:
         VkExtent2D extent;
         // Formats the pipeline renders to (dynamic rendering).
         std::vector<VkFormat> color_formats;
-        for (Image* c : colors) color_formats.push_back(c ? c->vk_format : VK_FORMAT_UNDEFINED);
+        for (size_t i = 0; i < colors.size(); i++) {
+            Image* c = colors[i];
+            VkFormat f = c ? c->vk_format : VK_FORMAT_UNDEFINED;
+            if (c && i < st_.rts.size() && st_.rts[i].view_format) {  // rendered through a view of another format
+                const VkFormat vf = ViewFormat(*c, st_.rts[i].view_format);
+                if (vf != VK_FORMAT_UNDEFINED) f = vf;
+            }
+            color_formats.push_back(f);
+        }
         VkFormat depth_format = depth ? depth->vk_format : VK_FORMAT_UNDEFINED;
         VkDescriptorSetLayout vsl = SetLayout(VK_SHADER_STAGE_VERTEX_BIT, vs->info);
         VkDescriptorSetLayout fsl = SetLayout(VK_SHADER_STAGE_FRAGMENT_BIT, fs->info);

@@ -111,6 +111,7 @@ struct TextureViewObj {
     int base_level = 0, num_levels = 0;  // 0 levels: all (view leaves levels alone)
     int base_layer = 0, num_layers = 0;  // 0 layers: all
     int target = -1;                      // -1: the texture's own
+    int format = 0;                       // 0: the texture's own (e.g. an sRGB view of an RGBA8 texture)
     bool has_levels = false, has_layers = false;
 };
 struct VertexStreamObj {

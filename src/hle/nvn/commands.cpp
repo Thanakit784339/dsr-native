@@ -170,6 +170,7 @@ static TexRef TargetRef(const void* texture, const void* view) {
         const TextureViewObj v = GetTextureView(view);
         if (v.has_levels) r.level = v.base_level;
         if (v.has_layers) r.layer = v.base_layer;
+        if (v.format && v.format != r.tex.format) r.view_format = v.format;  // e.g. rendering through an sRGB view
     }
     return r;
 }

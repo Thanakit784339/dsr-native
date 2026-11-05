@@ -150,6 +150,11 @@ void ViewSetLayers(void* v, int base, int num) {
     o.has_layers = true;
 }
 void ViewSetTarget(void* v, int target) { g_views.Get(v).target = target; }
+void ViewSetFormat(void* v, int format) {
+    g_views.Get(v).format = format;
+    Seen("texture view format", format);
+}
+int ViewGetFormat(const void* v) { return g_views.Copy(v).format; }
 void StreamSetDefaults(void* s) { g_stream.Reset(s); }
 void StreamSetStride(void* s, int64_t stride) { g_stream.Get(s).stride = int(stride); }
 void StreamSetDivisor(void* s, int d) { g_stream.Get(s).divisor = d; }
@@ -201,13 +206,15 @@ void TexturePoolRegisterTexture(void* pool, int id, const void* texture, const v
             r.layer = v.base_layer;
             r.view_layers = v.num_layers;
         }
+        if (v.format && v.format != r.tex.format) r.view_format = v.format;
     }
     bool changed;
     {
         std::lock_guard<std::mutex> lk(g_pool_mutex);
         auto it = g_texture_ids.find(id);
         changed = it == g_texture_ids.end() || it->second.addr != r.addr || it->second.tex.format != r.tex.format ||
-                  it->second.tex.width != r.tex.width || it->second.tex.height != r.tex.height;
+                  it->second.tex.width != r.tex.width || it->second.tex.height != r.tex.height ||
+                  it->second.view_format != r.view_format;
         g_texture_ids[id] = r;
     }
     // A texture (re)registered under this id: its memory may hold a newly streamed-in texture (the game reuses
@@ -268,6 +275,7 @@ const Proc kProcs[] = {
     P("nvnVertexAttribStateGetStreamIndex", AttribGetStream),
     P("nvnTextureViewSetDefaults", ViewSetDefaults), P("nvnTextureViewSetLevels", ViewSetLevels),
     P("nvnTextureViewSetLayers", ViewSetLayers), P("nvnTextureViewSetTarget", ViewSetTarget),
+    P("nvnTextureViewSetFormat", ViewSetFormat), P("nvnTextureViewGetFormat", ViewGetFormat),
     P("nvnVertexStreamStateSetDefaults", StreamSetDefaults), P("nvnVertexStreamStateSetStride", StreamSetStride),
     P("nvnVertexStreamStateSetDivisor", StreamSetDivisor), P("nvnVertexStreamStateGetStride", StreamGetStride),
     P("nvnVertexStreamStateGetDivisor", StreamGetDivisor),
