@@ -10,9 +10,11 @@
 // record time, so later Finalize/re-Initialize of the NVN object does not affect recorded work.
 
 #if defined(__linux__)
+#include <pthread.h>
 #include <sched.h>
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <string>
@@ -49,6 +51,7 @@ constexpr size_t kControlBytesPerRecording = 64;
 struct Recorder {
     bool recording = false;
     CmdList cmds;
+    size_t last_size = 0;  // commands in this buffer's previous recording (storage reserved up front)
     size_t command_used = 0, control_used = 0;
 };
 Table<Recorder> g_recorders;
@@ -86,8 +89,47 @@ CmdList TakePooledList() {
 }
 void ReturnPooledList(CmdList&& v) {
     v.clear();
+    if (v.capacity() < 256) return;  // small storage is not worth keeping (recordings reserve what they need)
     std::lock_guard<std::mutex> lk(g_list_pool_mutex);
     if (g_list_pool.size() < 32) g_list_pool.push_back(std::move(v));
+}
+
+// Lists are destroyed on a background thread: whichever thread drops the last reference (usually the game's
+// submit thread) only queues it. Destroying thousands of commands a frame was over half of that thread's time.
+std::mutex g_reap_mutex;
+std::condition_variable g_reap_cv;
+std::vector<CmdList*> g_reap_queue;
+void ReaperLoop() {
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), "dsr-reaper");
+#endif
+    std::vector<CmdList*> batch;
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(g_reap_mutex);
+            g_reap_cv.wait(lk, [] { return !g_reap_queue.empty(); });
+            batch.swap(g_reap_queue);
+        }
+        for (CmdList* l : batch) {
+            ReturnPooledList(std::move(*l));
+            delete l;
+        }
+        batch.clear();
+    }
+}
+void ReapList(const CmdList* l) {
+#if defined(__ANDROID__)
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(ReaperLoop).detach(); });
+    {
+        std::lock_guard<std::mutex> lk(g_reap_mutex);
+        g_reap_queue.push_back(const_cast<CmdList*>(l));
+    }
+    g_reap_cv.notify_one();
+#else
+    ReturnPooledList(std::move(*const_cast<CmdList*>(l)));  // tests: synchronously
+    delete l;
+#endif
 }
 
 // The recorder of the command buffer last appended to by this thread (one lookup per command was a locked
@@ -114,6 +156,7 @@ void BeginRecording(void* cb) {
     r.recording = true;
     r.cmds.clear();
     if (r.cmds.capacity() == 0) r.cmds = TakePooledList();
+    if (r.cmds.capacity() < r.last_size) r.cmds.reserve(r.last_size + r.last_size / 4);  // no growth copies
     r.control_used += kControlBytesPerRecording;
     g_begin_count++;
 }
@@ -124,6 +167,7 @@ size_t GetCommandMemoryUsed(const void* cb) { return RecorderOf(const_cast<void*
 size_t GetControlMemoryUsed(const void* cb) { return RecorderOf(const_cast<void*>(cb)).control_used; }
 uint64_t EndRecording(void* cb) {
     Recorder& r = RecorderOf(cb);
+    r.last_size = r.cmds.size();
     // A list much smaller than its (recycled) storage gets storage of its own size: the game keeps hundreds of
     // lists alive, and each holding the capacity of the biggest list ever recorded added up to gigabytes.
     if (r.cmds.capacity() > 2 * r.cmds.size() + 256) {
@@ -133,10 +177,7 @@ uint64_t EndRecording(void* cb) {
         ReturnPooledList(std::move(r.cmds));
         r.cmds = std::move(exact);
     }
-    std::shared_ptr<const CmdList> list(new CmdList(std::move(r.cmds)), [](const CmdList* l) {
-        ReturnPooledList(std::move(*const_cast<CmdList*>(l)));
-        delete l;
-    });
+    std::shared_ptr<const CmdList> list(new CmdList(std::move(r.cmds)), ReapList);
     r.cmds = CmdList{};
     r.recording = false;
     g_end_count++;
@@ -232,8 +273,10 @@ void ClearTextureAny(void* cb, const void* tex, const void* /*view*/, const Copy
                      int mask, uint8_t kind) {
     Cmd c;
     c.type = CmdType::ClearTexture;
-    c.dst = MakeTexRef(tex);
-    if (region) c.dst_region = *region;
+    auto ci = std::make_shared<CopyInfo>();
+    ci->dst = MakeTexRef(tex);
+    if (region) ci->dst_region = *region;
+    c.copy = std::move(ci);
     c.mask = mask;
     c.kind = kind;
     if (color) memcpy(c.color, color, sizeof(c.color));
@@ -253,52 +296,63 @@ void CopyTextureToTexture(void* cb, const void* src, const void* /*src_view*/, c
                           const void* dst, const void* /*dst_view*/, const CopyRegion* dst_region, int flags) {
     Cmd c;
     c.type = CmdType::CopyTexture;
-    c.src = MakeTexRef(src);
-    c.dst = MakeTexRef(dst);
-    if (src_region) c.src_region = *src_region;
-    if (dst_region) c.dst_region = *dst_region;
+    auto ci = std::make_shared<CopyInfo>();
+    ci->src = MakeTexRef(src);
+    ci->dst = MakeTexRef(dst);
+    if (src_region) ci->src_region = *src_region;
+    if (dst_region) ci->dst_region = *dst_region;
+    c.copy = std::move(ci);
     c.flags = flags;
     Append(cb, std::move(c));
 }
 
 // ---- binds ----------------------------------------------------------------------------------------------
+void Append(void* cb, Cmd&& c);
+// A bind: payload items inline when small (no allocation).
 template <typename T>
-std::shared_ptr<const void> Obj(T v) {
-    return std::make_shared<const T>(std::move(v));
-}
-void Bind(void* cb, CmdType t, std::shared_ptr<const void> obj, int stage = 0, int index = 0) {
+void BindItems(void* cb, CmdType t, const T* items, size_t n, int stage = 0, int index = 0) {
     Cmd c;
     c.type = t;
-    c.obj = std::move(obj);
+    SetItems(c, items, n);
     c.stage = stage;
     c.index = index;
     Append(cb, std::move(c));
 }
+template <typename T>
+void BindOne(void* cb, CmdType t, const T& v, int stage = 0, int index = 0) {
+    BindItems(cb, t, &v, 1, stage, index);
+}
 void BindProgram(void* cb, const void* program, int stage_bits) {
-    Bind(cb, CmdType::BindProgram, GetProgramCode(program), 0, stage_bits);
+    Cmd c;
+    c.type = CmdType::BindProgram;
+    c.obj = GetProgramCode(program);
+    c.index = stage_bits;
+    Append(cb, std::move(c));
 }
 // NVNvertexAttribState is 4 bytes and NVNvertexStreamState 8 bytes in game memory.
 void BindVertexAttribState(void* cb, int n, const uint8_t* states) {
-    std::vector<VertexAttribObj> v;
-    for (int i = 0; i < n && states; i++) v.push_back(GetVertexAttrib(states + 4 * i));
-    Bind(cb, CmdType::BindVertexAttribs, Obj(std::move(v)));
+    VertexAttribObj v[32];
+    n = states ? std::clamp(n, 0, 32) : 0;
+    for (int i = 0; i < n; i++) v[i] = GetVertexAttrib(states + 4 * i);
+    BindItems(cb, CmdType::BindVertexAttribs, v, size_t(n));
 }
 void BindVertexStreamState(void* cb, int n, const uint8_t* states) {
-    std::vector<VertexStreamObj> v;
-    for (int i = 0; i < n && states; i++) v.push_back(GetVertexStream(states + 8 * i));
-    Bind(cb, CmdType::BindVertexStreams, Obj(std::move(v)));
+    VertexStreamObj v[32];
+    n = states ? std::clamp(n, 0, 32) : 0;
+    for (int i = 0; i < n; i++) v[i] = GetVertexStream(states + 8 * i);
+    BindItems(cb, CmdType::BindVertexStreams, v, size_t(n));
 }
 void BindVertexBuffer(void* cb, int index, uint64_t addr, uint64_t size) {
-    Bind(cb, CmdType::BindVertexBuffers, Obj(std::vector<BufferRange>{{addr, size}}), 0, index);
+    BindOne(cb, CmdType::BindVertexBuffers, BufferRange{addr, size}, 0, index);
 }
 void BindVertexBuffers(void* cb, int first, int n, const BufferRange* ranges) {
-    Bind(cb, CmdType::BindVertexBuffers, Obj(std::vector<BufferRange>(ranges, ranges + std::max(0, n))), 0, first);
+    BindItems(cb, CmdType::BindVertexBuffers, ranges, ranges ? size_t(std::max(0, n)) : 0, 0, first);
 }
 void BindUniformBuffer(void* cb, int stage, int index, uint64_t addr, uint64_t size) {
-    Bind(cb, CmdType::BindUniformBuffers, Obj(std::vector<BufferRange>{{addr, size}}), stage, index);
+    BindOne(cb, CmdType::BindUniformBuffers, BufferRange{addr, size}, stage, index);
 }
 void BindUniformBuffers(void* cb, int stage, int first, int n, const BufferRange* ranges) {
-    Bind(cb, CmdType::BindUniformBuffers, Obj(std::vector<BufferRange>(ranges, ranges + std::max(0, n))), stage, first);
+    BindItems(cb, CmdType::BindUniformBuffers, ranges, ranges ? size_t(std::max(0, n)) : 0, stage, first);
 }
 // NVN texture handles: texture ID in the low 20 bits, sampler ID above (see DeviceGetTextureHandle).
 BoundTexture ResolveHandle(uint64_t handle) {
@@ -309,28 +363,28 @@ BoundTexture ResolveHandle(uint64_t handle) {
     return b;
 }
 void BindTexture(void* cb, int stage, int index, uint64_t handle) {
-    Bind(cb, CmdType::BindTextures, Obj(std::vector<BoundTexture>{ResolveHandle(handle)}), stage, index);
+    BindOne(cb, CmdType::BindTextures, ResolveHandle(handle), stage, index);
 }
 void BindTextures(void* cb, int stage, int first, int n, const uint64_t* handles) {
     std::vector<BoundTexture> v;
     for (int i = 0; i < n && handles; i++) v.push_back(ResolveHandle(handles[i]));
-    Bind(cb, CmdType::BindTextures, Obj(std::move(v)), stage, first);
+    BindItems(cb, CmdType::BindTextures, v.data(), v.size(), stage, first);
 }
 // Image handles (nvnDeviceGetImageHandle) are the pool ids.
 void BindImage(void* cb, int stage, int index, uint64_t handle) {
-    Bind(cb, CmdType::BindImages, Obj(std::vector<TexRef>{ImageById(int(handle & 0xFFFFF))}), stage, index);
+    BindOne(cb, CmdType::BindImages, ImageById(int(handle & 0xFFFFF)), stage, index);
 }
 void BindImages(void* cb, int stage, int first, int n, const uint64_t* handles) {
     std::vector<TexRef> v;
     for (int i = 0; i < n && handles; i++) v.push_back(ImageById(int(handles[i] & 0xFFFFF)));
-    Bind(cb, CmdType::BindImages, Obj(std::move(v)), stage, first);
+    BindItems(cb, CmdType::BindImages, v.data(), v.size(), stage, first);
 }
-void BindBlendState(void* cb, const void* s) { Bind(cb, CmdType::BindBlend, Obj(GetBlendState(s))); }
-void BindColorState(void* cb, const void* s) { Bind(cb, CmdType::BindColor, Obj(GetColorState(s))); }
-void BindChannelMaskState(void* cb, const void* s) { Bind(cb, CmdType::BindChannelMask, Obj(GetChannelMaskState(s))); }
-void BindDepthStencilState(void* cb, const void* s) { Bind(cb, CmdType::BindDepthStencil, Obj(GetDepthStencilState(s))); }
-void BindPolygonState(void* cb, const void* s) { Bind(cb, CmdType::BindPolygon, Obj(GetPolygonState(s))); }
-void BindMultisampleState(void* cb, const void* s) { Bind(cb, CmdType::BindMultisample, Obj(GetMultisampleState(s))); }
+void BindBlendState(void* cb, const void* s) { BindOne(cb, CmdType::BindBlend, GetBlendState(s)); }
+void BindColorState(void* cb, const void* s) { BindOne(cb, CmdType::BindColor, GetColorState(s)); }
+void BindChannelMaskState(void* cb, const void* s) { BindOne(cb, CmdType::BindChannelMask, GetChannelMaskState(s)); }
+void BindDepthStencilState(void* cb, const void* s) { BindOne(cb, CmdType::BindDepthStencil, GetDepthStencilState(s)); }
+void BindPolygonState(void* cb, const void* s) { BindOne(cb, CmdType::BindPolygon, GetPolygonState(s)); }
+void BindMultisampleState(void* cb, const void* s) { BindOne(cb, CmdType::BindMultisample, GetMultisampleState(s)); }
 
 // ---- dynamic state ------------------------------------------------------------------------------------
 void SetF(void* cb, CmdType t, float a, float b = 0, float c = 0, float d = 0) {
@@ -423,7 +477,7 @@ void UpdateUniformBuffer(void* cb, uint64_t buffer, size_t buffer_size, int64_t 
     c.type = CmdType::UpdateUniform;
     c.dst_addr = buffer + uint64_t(offset);
     const uint8_t* p = static_cast<const uint8_t*>(data);
-    c.obj = Obj(std::vector<uint8_t>(p, p + size));
+    SetItems(c, p, size);
     Append(cb, std::move(c));
 }
 std::atomic<int64_t> g_copy_row_stride{0}, g_copy_image_stride{0};
@@ -436,8 +490,10 @@ void CopyBufferToTexture(void* cb, uint64_t src, const void* dst, const void* /*
     Cmd c;
     c.type = CmdType::CopyBufferToTexture;
     c.src_addr = src;
-    c.dst = MakeTexRef(dst);
-    if (region) c.dst_region = *region;
+    auto ci = std::make_shared<CopyInfo>();
+    ci->dst = MakeTexRef(dst);
+    if (region) ci->dst_region = *region;
+    c.copy = std::move(ci);
     c.flags = flags;
     c.f[0] = float(g_copy_row_stride.load());
     c.f[1] = float(g_copy_image_stride.load());
@@ -450,8 +506,10 @@ void CopyTextureToBuffer(void* cb, const void* src, const void* /*view*/, const 
                          int flags) {
     Cmd c;
     c.type = CmdType::CopyTextureToBuffer;
-    c.src = MakeTexRef(src);
-    if (region) c.src_region = *region;
+    auto ci = std::make_shared<CopyInfo>();
+    ci->src = MakeTexRef(src);
+    if (region) ci->src_region = *region;
+    c.copy = std::move(ci);
     c.dst_addr = dst;
     c.flags = flags;
     c.f[0] = float(g_copy_row_stride.load());

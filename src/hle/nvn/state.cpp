@@ -5,7 +5,10 @@
 #include "hle/nvn/state.h"
 
 #include <atomic>
+#include <cstring>
+#include <mutex>
 #include <set>
+#include <unordered_set>
 #include <unordered_map>
 
 #include "common/log.h"
@@ -23,8 +26,6 @@ Table<ChannelMaskStateObj> g_channel;
 Table<DepthStencilStateObj> g_depth;
 Table<PolygonStateObj> g_polygon;
 Table<MultisampleStateObj> g_ms;
-Table<VertexAttribObj> g_attrib;
-Table<VertexStreamObj> g_stream;
 Table<SamplerObj> g_sampler_builders, g_samplers;
 
 std::mutex g_pool_mutex;
@@ -36,6 +37,12 @@ std::atomic<int> g_depth_mode{0}, g_origin_mode{0};
 
 // Logs each distinct (what, value) once.
 void Seen(const char* what, int a, int b = 0, int c = 0, int d = 0) {
+    // Called by setters on every use: repeats are filtered per thread first (no lock, no strings).
+    thread_local std::unordered_set<uint64_t> recent;
+    const uint64_t key = ((reinterpret_cast<uintptr_t>(what) * 0x9E3779B97F4A7C15ull ^ uint64_t(uint32_t(a))) *
+                              0x100000001B3ull ^
+                          uint64_t(uint32_t(b)) << 32 ^ uint64_t(uint32_t(c)) << 16 ^ uint64_t(uint32_t(d)));
+    if (recent.size() > 4096 || !recent.insert(key).second) return;
     static std::mutex m;
     static std::set<std::tuple<std::string, int, int, int, int>> seen;
     std::lock_guard<std::mutex> lk(m);
@@ -126,16 +133,26 @@ void MsSetDefaults(void* s) { g_ms.Reset(s); }
 void MsSetEnable(void* s, bool e) { g_ms.Get(s).enable = e; }
 void MsSetSamples(void* s, int n) { g_ms.Get(s).samples = n; }
 // ---- vertex layout -------------------------------------------------------------------------------------
-void AttribSetDefaults(void* s) { g_attrib.Reset(s); }
+// NVNvertexAttribState (4 bytes) and NVNvertexStreamState (8 bytes) keep their values in game memory, as the
+// real driver does: arrays of them are bound per draw, and a locked table lookup per element (contended by the
+// game's three recording threads) was ~15% of those threads' time.
+// Attribute word: bits 0-9 format, 10-15 stream, 16-31 relative offset.
+uint32_t LoadWord(const void* s) {
+    uint32_t w;
+    memcpy(&w, s, 4);
+    return w;
+}
+void StoreWord(void* s, uint32_t w) { memcpy(s, &w, 4); }
+void AttribSetDefaults(void* s) { StoreWord(s, 0); }
 void AttribSetFormat(void* s, int format, int64_t offset) {
-    auto& a = g_attrib.Get(s);
-    a.format = format;
-    a.offset = int(offset);
+    if (format < 0 || format > 0x3FF || offset < 0 || offset > 0xFFFF)
+        LOGW(kTag, "vertex attribute format %d / offset %lld out of the packed range", format, (long long)offset);
+    StoreWord(s, (LoadWord(s) & 0xFC00u) | (uint32_t(format) & 0x3FFu) | (uint32_t(offset & 0xFFFF) << 16));
     Seen("vertex format", format);
 }
-void AttribSetStream(void* s, int stream) { g_attrib.Get(s).stream = stream; }
-int AttribGetFormat(const void* s) { return g_attrib.Copy(s).format; }
-int AttribGetStream(const void* s) { return g_attrib.Copy(s).stream; }
+void AttribSetStream(void* s, int stream) { StoreWord(s, (LoadWord(s) & ~0xFC00u) | ((uint32_t(stream) & 63u) << 10)); }
+int AttribGetFormat(const void* s) { return int(LoadWord(s) & 0x3FFu); }
+int AttribGetStream(const void* s) { return int(LoadWord(s) >> 10 & 63u); }
 void ViewSetDefaults(void* v) { g_views.Reset(v); }
 void ViewSetLevels(void* v, int base, int num) {
     auto& o = g_views.Get(v);
@@ -155,11 +172,12 @@ void ViewSetFormat(void* v, int format) {
     Seen("texture view format", format);
 }
 int ViewGetFormat(const void* v) { return g_views.Copy(v).format; }
-void StreamSetDefaults(void* s) { g_stream.Reset(s); }
-void StreamSetStride(void* s, int64_t stride) { g_stream.Get(s).stride = int(stride); }
-void StreamSetDivisor(void* s, int d) { g_stream.Get(s).divisor = d; }
-int64_t StreamGetStride(const void* s) { return g_stream.Copy(s).stride; }
-int StreamGetDivisor(const void* s) { return g_stream.Copy(s).divisor; }
+// Stream state: stride, then divisor (two 32-bit words).
+void StreamSetDefaults(void* s) { memset(s, 0, 8); }
+void StreamSetStride(void* s, int64_t stride) { StoreWord(s, uint32_t(int32_t(stride))); }
+void StreamSetDivisor(void* s, int d) { StoreWord(static_cast<uint8_t*>(s) + 4, uint32_t(d)); }
+int64_t StreamGetStride(const void* s) { return int32_t(LoadWord(s)); }
+int StreamGetDivisor(const void* s) { return int32_t(LoadWord(static_cast<const uint8_t*>(s) + 4)); }
 // ---- samplers ------------------------------------------------------------------------------------------
 void SamplerBuilderSetDefaults(void* b) { g_sampler_builders.Reset(b); }
 void SamplerBuilderSetMinMag(void* b, int min, int mag) {
@@ -306,8 +324,13 @@ TextureViewObj GetTextureView(const void* o) { return g_views.Copy(o); }
 DepthStencilStateObj GetDepthStencilState(const void* o) { return g_depth.Copy(o); }
 PolygonStateObj GetPolygonState(const void* o) { return g_polygon.Copy(o); }
 MultisampleStateObj GetMultisampleState(const void* o) { return g_ms.Copy(o); }
-VertexAttribObj GetVertexAttrib(const void* o) { return g_attrib.Copy(o); }
-VertexStreamObj GetVertexStream(const void* o) { return g_stream.Copy(o); }
+VertexAttribObj GetVertexAttrib(const void* o) {
+    const uint32_t w = LoadWord(o);
+    return {int(w & 0x3FFu), int(w >> 16), int(w >> 10 & 63u)};
+}
+VertexStreamObj GetVertexStream(const void* o) {
+    return {int(int32_t(LoadWord(o))), int(int32_t(LoadWord(static_cast<const uint8_t*>(o) + 4)))};
+}
 
 TexRef TextureById(int id) {
     std::lock_guard<std::mutex> lk(g_pool_mutex);

@@ -439,7 +439,7 @@ public:
                     break;
                 case CmdType::ClearTexture:
                     if (c.mask == 0) break;
-                    if (Image* img = GetImage(c.dst, false)) {
+                    if (Image* img = c.copy ? GetImage(c.copy->dst, false) : nullptr) {
                         Begin();
                         EndRendering();
                         ClearColorImage(*img, c.color, c.kind);
@@ -447,12 +447,13 @@ public:
                     break;
                 case CmdType::ClearDepthStencil: ClearDepth(c); break;
                 case CmdType::CopyTexture: {
-                    Image* src = GetImage(c.src, true);  // a CPU-written source (video frames) is refreshed
-                    Image* dst = GetImage(c.dst, false);
+                    if (!c.copy) break;
+                    Image* src = GetImage(c.copy->src, true);  // a CPU-written source (video frames) is refreshed
+                    Image* dst = GetImage(c.copy->dst, false);
                     if (!src || !dst || src == dst) break;
                     Begin();
                     EndRendering();
-                    CopyImage(*src, c.src_region, *dst, c.dst_region, c.flags);
+                    CopyImage(*src, c.copy->src_region, *dst, c.copy->dst_region, c.flags);
                     break;
                 }
                 case CmdType::CopyBufferToTexture: CopyBufferToTexture(c); break;
@@ -472,9 +473,9 @@ public:
                         LogOnce("b2b-range", "buffer-to-buffer copy outside known memory");
                     break;
                 case CmdType::UpdateUniform: {
-                    const auto* data = static_cast<const std::vector<uint8_t>*>(c.obj.get());
-                    if (data && GuestRangeValid(c.dst_addr, data->size())) {
-                        memcpy(reinterpret_cast<void*>(c.dst_addr), data->data(), data->size());
+                    const std::span<const uint8_t> data = Items<uint8_t>(c);
+                    if (!data.empty() && GuestRangeValid(c.dst_addr, data.size())) {
+                        memcpy(reinterpret_cast<void*>(c.dst_addr), data.data(), data.size());
                         stream_cache_.clear();  // cached copies may include the old bytes
                     }
                     break;
@@ -494,20 +495,26 @@ public:
                     break;
                 }
                 case CmdType::BindVertexAttribs:
-                    st_.attribs = *static_cast<const std::vector<VertexAttribObj>*>(c.obj.get());
+                    {
+                        const auto v = Items<VertexAttribObj>(c);
+                        st_.attribs.assign(v.begin(), v.end());
+                    }
                     break;
                 case CmdType::BindVertexStreams:
-                    st_.streams = *static_cast<const std::vector<VertexStreamObj>*>(c.obj.get());
+                    {
+                        const auto v = Items<VertexStreamObj>(c);
+                        st_.streams.assign(v.begin(), v.end());
+                    }
                     break;
                 case CmdType::BindVertexBuffers: {
-                    const auto& v = *static_cast<const std::vector<BufferRange>*>(c.obj.get());
+                    const auto v = Items<BufferRange>(c);
                     for (size_t i = 0; i < v.size(); i++)
                         if (c.index + i < 16) st_.vertex_buffers[c.index + i] = v[i];
                     break;
                 }
                 case CmdType::BindUniformBuffers: {
                     if (c.stage < 0 || c.stage > 1) break;  // only vertex / fragment
-                    const auto& v = *static_cast<const std::vector<BufferRange>*>(c.obj.get());
+                    const auto v = Items<BufferRange>(c);
                     for (size_t i = 0; i < v.size(); i++) {
                         const size_t idx = size_t(c.index) + i;
                         if (idx < 18) st_.uniforms[c.stage][idx] = v[i];
@@ -517,14 +524,14 @@ public:
                 }
                 case CmdType::BindTextures: {
                     if (c.stage < 0 || c.stage > 1) break;
-                    const auto& v = *static_cast<const std::vector<BoundTexture>*>(c.obj.get());
+                    const auto v = Items<BoundTexture>(c);
                     for (size_t i = 0; i < v.size(); i++)
                         if (c.index + i < 32) st_.textures[c.stage][c.index + i] = v[i];
                     break;
                 }
                 case CmdType::BindImages: {
                     if (c.stage < 0 || c.stage > 1) break;
-                    const auto& v = *static_cast<const std::vector<TexRef>*>(c.obj.get());
+                    const auto v = Items<TexRef>(c);
                     for (size_t i = 0; i < v.size(); i++) {
                         if (c.index + i >= 8) break;
                         st_.images[c.stage][c.index + i] = v[i];
@@ -537,20 +544,20 @@ public:
                     break;
                 }
                 case CmdType::BindBlend: {
-                    const auto& b = *static_cast<const BlendStateObj*>(c.obj.get());
+                    const BlendStateObj b = One<BlendStateObj>(c);
                     if (b.target >= 0 && b.target < 8) st_.blend[b.target] = b;
                     break;
                 }
-                case CmdType::BindColor: st_.color = *static_cast<const ColorStateObj*>(c.obj.get()); break;
+                case CmdType::BindColor: st_.color = One<ColorStateObj>(c); break;
                 case CmdType::BindChannelMask:
-                    st_.channel = *static_cast<const ChannelMaskStateObj*>(c.obj.get());
+                    st_.channel = One<ChannelMaskStateObj>(c);
                     break;
                 case CmdType::BindDepthStencil:
-                    st_.depth = *static_cast<const DepthStencilStateObj*>(c.obj.get());
+                    st_.depth = One<DepthStencilStateObj>(c);
                     break;
-                case CmdType::BindPolygon: st_.polygon = *static_cast<const PolygonStateObj*>(c.obj.get()); break;
+                case CmdType::BindPolygon: st_.polygon = One<PolygonStateObj>(c); break;
                 case CmdType::BindMultisample:
-                    st_.multisample = *static_cast<const MultisampleStateObj*>(c.obj.get());
+                    st_.multisample = One<MultisampleStateObj>(c);
                     break;
                 case CmdType::SetViewport:
                     memcpy(st_.viewport, c.f, sizeof(st_.viewport));
@@ -2587,14 +2594,14 @@ private:
     std::vector<WatchedCopy> watched_copies_;
     void CheckWatchedCopies() {
         for (WatchedCopy& w : watched_copies_) {
-            if (!GuestRangeValid(w.cmd.src_addr, w.size)) continue;
+            if (!w.cmd.copy || !GuestRangeValid(w.cmd.src_addr, w.size)) continue;
             const uint8_t* p = reinterpret_cast<const uint8_t*>(w.cmd.src_addr);
             const uint64_t h = Fnv(p, w.size);
             if (h == w.hash) continue;
             w.hash = h;
             // Only something that still looks like a ramp is copied (the memory may be a reused upload buffer):
             // one entry per texel (8-bit or 32-bit float channels), each colour channel non-decreasing.
-            const int width = w.cmd.dst.tex.width;
+            const int width = w.cmd.copy->dst.tex.width;
             const size_t bpp = width > 0 ? w.size / size_t(width) : 0;
             auto channel = [&](int i, int ch) -> float {
                 if (bpp == 4) return p[size_t(i) * 4 + size_t(ch)] / 255.f;
@@ -2610,7 +2617,7 @@ private:
             static int logged = 0;
             if (logged++ < 30)
                 LOGI(kTag, "copy source @%llx of a %dx%d table changed (%zu B/texel): [0] %.3f %.3f %.3f | [%d] %.3f | [%d] %.3f: %s",
-                     (unsigned long long)w.cmd.src_addr, width, w.cmd.dst.tex.height, bpp, channel(0, 0),
+                     (unsigned long long)w.cmd.src_addr, width, w.cmd.copy->dst.tex.height, bpp, channel(0, 0),
                      channel(0, 1), channel(0, 2), width / 2, channel(width / 2, 0), width - 1, channel(width - 1, 0),
                      ramp ? "copied again" : "not a ramp, ignored");
             if (!ramp) continue;
@@ -2676,7 +2683,9 @@ private:
         }
     }
     void CopyTextureToBuffer(const Cmd& c) {
-        Image* img = GetImage(c.src, false);
+        if (!c.copy) return;
+        const CopyInfo& ci = *c.copy;
+        Image* img = GetImage(ci.src, false);
         if (!img) {
             LogOnce("t2b-noimg", "texture-to-buffer copy from a texture never rendered or uploaded: skipped");
             return;
@@ -2688,7 +2697,7 @@ private:
                     img->nvn_format, int(img->vk_format));
             return;
         }
-        const CopyRegion& r = c.src_region;
+        const CopyRegion& r = ci.src_region;
         const int w = r.width > 0 ? r.width : img->width, h = r.height > 0 ? r.height : img->height;
         const int d = std::max(1, r.depth);
         const size_t row = size_t(w) * size_t(fi.bytes_per_block), rows = size_t(h);
@@ -2702,11 +2711,11 @@ private:
         if (off == VK_WHOLE_SIZE) return;
         VkBufferImageCopy region{};
         region.bufferOffset = off;
-        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, uint32_t(std::max(0, c.src.level)), 0, 1};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, uint32_t(std::max(0, ci.src.level)), 0, 1};
         region.imageOffset = {r.x, r.y, img->type == VK_IMAGE_TYPE_3D ? r.z : 0};
         region.imageExtent = {uint32_t(w), uint32_t(h), uint32_t(img->type == VK_IMAGE_TYPE_3D ? d : 1)};
         if (img->type != VK_IMAGE_TYPE_3D) {
-            region.imageSubresource.baseArrayLayer = uint32_t(std::max(0, r.z) + std::max(0, c.src.layer));
+            region.imageSubresource.baseArrayLayer = uint32_t(std::max(0, r.z) + std::max(0, ci.src.layer));
             region.imageSubresource.layerCount = uint32_t(d);
         }
         Transition(*img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -2729,10 +2738,12 @@ private:
     }
 
     void CopyBufferToTexture(const Cmd& c, bool rerun = false) {
-        Image* img = GetImage(c.dst, false);
+        if (!c.copy) return;
+        const CopyInfo& ci = *c.copy;
+        Image* img = GetImage(ci.dst, false);
         if (!img || IsDepthFormat(img->nvn_format)) return;
         const FormatInfo fi = GetFormatInfo(img->nvn_format);
-        const CopyRegion& r = c.dst_region;
+        const CopyRegion& r = ci.dst_region;
         const int w = r.width > 0 ? r.width : img->width, h = r.height > 0 ? r.height : img->height;
         const int d = std::max(1, r.depth);
         const size_t row = size_t((w + fi.block_w - 1) / fi.block_w) * size_t(fi.bytes_per_block);
@@ -2747,7 +2758,7 @@ private:
         if (!rerun && h == 1 && w <= 1024 && src_size <= 65536) {
             bool known = false;
             for (WatchedCopy& wc : watched_copies_)
-                if (wc.cmd.dst.addr == c.dst.addr) {
+                if (wc.cmd.copy && wc.cmd.copy->dst.addr == ci.dst.addr) {
                     wc = {c, Fnv(reinterpret_cast<const uint8_t*>(c.src_addr), src_size), src_size};
                     known = true;
                 }
@@ -2789,7 +2800,7 @@ private:
         // The game may later rewrite this texture's memory with the CPU (the brightness lookup table is filled
         // by a copy at start-up, then rewritten in place): watch that memory from here on, like an upload.
         img->cpu_source = true;
-        img->sample_hash = SampleHash(c.dst);
+        img->sample_hash = SampleHash(ci.dst);
         img->checked_in_list = list_counter_;
         img->check_interval = 1;
         img->next_check_list = list_counter_ + 1;

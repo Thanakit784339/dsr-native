@@ -5,7 +5,10 @@
 
 #include <cstdint>
 #include <functional>
+#include <cstring>
 #include <memory>
+#include <span>
+#include <type_traits>
 #include <vector>
 
 #include "hle/nvn/nvn_types.h"
@@ -84,10 +87,17 @@ struct DrawParams {
 
 enum ClearKind : uint8_t { kClearFloat = 0, kClearInt = 1, kClearUint = 2 };
 
+// Textures and regions of copies / texture clears (rare commands: kept out of Cmd).
+struct CopyInfo {
+    TexRef src, dst;
+    CopyRegion src_region, dst_region;
+};
+
 struct Cmd {
     CmdType type{};
     uint8_t kind = kClearFloat;
     bool depth_mask = false;
+    uint16_t inline_count = 0;  // payload items stored in `inline_data` (when `obj` is null)
     int index = 0, mask = 0, stencil = 0, stencil_mask = 0, flags = 0;
     uint32_t color[4] = {};
     float depth = 0;
@@ -95,15 +105,43 @@ struct Cmd {
     float f[4] = {};
     uint64_t src_addr = 0, dst_addr = 0;
     DrawParams draw;
-    std::shared_ptr<const void> obj;  // type-specific payload (see CmdType)
+    // Type-specific payload (see CmdType): small ones (state objects, a few buffer ranges or vertex streams)
+    // inline, larger ones (and shader code, called lists) on the heap. Binds used to allocate twice each, and
+    // the recording threads spent half their time in the allocator.
+    static constexpr size_t kInlineBytes = 96;
+    alignas(8) uint8_t inline_data[kInlineBytes];
+    std::shared_ptr<const void> obj;
     // SetRenderTargets
     int num_rt = 0;
     std::shared_ptr<const std::vector<TexRef>> rts;  // colors[0..num_rt) then depth at [num_rt]
-    // copies / clears of explicit textures
-    TexRef src, dst;
-    CopyRegion src_region, dst_region;
+    std::shared_ptr<const CopyInfo> copy;            // CopyTexture, ClearTexture, CopyBufferToTexture, CopyTextureToBuffer
     uint64_t size64 = 0;  // CopyBufferToBuffer
 };
+// Payload items of a command: inline, or a std::vector<T> on the heap.
+template <typename T>
+void SetItems(Cmd& c, const T* p, size_t n) {
+    static_assert(std::is_trivially_copyable_v<T>, "inline payloads are copied bytewise");
+    if (n * sizeof(T) <= Cmd::kInlineBytes) {
+        if (n) memcpy(c.inline_data, p, n * sizeof(T));
+        c.inline_count = uint16_t(n);
+        c.obj = nullptr;
+    } else {
+        c.obj = std::make_shared<const std::vector<T>>(p, p + n);
+    }
+}
+template <typename T>
+std::span<const T> Items(const Cmd& c) {
+    if (c.obj) {
+        const auto& v = *static_cast<const std::vector<T>*>(c.obj.get());
+        return {v.data(), v.size()};
+    }
+    return {reinterpret_cast<const T*>(c.inline_data), c.inline_count};
+}
+template <typename T>
+T One(const Cmd& c) {
+    const std::span<const T> s = Items<T>(c);
+    return s.empty() ? T{} : s[0];
+}
 
 using CmdList = std::vector<Cmd>;
 // Calls `f` for every command of `list`, descending into CallList commands (nesting is shallow in practice).
