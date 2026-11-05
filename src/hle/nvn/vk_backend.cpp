@@ -336,6 +336,12 @@ struct Image {
     uint64_t addr = 0;     // storage in game memory
     TextureState tex{};    // as the game described it (layout of that storage)
     VkFormat twin = VK_FORMAT_UNDEFINED;  // sRGB/linear counterpart views may use (image is mutable-format)
+    // A clear not done yet: done as the load of the next render pass that starts on this subresource (no
+    // separate full-image write and read on a tiling GPU), or for real before any other use.
+    bool clear_pending = false;
+    VkClearValue clear_value{};
+    VkImageAspectFlags clear_aspect = 0;
+    int clear_layer = 0, clear_level = 0;
 };
 
 struct Shader {
@@ -400,8 +406,33 @@ public:
                     if (c.mask == 0 || c.index < 0 || c.index >= st_.num_rt) break;
                     if (Image* img = GetImage(st_.rts[c.index], false)) {
                         Begin();
-                        EndRendering();
-                        ClearColorImage(*img, c.color, c.kind, st_.rts[c.index].layer, st_.rts[c.index].level);
+                        const int layer = st_.rts[c.index].layer, level = st_.rts[c.index].level;
+                        if (!IsDepthFormat(img->nvn_format) && !capture_active_) {
+                            VkClearValue v{};
+                            memcpy(v.color.uint32, c.color, sizeof(v.color.uint32));
+                            if (rendering_ && size_t(c.index) < pass_color_count_ && pass_colors_[c.index] == img &&
+                                pass_color_sub_[c.index] == std::make_pair(layer, level)) {
+                                // Target of the open pass: cleared inside it.
+                                VkClearAttachment ca{VK_IMAGE_ASPECT_COLOR_BIT, uint32_t(c.index), v};
+                                VkClearRect rect{{{0, 0}, pass_extent_}, 0, 1};
+                                vkCmdClearAttachments(cmd_, 1, &ca, 1, &rect);
+                                clears_in_pass_++;
+                            } else {
+                                if (InOpenPass(img)) EndRendering();  // draws after the clear must see it
+                                if (img->clear_pending) FlushClear(*img);
+                                img->clear_pending = true;
+                                img->clear_value = v;
+                                img->clear_aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+                                img->clear_layer = layer;
+                                img->clear_level = level;
+                                clears_deferred_++;
+                            }
+                            img->written = true;
+                            img->cpu_source = false;
+                        } else {
+                            EndRendering();
+                            ClearColorImage(*img, c.color, c.kind, layer, level);
+                        }
                     }
                     break;
                 case CmdType::ClearTexture:
@@ -1981,6 +2012,7 @@ private:
                              0, nullptr, 1, &b);
     }
     void Transition(Image& img, VkImageLayout to) {
+        if (img.clear_pending) FlushClear(img);
         if (img.layout == to) return;
         RawBarrier(img.image, img.aspect, img.layout, to, uint32_t(img.levels), uint32_t(img.layers));
         img.layout = to;
@@ -1989,6 +2021,37 @@ private:
     // ======================================================================================================
     // clears / copies
     // ======================================================================================================
+    // Performs a deferred clear (outside a render pass).
+    void FlushClear(Image& img) {
+        img.clear_pending = false;
+        EndRendering();
+        const VkImageLayout dst = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        if (img.layout != dst) {
+            RawBarrier(img.image, img.aspect, img.layout, dst, uint32_t(img.levels), uint32_t(img.layers));
+            img.layout = dst;
+        }
+        VkImageSubresourceRange range{img.clear_aspect, SubLevel(img, img.clear_level), 1,
+                                      img.type == VK_IMAGE_TYPE_3D ? 0 : SubLayer(img, img.clear_layer), 1};
+        if (img.clear_aspect & VK_IMAGE_ASPECT_COLOR_BIT)
+            vkCmdClearColorImage(cmd_, img.image, dst, &img.clear_value.color, 1, &range);
+        else
+            vkCmdClearDepthStencilImage(cmd_, img.image, dst, &img.clear_value.depthStencil, 1, &range);
+        clears_flushed_++;
+    }
+    uint64_t clears_deferred_ = 0, clears_flushed_ = 0, clears_in_pass_ = 0;
+    // The render pass currently open: its colour images (and subresources) and depth image.
+    Image* pass_colors_[8] = {};
+    std::pair<int, int> pass_color_sub_[8] = {};
+    size_t pass_color_count_ = 0;
+    Image* pass_depth_ = nullptr;
+    VkExtent2D pass_extent_{};
+    bool InOpenPass(const Image* img) const {
+        if (!rendering_) return false;
+        if (pass_depth_ == img) return true;
+        for (size_t i = 0; i < pass_color_count_; i++)
+            if (pass_colors_[i] == img) return true;
+        return false;
+    }
     void ClearColorImage(Image& img, const uint32_t color[4], uint8_t kind, int layer = 0, int level = 0) {
         if (IsDepthFormat(img.nvn_format)) return;
         Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -2022,6 +2085,29 @@ private:
         a &= img->aspect;
         if (!a) return;
         Begin();
+        const TexRef& rr = st_.rts[size_t(st_.num_rt)];
+        if (a == img->aspect && !capture_active_) {  // every aspect cleared: deferred, or inside the open pass
+            VkClearValue v{};
+            v.depthStencil = {std::clamp(c.depth, 0.0f, 1.0f), uint32_t(c.stencil)};
+            if (rendering_ && pass_depth_ == img) {
+                VkClearAttachment ca{a, 0, v};
+                VkClearRect rect{{{0, 0}, pass_extent_}, 0, 1};
+                vkCmdClearAttachments(cmd_, 1, &ca, 1, &rect);
+                clears_in_pass_++;
+            } else {
+                if (InOpenPass(img)) EndRendering();
+                if (img->clear_pending) FlushClear(*img);
+                img->clear_pending = true;
+                img->clear_value = v;
+                img->clear_aspect = a;
+                img->clear_layer = rr.layer;
+                img->clear_level = rr.level;
+                clears_deferred_++;
+            }
+            img->written = true;
+            img->cpu_source = false;
+            return;
+        }
         EndRendering();
         Transition(*img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkClearDepthStencilValue v{std::clamp(c.depth, 0.0f, 1.0f), uint32_t(c.stencil)};
@@ -2346,11 +2432,21 @@ private:
             Image* c = colors[ci];
             VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
             if (c) {
+                // A pending clear of exactly this subresource, covering the whole render area: the load clears.
+                const uint32_t lv = SubLevel(*c, RtSub(ci).second);
+                const bool clear_on_load = c->clear_pending && c->clear_layer == RtSub(ci).first &&
+                                           c->clear_level == RtSub(ci).second && w == std::max(1u, uint32_t(c->width) >> lv) &&
+                                           h == std::max(1u, uint32_t(c->height) >> lv);
+                if (clear_on_load) c->clear_pending = false;
                 Transition(*c, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
                 a.imageView = AttachmentView(*c, RtSub(ci).first, RtSub(ci).second,
                                              ci < st_.rts.size() ? st_.rts[ci].view_format : 0);
                 a.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                 a.loadOp = c->written ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+                if (clear_on_load) {
+                    a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                    a.clearValue = c->clear_value;
+                }
                 a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
                 NoteWritten(c);
                 c->written = true;
@@ -2362,12 +2458,22 @@ private:
         }
         VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         if (depth) {
+            const uint32_t lv = SubLevel(*depth, RtSub(8).second);
+            const bool clear_on_load = depth->clear_pending && depth->clear_layer == RtSub(8).first &&
+                                       depth->clear_level == RtSub(8).second &&
+                                       w == std::max(1u, uint32_t(depth->width) >> lv) &&
+                                       h == std::max(1u, uint32_t(depth->height) >> lv);
+            if (clear_on_load) depth->clear_pending = false;
             Transition(*depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
             da.imageView = AttachmentView(*depth, RtSub(8).first, RtSub(8).second);
             da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
             da.loadOp = depth->written ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
             da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             da.clearValue.depthStencil = {1.0f, 0};
+            if (clear_on_load) {
+                da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                da.clearValue = depth->clear_value;
+            }
             NoteWritten(depth);
             depth->written = true;
             depth->cpu_source = false;
@@ -2380,6 +2486,13 @@ private:
         if (depth && HasDepth(depth->nvn_format)) ri.pDepthAttachment = &da;
         if (depth && HasStencil(depth->nvn_format)) ri.pStencilAttachment = &da;
         begin_rendering_(cmd_, &ri);
+        pass_color_count_ = std::min<size_t>(colors.size(), 8);
+        for (size_t i = 0; i < pass_color_count_; i++) {
+            pass_colors_[i] = colors[i];
+            pass_color_sub_[i] = RtSub(i);
+        }
+        pass_depth_ = depth;
+        pass_extent_ = {w, h};
         render_passes_++;
         rendering_ = true;
         rendering_key_ = key;
@@ -2722,7 +2835,7 @@ private:
                     img = DepthSnapshot(*depth, st_.rts[size_t(st_.num_rt)]);
                     if (!img) return Skip("texture is also the depth target");
                 }
-                if (img->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+                if (img->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL || img->clear_pending) {
                     if (rendering_) {
                         char k[96];
                         snprintf(k, sizeof(k), "fmt %d %dx%d from layout %d%s", img->nvn_format, img->width,
@@ -2799,7 +2912,7 @@ private:
                 const bool type_ok = (type == VK_IMAGE_VIEW_TYPE_3D) == (img->type == VK_IMAGE_TYPE_3D) &&
                                      (info.image_dim[slot] == shader::TexDim::D1) == (img->type == VK_IMAGE_TYPE_1D);
                 if (!type_ok) return Skip("storage image dimension does not match the shader");
-                if (img->layout != VK_IMAGE_LAYOUT_GENERAL) {
+                if (img->layout != VK_IMAGE_LAYOUT_GENERAL || img->clear_pending) {
                     EndRendering();
                     Transition(*img, VK_IMAGE_LAYOUT_GENERAL);
                 }
@@ -4025,6 +4138,9 @@ private:
                  (unsigned long long)readbacks_done_);
             readbacks_recorded_ = readbacks_done_ = 0;
         }
+        LOGI(kTag, "clears: %llu done as render pass loads or deferred, %llu inside passes, %llu performed separately",
+             (unsigned long long)clears_deferred_, (unsigned long long)clears_in_pass_, (unsigned long long)clears_flushed_);
+        clears_deferred_ = clears_in_pass_ = clears_flushed_ = 0;
         if (rt_writebacks_ || reports_done_) {
             LOGI(kTag, "small render targets written back to game memory: %llu; reports written: %llu",
                  (unsigned long long)rt_writebacks_, (unsigned long long)reports_done_);
