@@ -760,12 +760,15 @@ public:
             case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_B10G11R11_UFLOAT_PACK32: raw_bpp = 4; break;
             case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R32G32_SFLOAT: raw_bpp = 8; break;
             case VK_FORMAT_R32G32B32A32_SFLOAT: raw_bpp = 16; break;
+            case VK_FORMAT_R8G8B8A8_UNORM:  // small ones (light probes, cube maps): raw, all layers
+                if (it.src_w * it.src_h <= 64u * 64u) raw_bpp = 4;
+                break;
             default: break;
         }
         if (depth) raw_bpp = HasDepth(img.nvn_format) ? 4 : 0;
         if (raw_bpp && img.type == VK_IMAGE_TYPE_2D && it.src_w * it.src_h <= 1280u * 720u) {
             // Array images: up to 4 layers, stacked vertically (flag 16).
-            const uint32_t layers = uint32_t(std::min(4, std::max(1, img.layers)));
+            const uint32_t layers = uint32_t(std::min(6, std::max(1, img.layers)));
             it.w = it.src_w;
             it.h = it.src_h * layers;
             it.flags = (depth ? 4u : 8u) | (layers > 1 ? 16u : 0u) | (uint32_t(img.vk_format) << 8);
@@ -2650,6 +2653,11 @@ private:
                         tex_desc_draw_ = drawn_;
                     }
                     pass_tex_desc_ += d;
+                    if (draw_images_draw_ != drawn_) {
+                        draw_images_.clear();
+                        draw_images_draw_ = drawn_;
+                    }
+                    draw_images_.push_back({int(stage), int(slot), img});
                 }
                 VkImageView view = SampledView(*img, info.texture_dim[slot], info.texture_array[slot], swz,
                                                bt.valid ? &bt.texture : nullptr);
@@ -3147,15 +3155,36 @@ private:
                 for (size_t at = 0; at < pass_ubo_desc_.size(); at += 2800)
                     LOGI(kTag, "capture world draw %d constants%s:%s", world_draws_logged_, at ? " (cont.)" : "",
                          pass_ubo_desc_.substr(at, 2800).c_str());
-                for (int k = 0; k < 32; k++) {
-                    const BoundTexture& bt = st_.textures[1][k];
-                    if (!bt.valid || fs->info.texture_dim[k] == shader::TexDim::None) continue;
-                    auto it = images_.find(bt.texture.addr);
-                    if (it == images_.end()) continue;
-                    LOGI(kTag, "capture world draw %d texture fs%d: NVN format %d %dx%d, %d layers, %d levels -> item %zu",
-                         world_draws_logged_, k, it->second.nvn_format, it->second.width, it->second.height,
-                         it->second.layers, it->second.levels, capture_items_.size());
-                    CaptureImage(it->second);
+                for (const DrawImage& di : draw_images_) {
+                    if (draw_images_draw_ != drawn_ || di.stage != 1) continue;
+                    Image& im = *di.img;
+                    // Per layer, the mean of each channel of the game's own copy (deswizzled with our layout code):
+                    // shows whether the data is there and whether our layer layout finds it.
+                    std::string means;
+                    const FormatInfo fi = GetFormatInfo(im.nvn_format);
+                    const TextureLayout lay = ComputeLayout(im.tex);
+                    if (fi.bytes_per_block == 4 && fi.block_w == 1 && !lay.levels.empty() && !IsDepthFormat(im.nvn_format) &&
+                        GuestRangeValid(im.addr, lay.total)) {
+                        const LevelLayout& l = lay.levels[0];
+                        std::vector<uint8_t> lin(size_t(l.row_bytes) * size_t(l.rows) * size_t(std::max(1, l.depth)));
+                        for (int layer = 0; layer < std::min(lay.layers, 6); layer++) {
+                            const uint8_t* base = reinterpret_cast<const uint8_t*>(im.addr) + size_t(layer) * lay.layer_stride + l.offset;
+                            if (lay.linear) memcpy(lin.data(), base, lin.size());
+                            else DeswizzleLevel(lin.data(), base, l);
+                            double m[4] = {0, 0, 0, 0};
+                            for (size_t q = 0; q + 3 < lin.size(); q += 4)
+                                for (int c = 0; c < 4; c++) m[c] += lin[q + c];
+                            const double n = double(lin.size() / 4);
+                            char b[96];
+                            snprintf(b, sizeof(b), " [layer %d: %.1f %.1f %.1f %.1f]", layer, m[0] / n, m[1] / n, m[2] / n, m[3] / n);
+                            means += b;
+                        }
+                    }
+                    LOGI(kTag, "capture world draw %d texture fs%d: NVN format %d %dx%d target %d, %d layers (stride %zu), "
+                               "%d levels -> item %zu; game memory means:%s",
+                         world_draws_logged_, di.slot, im.nvn_format, im.width, im.height, im.target, im.layers,
+                         lay.layer_stride, im.levels, capture_items_.size(), means.empty() ? " n/a" : means.c_str());
+                    CaptureImage(im);
                 }
             }
         }
@@ -3878,6 +3907,12 @@ private:
     std::vector<uint32_t> query_pass_;
     uint64_t ubo_desc_draw_ = ~0ull;
     int world_draws_logged_ = 0;
+    struct DrawImage {
+        int stage, slot;
+        Image* img;
+    };
+    std::vector<DrawImage> draw_images_;  // textures resolved for the current draw (captures only)
+    uint64_t draw_images_draw_ = ~0ull;
     uint64_t tex_desc_draw_ = ~0ull;
     std::vector<CaptureItem> capture_items_;
     VkExtent2D no_attachment_extent_{0, 0};  // render area for a draw with no attachments (storage-only)
