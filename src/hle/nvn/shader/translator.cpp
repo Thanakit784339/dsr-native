@@ -181,6 +181,10 @@ public:
         else
             return Fail(r, "unsupported shader stage " + std::to_string(type));
         info_.stage = stage_;
+        // Vertex positions must come out bit-identical from different shaders: the game draws a character's depth
+        // with one shader and then its fading colour with another, keeping only pixels of equal depth (parts of
+        // dying characters vanished). Hence no driver-chosen fusing here, and an invariant gl_Position.
+        b_.exact_float = stage_ == Stage::Vertex;
         Setup();
         const size_t count = (size_ - kCodeOffset) / 8;
         bool ended = false;
@@ -519,7 +523,9 @@ private:
     void StoreVertexAttribute(uint32_t addr, Id u) {
         Id f = BitcastF(u);
         if (addr >= 0x70 && addr < 0x80) {
+            const bool first = !position_;
             Id pos = BuiltinVar(&position_, SpvStorageClassOutput, t_v4f_, SpvBuiltInPosition, "gl_Position");
+            if (first) b_.Decorate(pos, SpvDecorationInvariant, {});
             StoreComponent(pos, (addr - 0x70) / 4, f);
             return;
         }

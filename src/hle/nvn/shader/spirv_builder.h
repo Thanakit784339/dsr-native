@@ -147,11 +147,21 @@ public:
     void Label(Id id) { Emit(body_, SpvOpLabel, {id}); }
     void Op(SpvOp op, std::initializer_list<uint32_t> w) { Emit(body_, op, std::vector<uint32_t>(w)); }
     void Op(SpvOp op, const std::vector<uint32_t>& w) { Emit(body_, op, w); }
+    // Separate float multiplies and adds stay separate (NoContraction) when `exact_float` is set: a driver that
+    // fuses them into FMAs does so differently in different shaders, so two shaders computing the same vertex
+    // position no longer agree to the bit (Maxwell keeps FMUL/FADD unfused; FFMA is emitted as an explicit Fma).
+    bool exact_float = false;
+    void MaybeExact(SpvOp op, Id id) {
+        if (exact_float && (op == SpvOpFMul || op == SpvOpFAdd || op == SpvOpFSub || op == SpvOpFNegate ||
+                            op == SpvOpVectorTimesScalar || op == SpvOpDot))
+            Decorate(id, SpvDecorationNoContraction, {});
+    }
     Id OpResult(SpvOp op, Id type, std::initializer_list<uint32_t> args) {
         Id id = NewId();
         std::vector<uint32_t> w = {type, id};
         w.insert(w.end(), args.begin(), args.end());
         Emit(body_, op, w);
+        MaybeExact(op, id);
         return id;
     }
     Id OpResult(SpvOp op, Id type, const std::vector<uint32_t>& args) {
@@ -159,6 +169,7 @@ public:
         std::vector<uint32_t> w = {type, id};
         w.insert(w.end(), args.begin(), args.end());
         Emit(body_, op, w);
+        MaybeExact(op, id);
         return id;
     }
     Id Glsl(Id type, GLSLstd450Shim op, std::initializer_list<Id> args) {
