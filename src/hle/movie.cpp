@@ -381,6 +381,11 @@ struct Decoder {
     // Decoded picture geometry (from the codec's output format).
     int width = 0, height = 0, stride = 0, slice_height = 0, crop_left = 0, crop_top = 0;
     bool logged_convert = false;
+    // Diagnostics (movie stutter): when the game took its first video frames, against their timestamps.
+    std::string take_trace;
+    int takes_traced = 0;
+    std::chrono::steady_clock::time_point take_t0;
+    int64_t take_pts0 = 0;
     std::chrono::steady_clock::time_point last_report = std::chrono::steady_clock::now();
 #if defined(__ANDROID__)
     AMediaCodec* codec = nullptr;
@@ -757,6 +762,20 @@ int DecGetOutputBuffer(void* self, int index, void* buffer) {
                 pool.push_back(frame);
             }
             if (!frame) frame = std::make_shared<std::vector<uint8_t>>(pitch * size_t(h));
+        }
+        if (d->takes_traced < 150) {
+            const auto now = std::chrono::steady_clock::now();
+            if (d->takes_traced == 0) {
+                d->take_t0 = now;
+                d->take_pts0 = o.time_us;
+            }
+            char tb[32];
+            snprintf(tb, sizeof(tb), " %.0f/%.0f", std::chrono::duration<double, std::milli>(now - d->take_t0).count(),
+                     (o.time_us - d->take_pts0) / 1000.0);
+            d->take_trace += tb;
+            if (++d->takes_traced == 150)
+                LOGI(kTag, "video frames taken by the game (ms since the first / their timestamp, ms):%s",
+                     d->take_trace.c_str());
         }
         uint8_t* dst = direct ? gb.data : frame->data();
         const auto t0 = std::chrono::steady_clock::now();

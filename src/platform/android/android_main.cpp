@@ -319,7 +319,9 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "# record_thread: 1 = record GPU commands on a second CPU thread (faster), 0 = all on one thread\n"
                     "record_thread = 1\n"
                     "# fast_cores: 1 = keep the game's main, recording and submit threads on the performance cores\n"
-                    "fast_cores = 1\n",
+                    "fast_cores = 1\n"
+                    "# audio_smooth: 1 = report audio progress to the game smoothly (movies time video by it)\n"
+                    "audio_smooth = 1\n",
                     cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0,
                     cfg->gamma, cfg->exposure);
             fclose(w);
@@ -338,6 +340,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "pin_render_thread")) cfg->pin_render_thread = v != 0;
             else if (!strcmp(key, "record_thread")) cfg->record_thread = v != 0;
             else if (!strcmp(key, "fast_cores")) cfg->fast_cores = v != 0;
+            else if (!strcmp(key, "audio_smooth")) cfg->audio_smooth = v != 0;
             else if (!strcmp(key, "gamma")) {
                 const float g = float(atof(value));
                 cfg->gamma = g >= 0.5f && g <= 3.0f ? g : 1.0f;

@@ -24,6 +24,7 @@ struct RuntimeConfig {
     bool auto_capture = false;    // diagnostics: save a few frame captures automatically during play
     bool profile = true;          // diagnostics: sampling CPU profile of the busy threads, logged every 10 s
     float gamma = 1.0f;           // extra display gamma applied through the game's brightness ramp (> 1 lifts shadows)
+    bool audio_smooth = true;  // release audio buffers to the game at a smooth pace (movie timing)
     bool fast_cores = true;  // keep the game's frame-critical threads off the efficiency cores
     bool record_thread = true;  // record Vulkan commands on a second thread (draw preparation stays on the render thread)
     bool pin_render_thread = false;  // keep the render thread on the fastest CPU core(s) (slower on 8 Gen 2: off)

@@ -9,11 +9,14 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <chrono>
+#include <string>
 #include <thread>
 
 #include "common/log.h"
 #include "hle/os/os.h"
 #include "hle/registry.h"
+#include "runtime/runtime.h"
 
 #if defined(__ANDROID__)
 #include <aaudio/AAudio.h>
@@ -86,6 +89,9 @@ public:
         if (stream_) AAudioStream_requestStart(stream_);
 #endif
         worker_ = std::thread([this] { Run(); });
+#if defined(__ANDROID__)
+        if (Smooth()) pacer_ = std::thread([this] { Pace(); });
+#endif
     }
 
     void Stop() {
@@ -95,7 +101,9 @@ public:
             running_ = false;
         }
         cv_.notify_all();
+        pace_cv_.notify_all();
         if (worker_.joinable()) worker_.join();
+        if (pacer_.joinable()) pacer_.join();
 #if defined(__ANDROID__)
         if (stream_) {
             AAudioStream_requestStop(stream_);
@@ -135,13 +143,98 @@ private:
             const int16_t* pcm = ToStereo(static_cast<const int16_t*>(b->data), frames);
             Report(pcm, frames);
             Play(pcm, frames);
+            written_ += frames;
+            bool now_released = false;
             {
                 std::lock_guard<std::mutex> lk(m_);
                 queued_.pop_front();
-                released_.push_back(b);
+                if (Smooth()) {
+                    accepted_.push_back({b, written_});
+                } else {
+                    released_.push_back(b);
+                    now_released = true;
+                }
             }
-            if (event_) dsr::hle::os::SignalSystemEvent(event_);
+            if (now_released) Released(1);
+            pace_cv_.notify_all();
         }
+    }
+
+    // Buffer release timing. Android takes audio in bursts (tens of ms of samples at once on a normal-mode
+    // stream), and the game was told a buffer was done the moment its samples were accepted: release times came
+    // in clumps. Games that time video by audio progress (the opening movie) then showed frames in bursts and
+    // held them. Accepted buffers are now released when a smoothly interpolated read position (the device's
+    // read counter, advanced at the sample rate between its steps, capped at one burst ahead) says the device
+    // has room for them: the same moment on average, without the clumps.
+    struct Accepted {
+        GuestBuffer* b;
+        uint64_t end;  // frames written up to and including this buffer
+    };
+    bool Smooth() const {
+#if defined(__ANDROID__)
+        return stream_ && smooth_;
+#else
+        return false;
+#endif
+    }
+    void Released(int n) {
+        TraceReleases(n);
+        if (event_) dsr::hle::os::SignalSystemEvent(event_);
+    }
+    void Pace() {
+#if defined(__ANDROID__)
+        int64_t last_read = -1;
+        std::chrono::steady_clock::time_point last_change{};
+        const int32_t burst = std::max<int32_t>(1, AAudioStream_getFramesPerBurst(stream_));
+        const int32_t buffer = std::max<int32_t>(burst, AAudioStream_getBufferSizeInFrames(stream_));
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(m_);
+                pace_cv_.wait_for(lk, std::chrono::milliseconds(2));
+                if (!running_) {
+                    for (const Accepted& a : accepted_) released_.push_back(a.b);
+                    accepted_.clear();
+                    return;
+                }
+                if (accepted_.empty()) continue;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            const int64_t read = AAudioStream_getFramesRead(stream_);
+            if (read != last_read) {
+                last_read = read;
+                last_change = now;
+            }
+            const double since = std::chrono::duration<double>(now - last_change).count();
+            const double pos = double(read) + std::min(double(burst), since * kSampleRate);
+            int n = 0;
+            {
+                std::lock_guard<std::mutex> lk(m_);
+                while (!accepted_.empty() && double(accepted_.front().end) <= pos + buffer) {
+                    released_.push_back(accepted_.front().b);
+                    accepted_.pop_front();
+                    n++;
+                }
+            }
+            if (n) Released(n);
+        }
+#endif
+    }
+    // Diagnostics (movie stutter): intervals between the first releases of each stream, logged once.
+    std::chrono::steady_clock::time_point trace_last_{};
+    std::string trace_;
+    int traced_ = 0;
+    void TraceReleases(int n) {
+        if (traced_ >= 120) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (traced_ > 0) {
+            char b[24];
+            snprintf(b, sizeof(b), " %.0f%s", std::chrono::duration<double, std::milli>(now - trace_last_).count(),
+                     n > 1 ? ("x" + std::to_string(n)).c_str() : "");
+            trace_ += b;
+        }
+        trace_last_ = now;
+        if (++traced_ == 120)
+            LOGI(kTag, "audio out (%d ch) buffer releases, ms apart (xN: N at once):%s", channels_, trace_.c_str());
     }
 
     // The game may open the output with 1, 2 or 6 (5.1: FL FR FC LFE BL BR) channels; the host stream is
@@ -215,6 +308,11 @@ private:
     std::mutex m_;
     std::condition_variable cv_;
     std::deque<GuestBuffer*> queued_, released_;
+    std::deque<Accepted> accepted_;  // written to the device, not yet released (smoothing)
+    std::condition_variable pace_cv_;
+    std::thread pacer_;
+    uint64_t written_ = 0;
+    bool smooth_ = dsr::GetRuntime().config.audio_smooth;
     std::thread worker_;
     bool running_ = false;
 #if defined(__ANDROID__)
