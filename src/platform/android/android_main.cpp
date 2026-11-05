@@ -30,7 +30,9 @@
 #include "common/crash.h"
 #include "common/log.h"
 #include "common/platform.h"
+#include "common/profiler.h"
 #include "hle/input.h"
+#include "hle/nvn/backend.h"
 #include "hle/video.h"
 #include "runtime/runtime.h"
 
@@ -300,8 +302,11 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "# appear a frame late), 0 = compile on the spot (can hitch the first time something is seen)\n"
                     "async_pipelines = %d\n"
                     "# auto_capture: 1 = save a few frame captures (dsr_frame_*.bin) during play, for diagnostics\n"
-                    "auto_capture = %d\n",
-                    cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0);
+                    "# (pressing both sticks in, L3 + R3, always saves one)\n"
+                    "auto_capture = %d\n"
+                    "# profile: 1 = log where the CPU time goes every 10 s (diagnostics, costs ~1%%)\n"
+                    "profile = %d\n",
+                    cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0);
             fclose(w);
             LOGI(kTag, "settings: wrote defaults to %s", path.c_str());
         }
@@ -314,11 +319,13 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             if (!strcmp(key, "fps")) cfg->target_fps = v >= 50 ? 60 : 30;
             else if (!strcmp(key, "async_pipelines")) cfg->async_pipelines = v != 0;
             else if (!strcmp(key, "auto_capture")) cfg->auto_capture = v != 0;
+            else if (!strcmp(key, "profile")) cfg->profile = v != 0;
         }
         fclose(f);
     }
-    LOGI(kTag, "settings (%s): fps %d, async pipelines %s, auto capture %s", path.c_str(), cfg->target_fps,
-         cfg->async_pipelines ? "on" : "off", cfg->auto_capture ? "on" : "off");
+    LOGI(kTag, "settings (%s): fps %d, async pipelines %s, auto capture %s, profile %s", path.c_str(), cfg->target_fps,
+         cfg->async_pipelines ? "on" : "off", cfg->auto_capture ? "on" : "off", cfg->profile ? "on" : "off");
+    if (cfg->profile) dsr::profiler::Enable();
 }
 
 void StartGame(android_app* app) {
@@ -392,10 +399,20 @@ int32_t OnInput(android_app*, AInputEvent* ev) {
                  b ? "mapped" : "not mapped");
         }
         if (!b) return 0;
+        const uint64_t before = g_pad.buttons;
         if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_DOWN)
             g_pad.buttons |= b;
         else if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_UP)
             g_pad.buttons &= ~b;
+        // Diagnostics: pressing both sticks in (L3 + R3) saves a frame capture (dsr_frame_*.bin) of the next frame.
+        {
+            using namespace dsr::input;
+            const uint64_t both = kStickL | kStickR;
+            if ((g_pad.buttons & both) == both && (before & both) != both) {
+                LOGI(kTag, "L3 + R3: frame capture requested");
+                dsr::hle::nvn::GetBackend().RequestCapture(0);
+            }
+        }
         SetPad(g_pad);
         return 1;
     }

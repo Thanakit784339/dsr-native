@@ -20,6 +20,7 @@
 #include <unordered_map>
 
 #include "common/log.h"
+#include "common/profiler.h"
 #include "hle/nvn.h"
 #include "hle/nvn/backend.h"
 #include "hle/nvn/state.h"
@@ -428,6 +429,7 @@ private:
 #endif
     }
     void Run() {
+        dsr::profiler::RegisterCurrentThread("render (Vulkan)");
         for (;;) {
             std::function<void()> task;
             {

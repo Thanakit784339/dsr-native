@@ -42,6 +42,14 @@ jobs:
           path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
+      # Unstripped native library: symbolizes the profiler's dsr+0x... addresses.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsr-native-symbols-${{ github.sha }}
+          path: android/app/build/intermediates/cxx/*/*/obj/arm64-v8a/libdsr.so
+          if-no-files-found: warn
+          retention-days: 30
+
   # Loader/HLE tests on x86-64 and on a real arm64 machine. The arm64 job also runs the
   # assembly transition code (x18 handling, thunks, GuestCall, setjmp/longjmp).
   host-tests:

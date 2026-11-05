@@ -2327,8 +2327,10 @@ private:
                     tex_writes.push_back({uint32_t(stage), 32 + slot,
                                           {Sampler(bt.sampler, false, Filterable(*img)), view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
                 if (shadow)
-                    tex_writes.push_back({uint32_t(stage), 64 + slot,
-                                          {Sampler(bt.sampler, true, Filterable(*img)), view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+                    tex_writes.push_back({uint32_t(stage), 64 + slot,  // point-sampled: the shader filters (2x2 PCF)
+                                          {Sampler(bt.sampler, true, info.texture_dim[slot] != shader::TexDim::D2 &&
+                                                                         Filterable(*img)),
+                                           view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
             }
         }
 

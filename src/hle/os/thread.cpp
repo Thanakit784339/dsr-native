@@ -16,6 +16,7 @@
 
 #include "arch/arch.h"
 #include "common/log.h"
+#include "common/profiler.h"
 #include "hle/os/os.h"
 #include "hle/registry.h"
 #include "runtime/runtime.h"
@@ -99,6 +100,7 @@ void* ThreadTrampoline(void* p) {
     t_current = ht;
     QueryStack(ht);
     pthread_setname_np(pthread_self(), ht->name.empty() ? "guest" : ht->name.substr(0, 15).c_str());
+    dsr::profiler::RegisterCurrentThread(ht->name.empty() ? "guest" : ht->name.c_str());
     LOGD(kTag, "thread %llu '%s' start entry=%p arg=%p", (unsigned long long)ht->id, ht->name.c_str(), ht->entry,
          ht->arg);
     arch::GuestCall<void>(ht->entry, ht->arg);
@@ -144,6 +146,7 @@ GuestThread* CurrentThread() {
 }
 
 void AdoptMainThread(const char* name, size_t stack_size, int priority) {
+    dsr::profiler::RegisterCurrentThread(name);
     GuestThread* t = CurrentThread();
     t_current->name = name;
     t_current->stack_size = stack_size;

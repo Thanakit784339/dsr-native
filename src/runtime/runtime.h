@@ -22,6 +22,7 @@ struct RuntimeConfig {
     int target_fps = 60;          // presentation pace: 30 (the Switch rate) or 60
     bool async_pipelines = true;  // compile new GPU pipelines off the render thread (no hitch; the draw waits a frame)
     bool auto_capture = false;    // diagnostics: save a few frame captures automatically during play
+    bool profile = true;          // diagnostics: sampling CPU profile of the busy threads, logged every 10 s
 };
 
 struct Runtime {
@@ -46,8 +47,7 @@ int RunGame();
 
 // Patches engine functions of this game build (log/panic output, frame rate). Called by LoadGame.
 void InstallGameHooks();
-// With fps = 60: sets the game's per-frame time step (clamped to 1/60..1/30 s). No effect otherwise.
-void SetGameFrameTime(double seconds);
+// The game's current per-frame time step in seconds (1/30 unless the 60 fps patches are active).
 float GameFrameTime();
 
 // Prints an import binding summary (implemented / unimplemented / data) to the log.

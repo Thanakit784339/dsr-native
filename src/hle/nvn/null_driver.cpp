@@ -467,12 +467,7 @@ void QueuePresentTexture(void* queue, void* window, int index) {
         ft_max = std::max(ft_max, ms);
         ft_n++;
         if (ms > 2.0 * 1000.0 / fps) ft_hitches++;
-        // The game's time step (60 fps mode): the recent frame time, smoothed, so it keeps normal speed whether
-        // a frame takes 16.7 or 30 ms.
-        static double smoothed = 1000.0 / fps;
-        smoothed += 0.25 * (std::min(ms, 100.0) - smoothed);
-        dsr::SetGameFrameTime(smoothed / 1000.0);
-        step_sum += dsr::GameFrameTime();
+        step_sum += dsr::GameFrameTime();  // set by the game's frame limiter (60 fps mode)
     }
     static bool caller_logged = false;
     if (!caller_logged) {

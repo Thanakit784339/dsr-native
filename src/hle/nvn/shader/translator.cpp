@@ -768,6 +768,42 @@ private:
         Id dref = dc ? GetF(meta++) : 0;
 
         Id image = b_.OpResult(SpvOpLoad, sampled_type, {var});
+        if (dc && dim == TexDim::D2) {
+            // Depth compare (shadow maps): 2x2 percentage-closer filtering done here, from four point-sampled
+            // compares. Hardware does this when a compare sampler filters linearly, but some depth formats
+            // (D32F+S8, which stands in for D24S8) cannot be filtered on some GPUs: point-sampled compares made
+            // blocky shadows. Compare samplers are always point-sampled now, so this is the only filtering.
+            b_.Capability(SpvCapabilityImageQuery);
+            Id img = b_.OpResult(SpvOpImage, shadow_image_type_[slot], {image});
+            Id size_any = b_.OpResult(SpvOpImageQuerySizeLod, array ? t_v3i_ : t_v2i_, {img, b_.ConstInt(0)});
+            Id fsx = b_.OpResult(SpvOpConvertSToF, t_f32_, {b_.OpResult(SpvOpCompositeExtract, t_i32_, {size_any, 0})});
+            Id fsy = b_.OpResult(SpvOpConvertSToF, t_f32_, {b_.OpResult(SpvOpCompositeExtract, t_i32_, {size_any, 1})});
+            Id tx = b_.OpResult(SpvOpFSub, t_f32_, {b_.OpResult(SpvOpFMul, t_f32_, {comps[0], fsx}), b_.ConstFloat(0.5f)});
+            Id ty = b_.OpResult(SpvOpFSub, t_f32_, {b_.OpResult(SpvOpFMul, t_f32_, {comps[1], fsy}), b_.ConstFloat(0.5f)});
+            Id bx = b_.Glsl(t_f32_, G::kFloor, {tx}), by = b_.Glsl(t_f32_, G::kFloor, {ty});
+            Id wx = b_.OpResult(SpvOpFSub, t_f32_, {tx, bx}), wy = b_.OpResult(SpvOpFSub, t_f32_, {ty, by});
+            Id s[4];
+            for (int k = 0; k < 4; k++) {
+                const float dx = (k & 1) ? 1.5f : 0.5f, dy = (k & 2) ? 1.5f : 0.5f;
+                Id cu = b_.OpResult(SpvOpFDiv, t_f32_, {b_.OpResult(SpvOpFAdd, t_f32_, {bx, b_.ConstFloat(dx)}), fsx});
+                Id cv = b_.OpResult(SpvOpFDiv, t_f32_, {b_.OpResult(SpvOpFAdd, t_f32_, {by, b_.ConstFloat(dy)}), fsy});
+                Id ck = layer ? b_.OpResult(SpvOpCompositeConstruct, t_v3f_, {cu, cv, layer})
+                              : b_.OpResult(SpvOpCompositeConstruct, t_v2f_, {cu, cv});
+                std::vector<uint32_t> a = {image, ck, dref, uint32_t(SpvImageOperandsLodMask | offset_operand_mask),
+                                           b_.ConstFloat(0.0f)};
+                if (offset_operand_mask) a.push_back(offset);
+                s[k] = b_.OpResult(SpvOpImageSampleDrefExplicitLod, t_f32_, a);
+            }
+            Id top = b_.Glsl(t_f32_, G::kFMix, {s[0], s[1], wx});
+            Id bottom = b_.Glsl(t_f32_, G::kFMix, {s[2], s[3], wx});
+            Id result = b_.Glsl(t_f32_, G::kFMix, {top, bottom, wy});
+            uint32_t d = dest;
+            for (uint32_t c = 0; c < 4; c++) {
+                if (!(mask >> c & 1)) continue;
+                if (d != 255) SetF(d++, result);
+            }
+            return;
+        }
         const bool implicit = stage_ == Stage::Fragment && (lod_mode == 0 || lod_mode == 2 || lod_mode == 6);
         std::vector<uint32_t> args = {image, coords};
         if (dc) args.push_back(dref);

@@ -22,7 +22,7 @@ public:
     enum GLSLstd450Shim : uint32_t {
         kRound = 1, kRoundEven = 2, kTrunc = 3, kFAbs = 4, kFloor = 8, kCeil = 9, kFract = 10, kSin = 13,
         kCos = 14, kExp2 = 29, kLog2 = 30, kSqrt = 31, kInverseSqrt = 32, kFMin = 37, kUMin = 38, kSMin = 39,
-        kSAbsShim = 5, kFMax = 40, kUMax = 41, kSMax = 42, kFClamp = 43, kUClamp = 44, kSClamp = 45, kFma = 50,
+        kSAbsShim = 5, kFMax = 40, kUMax = 41, kSMax = 42, kFClamp = 43, kUClamp = 44, kSClamp = 45, kFMix = 46, kFma = 50,
     };
 
     Id NewId() { return next_id_++; }
