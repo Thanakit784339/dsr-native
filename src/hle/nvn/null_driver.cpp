@@ -77,6 +77,12 @@ uintptr_t PoolBase(const void* pool) { return reinterpret_cast<uintptr_t>(g_pool
 // ---- device ----------------------------------------------------------------------------------------
 // Returns 0 so getters that fall back to it never hand garbage to the game.
 uint64_t Nop() { return 0; }
+// CPU reads of texture contents: not emulated (GPU-rendered contents never reach game memory this way).
+uint64_t TexReadTexels(const void* tex) {
+    static std::atomic<int> n{0};
+    if (n++ < 4) LOGI(kTag, "nvnTextureReadTexels(%p): not emulated", tex);
+    return 0;
+}
 bool True() { return true; }
 
 bool DeviceInitialize(void* device, const void* builder) {
@@ -662,7 +668,8 @@ const Proc kProcs[] = {
     P("nvnTextureGetTarget", TexGetTarget), P("nvnTextureGetStorageSize", TexGetStorageSize),
     P("nvnTextureGetTextureAddress", TexGetTextureAddress), P("nvnTextureFlushTexels", Nop),
     P("nvnTextureInvalidateTexels", Nop), P("nvnTextureWriteTexels", TexWriteTexels),
-    P("nvnTextureWriteTexelsStrided", TexWriteTexelsStrided), P("nvnTextureReadTexels", Nop),
+    P("nvnTextureWriteTexelsStrided", TexWriteTexelsStrided), P("nvnTextureReadTexels", TexReadTexels),
+    P("nvnTextureReadTexelsStrided", TexReadTexels),
     // pools of descriptors, samplers, programs
     P("nvnTexturePoolInitialize", True), P("nvnTexturePoolFinalize", Nop),  P("nvnSamplerPoolInitialize", True), P("nvnSamplerPoolFinalize", Nop),
    

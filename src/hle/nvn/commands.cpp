@@ -427,6 +427,39 @@ void CopyBufferToTexture(void* cb, uint64_t src, const void* dst, const void* /*
     Append(cb, std::move(c));
 }
 
+// GPU -> memory copies. The game reads results back this way (e.g. the luminance that drives auto exposure:
+// without it the exposure stayed at its default and the picture was too dark).
+void CopyTextureToBuffer(void* cb, const void* src, const void* /*view*/, const CopyRegion* region, uint64_t dst,
+                         int flags) {
+    Cmd c;
+    c.type = CmdType::CopyTextureToBuffer;
+    c.src = MakeTexRef(src);
+    if (region) c.src_region = *region;
+    c.dst_addr = dst;
+    c.flags = flags;
+    c.f[0] = float(g_copy_row_stride.load());
+    c.f[1] = float(g_copy_image_stride.load());
+    Append(cb, std::move(c));
+}
+void CopyBufferToBuffer(void* cb, uint64_t src, uint64_t dst, size_t size, int flags) {
+    Cmd c;
+    c.type = CmdType::CopyBufferToBuffer;
+    c.src_addr = src;
+    c.dst_addr = dst;
+    c.size64 = size;
+    c.flags = flags;
+    Append(cb, std::move(c));
+}
+// Not emulated yet: logged once, so a log shows whether the game uses them.
+void ReportCounter(void*, int counter, uint64_t) {
+    static std::atomic<int> n{0};
+    if (n++ < 4) LOGI(kTag, "nvnCommandBufferReportCounter(counter %d): not emulated", counter);
+}
+void ReportValue(void*, uint32_t value, uint64_t) {
+    static std::atomic<int> n{0};
+    if (n++ < 4) LOGI(kTag, "nvnCommandBufferReportValue(%u): not emulated", value);
+}
+
 // ---- queue ------------------------------------------------------------------------------------------------
 // ---- render thread --------------------------------------------------------------------------------------------
 class GpuQueue {
@@ -639,6 +672,10 @@ const Proc kProcs[] = {
     P("nvnCommandBufferGetCopyRowStride", GetCopyRowStride),
     P("nvnCommandBufferGetCopyImageStride", GetCopyImageStride),
     P("nvnCommandBufferCopyBufferToTexture", CopyBufferToTexture),
+    P("nvnCommandBufferCopyTextureToBuffer", CopyTextureToBuffer),
+    P("nvnCommandBufferCopyBufferToBuffer", CopyBufferToBuffer),
+    P("nvnCommandBufferReportCounter", ReportCounter),
+    P("nvnCommandBufferReportValue", ReportValue),
     P("nvnQueueSubmitCommands", QueueSubmitCommands),
     P("nvnCommandBufferFenceSync", FenceSync), P("nvnQueueFinish", QueueFinish),
     P("nvnSyncInitialize", SyncInitialize), P("nvnSyncFinalize", SyncFinalize), P("nvnSyncWait", SyncWait),

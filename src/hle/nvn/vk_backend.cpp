@@ -367,6 +367,7 @@ public:
         MaybeArmCapture();
         ApplyDirtyMarks();
         if (!watched_copies_.empty()) CheckWatchedCopies();
+        PollReadbacks();
         for (const Cmd& c : cmds) {
             switch (c.type) {
                 case CmdType::SetRenderTargets:
@@ -402,6 +403,13 @@ public:
                     break;
                 }
                 case CmdType::CopyBufferToTexture: CopyBufferToTexture(c); break;
+                case CmdType::CopyTextureToBuffer: CopyTextureToBuffer(c); break;
+                case CmdType::CopyBufferToBuffer:
+                    if (c.size64 && GuestRangeValid(c.src_addr, c.size64) && GuestRangeValid(c.dst_addr, c.size64))
+                        memmove(reinterpret_cast<void*>(c.dst_addr), reinterpret_cast<const void*>(c.src_addr), c.size64);
+                    else
+                        LogOnce("b2b-range", "buffer-to-buffer copy outside known memory");
+                    break;
                 case CmdType::UpdateUniform: {
                     auto data = std::static_pointer_cast<const std::vector<uint8_t>>(c.obj);
                     if (data && GuestRangeValid(c.dst_addr, data->size())) {
@@ -1114,7 +1122,8 @@ private:
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bi.size = kStreamSize + kMaxUniformRange;  // slack: a uniform range may start anywhere in the stream
         bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                   VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                   VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                   VK_BUFFER_USAGE_TRANSFER_DST_BIT;  // destination of texture -> buffer readbacks
         if (vkCreateBuffer(device_, &bi, nullptr, &stream_) != VK_SUCCESS) return false;
         VkMemoryRequirements req;
         vkGetBufferMemoryRequirements(device_, stream_, &req);
@@ -1764,6 +1773,26 @@ private:
         stream_memory_ = slots_[i].mem;
         stream_ptr_ = slots_[i].ptr;
     }
+    // Writes the finished readbacks of a slot to game memory (its fence has signalled).
+    void DeliverReadbacks(Slot& sl) {
+        for (const Readback& rb : sl.readbacks) {
+            const size_t span = rb.dst_image_stride * (rb.depth - 1) + rb.dst_stride * (rb.rows - 1) + rb.row;
+            if (!GuestRangeValid(rb.dst, span)) continue;
+            uint8_t* dst = reinterpret_cast<uint8_t*>(rb.dst);
+            const uint8_t* src = sl.ptr + rb.off;
+            for (size_t z = 0; z < rb.depth; z++)
+                for (size_t y = 0; y < rb.rows; y++)
+                    memcpy(dst + z * rb.dst_image_stride + y * rb.dst_stride, src + (z * rb.rows + y) * rb.row, rb.row);
+            readbacks_done_++;
+        }
+        sl.readbacks.clear();
+    }
+    // Slots whose work has finished deliver their readbacks without waiting (called once per list).
+    void PollReadbacks() {
+        for (Slot& sl : slots_)
+            if (sl.pending && !sl.readbacks.empty() && vkGetFenceStatus(device_, sl.fence) == VK_SUCCESS)
+                DeliverReadbacks(sl);
+    }
     void NextSlot() {
         const int n = (slot_ + 1) % kSlots;
         Slot& sl = slots_[n];
@@ -1771,6 +1800,7 @@ private:
             MsTimer wait_timer(wait_ms_);
             VkResult r = vkWaitForFences(device_, 1, &sl.fence, VK_TRUE, 5000000000ull);
             if (r != VK_SUCCESS) LogOnce("fence", "GPU did not finish within 5 s (%d)", r);
+            DeliverReadbacks(sl);
             vkResetFences(device_, 1, &sl.fence);
             sl.pending = false;
         }
@@ -1784,6 +1814,7 @@ private:
         vkQueueWaitIdle(queue_);
         for (Slot& sl : slots_)
             if (sl.pending) {
+                DeliverReadbacks(sl);
                 vkResetFences(device_, 1, &sl.fence);
                 sl.pending = false;
             }
@@ -1946,6 +1977,69 @@ private:
             CopyBufferToTexture(c, true);
         }
     }
+    uint64_t readbacks_done_ = 0, readbacks_recorded_ = 0;
+    static uint32_t VkTexelBytes(VkFormat f) {
+        switch (f) {
+            case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_UINT: return 1;
+            case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R16_UINT: return 2;
+            case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB:
+            case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16_UNORM:
+            case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_R8G8B8A8_UINT:
+                return 4;
+            case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R32G32_SFLOAT: case VK_FORMAT_R16G16B16A16_UNORM: return 8;
+            case VK_FORMAT_R32G32B32A32_SFLOAT: case VK_FORMAT_R32G32B32A32_UINT: return 16;
+            default: return 0;
+        }
+    }
+    void CopyTextureToBuffer(const Cmd& c) {
+        Image* img = GetImage(c.src, false);
+        if (!img) {
+            LogOnce("t2b-noimg", "texture-to-buffer copy from a texture never rendered or uploaded: skipped");
+            return;
+        }
+        const FormatInfo fi = GetFormatInfo(img->nvn_format);
+        if (IsDepthFormat(img->nvn_format) || fi.block_w != 1 || fi.block_h != 1 ||
+            VkTexelBytes(img->vk_format) != uint32_t(fi.bytes_per_block)) {
+            LogOnce("t2b-format", "texture-to-buffer copy of NVN format %d (Vulkan %d): layouts differ, skipped",
+                    img->nvn_format, int(img->vk_format));
+            return;
+        }
+        const CopyRegion& r = c.src_region;
+        const int w = r.width > 0 ? r.width : img->width, h = r.height > 0 ? r.height : img->height;
+        const int d = std::max(1, r.depth);
+        const size_t row = size_t(w) * size_t(fi.bytes_per_block), rows = size_t(h);
+        const size_t stride = c.f[0] > 0 ? size_t(c.f[0]) : row;
+        const size_t image_stride = c.f[1] > 0 ? size_t(c.f[1]) : stride * rows;
+        const size_t bytes = row * rows * size_t(d);
+        Begin();
+        EndRendering();
+        if (StreamRemaining() < bytes + 1024) Flush();
+        const VkDeviceSize off = StreamAlloc(bytes, 16);
+        if (off == VK_WHOLE_SIZE) return;
+        VkBufferImageCopy region{};
+        region.bufferOffset = off;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, uint32_t(std::max(0, c.src.level)), 0, 1};
+        region.imageOffset = {r.x, r.y, img->type == VK_IMAGE_TYPE_3D ? r.z : 0};
+        region.imageExtent = {uint32_t(w), uint32_t(h), uint32_t(img->type == VK_IMAGE_TYPE_3D ? d : 1)};
+        if (img->type != VK_IMAGE_TYPE_3D) {
+            region.imageSubresource.baseArrayLayer = uint32_t(std::max(0, r.z) + std::max(0, c.src.layer));
+            region.imageSubresource.layerCount = uint32_t(d);
+        }
+        Transition(*img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        vkCmdCopyImageToBuffer(cmd_, img->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stream_, 1, &region);
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0,
+                             nullptr);
+        slots_[slot_].readbacks.push_back({off, c.dst_addr, row, rows, size_t(d), stride, image_stride});
+        readbacks_recorded_++;
+        static int logged = 0;
+        if (logged++ < 6)
+            LOGI(kTag, "texture -> buffer %dx%d at %d,%d (NVN format %d) -> @%llx (row stride %zu)", w, h, r.x, r.y,
+                 img->nvn_format, (unsigned long long)c.dst_addr, stride);
+    }
+
     void CopyBufferToTexture(const Cmd& c, bool rerun = false) {
         Image* img = GetImage(c.dst, false);
         if (!img || IsDepthFormat(img->nvn_format)) return;
@@ -3523,6 +3617,11 @@ private:
             phases += " " + std::string(kPhaseNames[i]) + "=" + std::to_string(int(phase_ms_[i]));
             phase_ms_[i] = 0;
         }
+        if (readbacks_recorded_ || readbacks_done_) {
+            LOGI(kTag, "GPU -> memory copies: %llu recorded, %llu delivered", (unsigned long long)readbacks_recorded_,
+                 (unsigned long long)readbacks_done_);
+            readbacks_recorded_ = readbacks_done_ = 0;
+        }
         LOGI(kTag, "descriptor sets: %llu reused from earlier frames, %zu kept, %llu resets", (unsigned long long)persist_hits_,
              persist_cache_.size(), (unsigned long long)persist_resets_);
         persist_hits_ = 0;
@@ -3646,10 +3745,18 @@ private:
     std::unordered_map<std::vector<uint32_t>, VkPipelineLayout, VecHash> pipeline_layouts_;
     std::unordered_map<std::vector<uint32_t>, VkPipeline, VecHash> pipelines_;
     std::map<std::vector<uint32_t>, VkSampler> samplers_;
+    // A texture -> buffer copy: the GPU copies into the slot's stream; once the slot's work has finished the
+    // rows are written to game memory.
+    struct Readback {
+        VkDeviceSize off;
+        uint64_t dst;
+        size_t row, rows, depth, dst_stride, dst_image_stride;
+    };
     struct Slot {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         bool pending = false;
+        std::vector<Readback> readbacks;
         VkDescriptorPool pool = VK_NULL_HANDLE;
         VkBuffer stream = VK_NULL_HANDLE;
         VkDeviceMemory mem = VK_NULL_HANDLE;

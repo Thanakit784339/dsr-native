@@ -56,6 +56,8 @@ enum class CmdType : uint8_t {
     UpdateUniform,      // dst_addr; obj: std::vector<uint8_t>
     CopyBufferToTexture,// src_addr, dst, dst_region, flags, f[0] = row stride, f[1] = image stride
     FenceSync,          // src_addr: the NVNsync, signalled once the list has executed (handled by the queue)
+    CopyTextureToBuffer,// src, src_region, dst_addr, flags, f[0] = row stride, f[1] = image stride
+    CopyBufferToBuffer, // src_addr, dst_addr, index = size (bytes; see `size64`)
 };
 
 struct BufferRange {  // NVNbufferRange
@@ -97,6 +99,7 @@ struct Cmd {
     // copies / clears of explicit textures
     TexRef src, dst;
     CopyRegion src_region, dst_region;
+    uint64_t size64 = 0;  // CopyBufferToBuffer
 };
 
 using CmdList = std::vector<Cmd>;
