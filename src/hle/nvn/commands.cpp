@@ -156,11 +156,19 @@ uint64_t EndRecording(void* cb) {
 }
 bool IsRecording(const void* cb) { return RecorderOf(const_cast<void*>(cb)).recording; }
 
-// Inline previously recorded command lists (CallCommands / CopyCommands behave the same for us).
+// Previously recorded command lists (CallCommands / CopyCommands behave the same for us) are referenced, not
+// copied: the game calls ~20 lists a frame, and copying their commands (with every shared_ptr in them) cost the
+// game's render thread a large share of its time.
 void CallCommands(void* cb, int n, const uint64_t* handles) {
-    Recorder& r = g_recorders.Get(cb);
+    Recorder& r = RecorderOf(cb);
     for (int i = 0; i < n; i++)
-        if (auto list = FindHandle(handles[i])) r.cmds.insert(r.cmds.end(), list->begin(), list->end());
+        if (auto list = FindHandle(handles[i])) {
+            Cmd c;
+            c.type = CmdType::CallList;
+            c.obj = std::move(list);
+            r.cmds.push_back(std::move(c));
+            r.command_used += kBytesPerCommand;
+        }
 }
 
 // A render target's view picks the mip level and array layer that is rendered into.
@@ -595,8 +603,10 @@ void QueueSubmitCommands(void* /*queue*/, int n, const uint64_t* handles) {
             g_submit_counts[handles[i]]++;
         }
         g_stats.submits++;
-        g_stats.commands += list->size();
-        for (const Cmd& c : *list) {
+        std::vector<const void*> fences;
+        ForEachCmd(*list, [&](const Cmd& c) {
+            g_stats.commands++;
+            if (c.type == CmdType::FenceSync) fences.push_back(reinterpret_cast<const void*>(c.src_addr));
             switch (c.type) {
                 case CmdType::Draw: g_stats.draws++; break;
                 default: break;
@@ -606,10 +616,7 @@ void QueueSubmitCommands(void* /*queue*/, int n, const uint64_t* handles) {
                 case CmdType::CopyTexture: g_stats.copies++; break;
                 case CmdType::SetRenderTargets: g_stats.rt_binds++; break;
             }
-        }
-        std::vector<const void*> fences;
-        for (const Cmd& c : *list)
-            if (c.type == CmdType::FenceSync) fences.push_back(reinterpret_cast<const void*>(c.src_addr));
+        });
         const uint64_t seq = Queue().Enqueue([list] { GetBackend().Execute(*list); });
         if (!fences.empty()) {
             std::lock_guard<std::mutex> lk(g_sync_mutex);

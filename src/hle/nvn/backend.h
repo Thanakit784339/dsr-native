@@ -60,6 +60,7 @@ enum class CmdType : uint8_t {
     CopyTextureToBuffer,// src, src_region, dst_addr, flags, f[0] = row stride, f[1] = image stride
     CopyBufferToBuffer, // src_addr, dst_addr, index = size (bytes; see `size64`)
     Report,             // dst_addr; index 0: value (`mask` = the value), 1: counter (`mask` = NVNcounterType)
+    CallList,           // obj: const CmdList, executed in place (nvnCommandBufferCallCommands / CopyCommands)
 };
 
 struct BufferRange {  // NVNbufferRange
@@ -105,6 +106,17 @@ struct Cmd {
 };
 
 using CmdList = std::vector<Cmd>;
+// Calls `f` for every command of `list`, descending into CallList commands (nesting is shallow in practice).
+template <typename F>
+void ForEachCmd(const CmdList& list, F&& f, int depth = 0) {
+    for (const Cmd& c : list) {
+        if (c.type == CmdType::CallList) {
+            if (c.obj && depth < 8) ForEachCmd(*static_cast<const CmdList*>(c.obj.get()), f, depth + 1);
+        } else {
+            f(c);
+        }
+    }
+}
 
 class Backend {
 public:

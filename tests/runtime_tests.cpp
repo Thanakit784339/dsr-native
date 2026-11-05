@@ -308,7 +308,10 @@ static void TestNvnCommands() {
         CHECK(l.size() == 4 && l[1].type == CmdType::ClearColor && got[0] == 1.0f && got[1] == 0.0f && l[1].mask == 0xF);
         CHECK(l.size() == 4 && l[2].type == CmdType::ClearDepthStencil && l[2].depth == 1.0f && l[2].depth_mask);
         CHECK(l.size() == 4 && l[3].type == CmdType::Draw);
-        CHECK(be.executed[1].size() == 4);  // inlined copy
+        // The second list calls the first (referenced, not copied): the same four commands.
+        size_t called = 0;
+        dsr::hle::nvn::ForEachCmd(be.executed[1], [&](const dsr::hle::nvn::Cmd&) { called++; });
+        CHECK(be.executed[1].size() == 1 && be.executed[1][0].type == CmdType::CallList && called == 4);
     }
 
     // Presenting window texture 0 resolves to the color texture.

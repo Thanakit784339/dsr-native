@@ -383,18 +383,13 @@ public:
         ~MsTimer() { total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
     };
 
-    void Execute(const CmdList& cmds) override {
-        std::lock_guard<std::mutex> lk(m_);
-        MsTimer timer(exec_ms_);
-        if (!EnsureDevice()) return;
-        ResetTransient();
-        list_counter_++;
-        MaybeArmCapture();
-        ApplyDirtyMarks();
-        if (!watched_copies_.empty()) CheckWatchedCopies();
-        PollReadbacks();
+    // The commands of a list, in order; called lists (CallList) are executed in place.
+    void ExecuteCommands(const CmdList& cmds, int depth) {
         for (const Cmd& c : cmds) {
             switch (c.type) {
+                case CmdType::CallList:
+                    if (c.obj && depth < 8) ExecuteCommands(*static_cast<const CmdList*>(c.obj.get()), depth + 1);
+                    break;
                 case CmdType::SetRenderTargets:
                     if (capture_active_) CaptureEndOfPass();
                     st_.num_rt = c.num_rt;
@@ -545,6 +540,19 @@ public:
                 case CmdType::FenceSync: break;  // signalled by the queue once the list has run
             }
         }
+    }
+
+    void Execute(const CmdList& cmds) override {
+        std::lock_guard<std::mutex> lk(m_);
+        MsTimer timer(exec_ms_);
+        if (!EnsureDevice()) return;
+        ResetTransient();
+        list_counter_++;
+        MaybeArmCapture();
+        ApplyDirtyMarks();
+        if (!watched_copies_.empty()) CheckWatchedCopies();
+        PollReadbacks();
+        ExecuteCommands(cmds, 0);
         if (capture_active_) CaptureEndOfPass();
         if (recording_) WriteBackSmallTargets();
         if (recording_) {
@@ -2277,7 +2285,8 @@ private:
         return {st_.rts[idx].layer, st_.rts[idx].level};
     }
     bool EnsureRendering(const std::vector<Image*>& colors, Image* depth, VkExtent2D* extent) {
-        std::vector<uint64_t> key;
+        std::vector<uint64_t>& key = scratch_rendering_key_;
+        key.clear();
         for (size_t i = 0; i < colors.size(); i++) {
             key.push_back(reinterpret_cast<uint64_t>(colors[i] ? colors[i]->image : VK_NULL_HANDLE));
             key.push_back(uint64_t(RtSub(i).first) << 32 | uint32_t(RtSub(i).second));
@@ -2563,6 +2572,24 @@ private:
         ~PhaseEnd() { self->Phase(6); }
     };
 
+    // Per-draw scratch storage (reused, so a draw allocates nothing). Draw only re-enters itself as
+    // `return Draw(p)`, after which the outer call uses none of these.
+    struct TexWrite {
+        uint32_t set, binding;
+        VkDescriptorImageInfo info;
+    };
+    struct UboWrite {
+        uint32_t set, binding;
+        VkDescriptorBufferInfo info;
+        bool dynamic;
+        uint32_t dyn_offset;
+    };
+    std::vector<TexWrite> scratch_tex_writes_;
+    std::vector<UboWrite> scratch_ubo_writes_;
+    std::vector<Image*> scratch_colors_;
+    std::vector<VkFormat> scratch_color_formats_;
+    std::vector<uint64_t> scratch_rendering_key_;
+
     void Draw(const DrawParams& p) {
         phase_timing_ = (drawn_ & 7) == 0;
         Phase(-1);
@@ -2613,7 +2640,8 @@ private:
 
         Phase(0);
         // ---- render targets ----------------------------------------------------------------------------------
-        std::vector<Image*> colors(size_t(std::max(0, st_.num_rt)), nullptr);
+        std::vector<Image*>& colors = scratch_colors_;
+        colors.assign(size_t(std::max(0, st_.num_rt)), nullptr);
         for (int i = 0; i < st_.num_rt; i++) {
             Image* img = GetImage(st_.rts[size_t(i)], false);
             if (img && (img->features & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) && !IsDepthFormat(img->nvn_format))
@@ -2628,11 +2656,8 @@ private:
 
         Phase(1);
         // ---- textures (uploads and layout changes happen outside rendering) ---------------------------------
-        struct TexWrite {
-            uint32_t set, binding;
-            VkDescriptorImageInfo info;
-        };
-        std::vector<TexWrite> tex_writes;
+        std::vector<TexWrite>& tex_writes = scratch_tex_writes_;  // members: no allocation per draw
+        tex_writes.clear();
         for (int stage = 0; stage < 2; stage++) {
             const shader::ShaderInfo& info = stage == 0 ? vs->info : fs->info;
             for (uint32_t slot = 0; slot < 32; slot++) {
@@ -2752,14 +2777,9 @@ private:
         }
         Phase(2);
         // ---- uniform data ------------------------------------------------------------------------------------
-        struct UboWrite {
-            uint32_t set, binding;
-            VkDescriptorBufferInfo info;
-            bool dynamic;
-            uint32_t dyn_offset;
-        };
         const bool dyn_stage[2] = {DynamicUniforms(vs->info), DynamicUniforms(fs->info)};
-        std::vector<UboWrite> ubo_writes;
+        std::vector<UboWrite>& ubo_writes = scratch_ubo_writes_;
+        ubo_writes.clear();
         const VkDeviceSize ubo_align = std::max<VkDeviceSize>(16, props_.limits.minUniformBufferOffsetAlignment);
         for (int stage = 0; stage < 2; stage++) {
             const shader::ShaderInfo& info = stage == 0 ? vs->info : fs->info;
@@ -3015,7 +3035,8 @@ private:
         // ---- pipeline ----------------------------------------------------------------------------------------
         VkExtent2D extent;
         // Formats the pipeline renders to (dynamic rendering).
-        std::vector<VkFormat> color_formats;
+        std::vector<VkFormat>& color_formats = scratch_color_formats_;
+        color_formats.clear();
         for (size_t i = 0; i < colors.size(); i++) {
             Image* c = colors[i];
             VkFormat f = c ? c->vk_format : VK_FORMAT_UNDEFINED;
@@ -3638,8 +3659,10 @@ private:
         uint64_t hash;
         VkDeviceSize off;
         uint32_t changes;  // content changes seen; from 2 on the range is streamed instead (volatile)
-        uint64_t next_check_list;  // unchanged ranges are re-hashed less and less often (up to every 8 lists)
+        uint64_t next_check_list;  // unused (checks every list)
         uint32_t interval;
+        uint64_t checked_list = 0;  // content verified in this list already: memory a list draws from cannot change
+                                    // while the list runs, so later draws of the same range skip the hash
     };
     std::unordered_map<uint64_t, GeoEntry> geo_;
     uint64_t geo_hits_ = 0, geo_misses_ = 0, geo_bytes_ = 0, geo_resets_ = 0, geo_volatile_ = 0;
@@ -3718,11 +3741,16 @@ private:
             geo_volatile_++;
             return VK_WHOLE_SIZE;  // rewritten every frame or so: streamed with the list
         }
+        if (it != geo_.end() && it->second.checked_list == list_counter_) {
+            geo_hits_++;
+            return it->second.off;
+        }
         // Checked every list: skipping checks for ranges that had been stable showed other geometry (memory the
         // game reused for another mesh of the same size) for a few frames: flickering textures.
         const uint64_t h = GeoHash(src, size);
         if (it != geo_.end() && it->second.hash == h) {
             geo_hits_++;
+            it->second.checked_list = list_counter_;
             it->second.interval = std::min<uint32_t>(it->second.interval * 2, 8);
             it->second.next_check_list = list_counter_ + it->second.interval;
             return it->second.off;
@@ -3750,7 +3778,7 @@ private:
         geo_misses_++;
         geo_bytes_ += size;
         // A changed range gets new space (the old copy may still be read by frames in flight).
-        geo_[key] = {h, off, changes, list_counter_ + 1, 1};
+        geo_[key] = {h, off, changes, list_counter_ + 1, 1, list_counter_};
         return off;
     }
 
