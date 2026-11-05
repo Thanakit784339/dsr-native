@@ -365,6 +365,7 @@ public:
         ResetTransient();
         list_counter_++;
         MaybeArmCapture();
+        ApplyDirtyMarks();
         for (const Cmd& c : cmds) {
             switch (c.type) {
                 case CmdType::SetRenderTargets:
@@ -535,20 +536,32 @@ public:
     uint64_t frames_set_ = 0, frames_uploaded_ = 0;  // statistics (frames_set_ under frames_mutex_)
 
     // Textures the CPU wrote through NVN (nvnTextureWriteTexels): checked at their next use. Thread-safe.
+    // Addresses queued by any thread; the render thread applies them at the start of each list (the images
+    // there are checked at their next use; addresses with no image yet need nothing: they upload when used).
     std::mutex dirty_mutex_;
-    std::unordered_set<uint64_t> dirty_addrs_;
-    std::atomic<int> dirty_count_{0};
+    std::vector<uint64_t> dirty_queue_;
+    std::atomic<bool> dirty_pending_{false};
     static constexpr uint32_t kMaxCheckInterval = 16;
     void MarkTextureDirty(uint64_t addr) override {
         std::lock_guard<std::mutex> lk(dirty_mutex_);
-        if (dirty_addrs_.insert(addr).second) dirty_count_++;
+        dirty_queue_.push_back(addr);
+        dirty_pending_.store(true, std::memory_order_release);
     }
-    bool TakeDirty(uint64_t addr) {
-        if (dirty_count_.load(std::memory_order_relaxed) == 0) return false;
-        std::lock_guard<std::mutex> lk(dirty_mutex_);
-        if (!dirty_addrs_.erase(addr)) return false;
-        dirty_count_--;
-        return true;
+    void ApplyDirtyMarks() {
+        if (!dirty_pending_.load(std::memory_order_acquire)) return;
+        std::vector<uint64_t> q;
+        {
+            std::lock_guard<std::mutex> lk(dirty_mutex_);
+            q.swap(dirty_queue_);
+            dirty_pending_.store(false, std::memory_order_relaxed);
+        }
+        for (uint64_t a : q) {
+            auto it = images_.find(a);
+            if (it == images_.end()) continue;
+            it->second.next_check_list = 0;
+            it->second.check_interval = 1;
+            it->second.checked_in_list = 0;
+        }
     }
 
     void SetTextureFrame(uint64_t addr, std::shared_ptr<const std::vector<uint8_t>> rgba, int w, int h) override {
@@ -683,7 +696,9 @@ public:
             LOGI(kTag, "capture pass %u state: %s", capture_pass_, pass_state_desc_.c_str());
         pass_state_desc_.clear();
         if (!pass_written_.empty() && !pass_ubo_desc_.empty())
-            LOGI(kTag, "capture pass %u fragment constants:%s", capture_pass_, pass_ubo_desc_.c_str());
+            for (size_t at = 0; at < pass_ubo_desc_.size(); at += 2800)
+                LOGI(kTag, "capture pass %u constants%s:%s", capture_pass_, at ? " (cont.)" : "",
+                     pass_ubo_desc_.substr(at, 2800).c_str());
         pass_ubo_desc_.clear();
         for (Image* img : pass_written_) CaptureImage(*img);
         pass_written_.clear();
@@ -1068,6 +1083,7 @@ private:
             VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
             vkCreateFence(device_, &fci, nullptr, &sl.fence);
             if (!CreateStream() || !CreateDescriptorPool()) return false;
+            if (!persist_pool_) CreatePersistentPool();
             sl.stream = stream_;
             sl.mem = stream_memory_;
             sl.ptr = stream_ptr_;
@@ -1172,6 +1188,18 @@ private:
         }
     }
 
+    bool CreatePersistentPool() {
+        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768},
+                                        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 65536},
+                                        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2048},
+                                        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 65536}};
+        VkDescriptorPoolCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        ci.maxSets = 16384;
+        ci.poolSizeCount = 4;
+        ci.pPoolSizes = sizes;
+        if (vkCreateDescriptorPool(device_, &ci, nullptr, &persist_pool_) != VK_SUCCESS) persist_pool_ = VK_NULL_HANDLE;
+        return true;
+    }
     bool CreateDescriptorPool() {
         LOGI(kTag, "uniform buffers: up to %u with dynamic offsets per pipeline layout, alignment %llu, range %u",
              props_.limits.maxDescriptorSetUniformBuffersDynamic,
@@ -1363,7 +1391,7 @@ private:
         if (upload && !img->written && !img->uploaded) {
             Upload(*img, t);
         } else if (upload && img->cpu_source && img->checked_in_list != list_counter_ &&
-                   (list_counter_ >= img->next_check_list || TakeDirty(t.addr) ||
+                   (list_counter_ >= img->next_check_list ||
                     size_t(img->width) * img->height <= 4096)) {  // small (lookup tables): every list
             // Most game textures never change after loading; hashing every one every frame cost ~15 ms a
             // frame (a 1 MB texture is thousands of cache misses). So checks back off while nothing changes.
@@ -1454,7 +1482,17 @@ private:
         return &(images_[t.addr] = img);
     }
 
+    void ResetPersistentSets() {
+        if (!persist_pool_) return;
+        vkResetDescriptorPool(device_, persist_pool_, 0);
+        persist_cache_.clear();
+        desc_cache_.clear();  // may hold sets from the persistent pool
+        InvalidateBoundState();
+        persist_resets_++;
+    }
     void DestroyImage(Image& img) {
+        // Called with the GPU idle: sets that may reference this image's views are dropped with it.
+        ResetPersistentSets();
         for (auto& [k, v] : img.views) vkDestroyImageView(device_, v, nullptr);
         if (img.image) vkDestroyImage(device_, img.image, nullptr);
         if (img.memory) vkFreeMemory(device_, img.memory, nullptr);
@@ -2450,15 +2488,15 @@ private:
                 } else {
                     ubo_writes.push_back({uint32_t(stage), n, bi, false, 0});
                 }
-                if (capture_active_ && stage == 1 && src && size && n >= kCbufBase) {
+                if (capture_active_ && src && size && n >= kCbufBase) {
                     if (ubo_desc_draw_ != drawn_) {
                         pass_ubo_desc_.clear();
                         ubo_desc_draw_ = drawn_;
                     }
                     char d[64];
-                    snprintf(d, sizeof(d), " c%u(%zu B):", n, size);
+                    snprintf(d, sizeof(d), " %s c%u(%zu B):", stage ? "fs" : "vs", n, size);
                     pass_ubo_desc_ += d;
-                    const size_t nf = std::min<size_t>(size / 4, 32);
+                    const size_t nf = std::min<size_t>(size / 4, 512);  // all of it (brightness hunt)
                     for (size_t k = 0; k < nf; k++) {
                         float f;
                         memcpy(&f, src + k * 4, 4);
@@ -2682,7 +2720,16 @@ private:
             dk.Add(t.info.imageLayout);
         }
         auto cached_sets = desc_cache_.find(dk.h);
-        const bool reuse = cached_sets != desc_cache_.end();
+        bool reuse = cached_sets != desc_cache_.end();
+        if (!reuse) {
+            auto ps = persist_cache_.find(dk.h);
+            if (ps != persist_cache_.end()) {
+                desc_cache_[dk.h] = ps->second;
+                cached_sets = desc_cache_.find(dk.h);
+                reuse = true;
+                persist_hits_++;
+            }
+        }
         if (reuse) {
             sets[0] = cached_sets->second.first;
             sets[1] = cached_sets->second.second;
@@ -2692,7 +2739,25 @@ private:
         dai.descriptorPool = desc_pool_;
         dai.descriptorSetCount = 2;
         dai.pSetLayouts = layouts;
-        if (!reuse && vkAllocateDescriptorSets(device_, &dai, sets) != VK_SUCCESS) {
+        bool persistent = false;
+        // Only sets whose uniform buffers all take dynamic offsets can outlive the list: a fixed offset points
+        // at this list's data in the stream, which a later list overwrites.
+        bool persistable = true;
+        for (const UboWrite& u : ubo_writes) persistable &= u.dynamic;
+        if (!reuse && persist_pool_ && persistable) {
+            VkDescriptorSetAllocateInfo pai = dai;
+            pai.descriptorPool = persist_pool_;
+            if (vkAllocateDescriptorSets(device_, &pai, sets) == VK_SUCCESS) {
+                persistent = true;
+            } else if (persist_cache_.size() > 64) {
+                // Full: empty it once the GPU no longer uses any of it, then redo this draw.
+                Flush();
+                WaitGpuIdle();
+                ResetPersistentSets();
+                return Draw(p);
+            }
+        }
+        if (!reuse && !persistent && vkAllocateDescriptorSets(device_, &dai, sets) != VK_SUCCESS) {
             // Pool exhausted: everything recorded so far must run first. Retry this draw from the top.
             Flush();
             if (vkAllocateDescriptorSets(device_, &dai, sets) != VK_SUCCESS) return Skip("descriptor allocation failed");
@@ -2720,6 +2785,7 @@ private:
         if (!reuse) {
             if (!writes.empty()) vkUpdateDescriptorSets(device_, uint32_t(writes.size()), writes.data(), 0, nullptr);
             desc_cache_[dk.h] = {sets[0], sets[1]};
+            if (persistent) persist_cache_[dk.h] = {sets[0], sets[1]};
         }
 
         // ---- record --------------------------------------------------------------------------------------------
@@ -3217,17 +3283,27 @@ private:
         return false;
     }
     static uint64_t GeoHash(const uint8_t* p, size_t n) {
-        auto mix = [](uint64_t h, uint64_t v) { return (h ^ v) * 0x9E3779B97F4A7C15ull; };
+        constexpr uint64_t K = 0x9E3779B97F4A7C15ull;
+        auto mix = [](uint64_t h, uint64_t v) { return (h ^ v) * K; };
         uint64_t h = 0xcbf29ce484222325ull ^ n;
         uint64_t v;
-        if (n <= 16384) {  // small: the whole range
+        if (n <= 16384) {  // small: the whole range, four independent lanes (a single chain is latency bound)
+            uint64_t a = h, b = h + 1, c = h + 2, d = h + 3;
             size_t i = 0;
+            for (; i + 32 <= n; i += 32) {
+                uint64_t w[4];
+                memcpy(w, p + i, 32);
+                a = (a ^ w[0]) * K;
+                b = (b ^ w[1]) * K;
+                c = (c ^ w[2]) * K;
+                d = (d ^ w[3]) * K;
+            }
             for (; i + 8 <= n; i += 8) {
                 memcpy(&v, p + i, 8);
-                h = mix(h, v);
+                a = mix(a, v);
             }
-            for (; i < n; i++) h = mix(h, p[i]);
-            return h;
+            for (; i < n; i++) b = mix(b, p[i]);
+            return mix(mix(mix(a, b >> 1 | b << 63), c >> 2 | c << 62), d >> 3 | d << 61);
         }
         for (size_t i = 0; i < 64; i += 8) {  // both ends
             memcpy(&v, p + i, 8);
@@ -3388,6 +3464,9 @@ private:
             phases += " " + std::string(kPhaseNames[i]) + "=" + std::to_string(int(phase_ms_[i]));
             phase_ms_[i] = 0;
         }
+        LOGI(kTag, "descriptor sets: %llu reused from earlier frames, %zu kept, %llu resets", (unsigned long long)persist_hits_,
+             persist_cache_.size(), (unsigned long long)persist_resets_);
+        persist_hits_ = 0;
         LOGI(kTag, "draw time by phase (ms):%s | %d pipelines compiled in %.0f ms (%llu draws waited for one) | %llu fast-path draws | %llu descriptor sets reused",
              phases.c_str(), new_pipelines_, compile_ms_, (unsigned long long)pipeline_waits_,
              (unsigned long long)fast_draws_, (unsigned long long)desc_reused_);
@@ -3529,6 +3608,11 @@ private:
     VkDescriptorSetLayout last_pl_vs_ = VK_NULL_HANDLE, last_pl_fs_ = VK_NULL_HANDLE;
     VkPipelineLayout last_pl_ = VK_NULL_HANDLE;
     std::unordered_map<uint64_t, std::pair<VkDescriptorSet, VkDescriptorSet>> desc_cache_;
+    // Descriptor sets kept across lists (most draws bind the same textures frame after frame): their own pool,
+    // emptied when an image is destroyed (the GPU is idle then) or when it is full.
+    VkDescriptorPool persist_pool_ = VK_NULL_HANDLE;
+    std::unordered_map<uint64_t, std::pair<VkDescriptorSet, VkDescriptorSet>> persist_cache_;
+    uint64_t persist_hits_ = 0, persist_resets_ = 0;
     uint64_t desc_reused_ = 0;
     VkPipeline bound_pipeline_ = VK_NULL_HANDLE;
     // Last recorded dynamic state, vertex/index bindings and push constants (skipped when unchanged).

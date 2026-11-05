@@ -350,6 +350,9 @@ bool TexInitialize(void* tex, const void* b) {
     }
     t.packaged_data = nullptr;
     g_textures.Get(tex) = t;
+    // A new texture at this storage (the game reuses texture memory as it streams textures in): check the
+    // memory at the texture's next use.
+    if (t.pool) GetBackend().MarkTextureDirty(PoolBase(t.pool) + uint64_t(t.offset));
     if (t.pool) {
         std::lock_guard<std::mutex> lk(g_tex_addr_mutex);
         g_tex_by_addr[PoolBase(t.pool) + uint64_t(t.offset)] = t;

@@ -10,6 +10,7 @@
 
 #include "common/log.h"
 #include "hle/nvn.h"
+#include "hle/nvn/backend.h"
 
 namespace dsr::hle::nvn {
 namespace {
@@ -201,8 +202,17 @@ void TexturePoolRegisterTexture(void* pool, int id, const void* texture, const v
             r.view_layers = v.num_layers;
         }
     }
-    std::lock_guard<std::mutex> lk(g_pool_mutex);
-    g_texture_ids[id] = r;
+    bool changed;
+    {
+        std::lock_guard<std::mutex> lk(g_pool_mutex);
+        auto it = g_texture_ids.find(id);
+        changed = it == g_texture_ids.end() || it->second.addr != r.addr || it->second.tex.format != r.tex.format ||
+                  it->second.tex.width != r.tex.width || it->second.tex.height != r.tex.height;
+        g_texture_ids[id] = r;
+    }
+    // A texture (re)registered under this id: its memory may hold a newly streamed-in texture (the game reuses
+    // texture memory). Check it at its next use instead of waiting for the next scheduled check.
+    if (changed && r.valid) GetBackend().MarkTextureDirty(r.addr);
 }
 void TexturePoolRegisterImage(void* pool, int id, const void* texture, const void* view) {
     TexRef r = MakeTexRef(texture);
