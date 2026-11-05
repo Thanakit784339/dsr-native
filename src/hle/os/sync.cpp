@@ -313,6 +313,11 @@ HLE_FUNC(_ZN2nn2os10ClearEventEPNS0_9EventTypeE, void, nn_os_ClearEvent, (void* 
     v.signaled() = false;
     CritSec::Unlock(v.cs());
 }
+namespace dsr::hle::os {
+void ClearGuestEvent(void* e) {
+    if (e) nn_os_ClearEvent(e);
+}
+}  // namespace dsr::hle::os
 
 // ===== Semaphore =================================================================================
 HLE_FUNC(_ZN2nn2os19InitializeSemaphoreEPNS0_13SemaphoreTypeEii, void, nn_os_InitializeSemaphore,

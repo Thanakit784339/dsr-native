@@ -150,12 +150,13 @@ void CopyToBuffer(const void* self, const uint8_t* src, size_t n) {
 // would corrupt both).
 std::mutex g_input_mutex;
 std::unordered_map<const uint8_t*, int> g_input_kind;  // input buffer -> 1 video, 2 audio
-uint64_t g_inputs_checked = 0, g_inputs_mismatched = 0, g_reads_failed = 0;
+uint64_t g_inputs_checked = 0, g_inputs_mismatched = 0, g_reads_failed = 0, g_reads_kept = 0;
 
 // ===== Extractor ==========================================================================================
 struct Extractor {
     int fd = -1;
     std::vector<int> track_kind;  // 1 video, 2 audio, 0 other
+    bool keep_sample = false;     // last Read had no buffer: the following Advance must not skip the sample
 #if defined(__ANDROID__)
     AMediaExtractor* ex = nullptr;
 #endif
@@ -279,6 +280,13 @@ int ExRead(void* self, void* buffer) {
     BufferState& b = Buf(buffer);
     if (!e->ex) return kFail;
     const int track = AMediaExtractor_getSampleTrackIndex(e->ex);
+    if (!b.data || b.capacity == 0) {
+        // No input buffer behind it: keep the sample (the game advances regardless) so it is read again.
+        e->keep_sample = true;
+        std::lock_guard<std::mutex> lk(g_input_mutex);
+        g_reads_kept++;
+        return kFail;
+    }
     ssize_t n = AMediaExtractor_readSampleData(e->ex, b.data, b.capacity);
     if (n < 0) {
         std::lock_guard<std::mutex> lk(g_input_mutex);
@@ -301,6 +309,10 @@ int ExRead(void* self, void* buffer) {
 int ExAdvance(void* self) {
 #if defined(__ANDROID__)
     Extractor* e = Ex(self);
+    if (e->keep_sample) {
+        e->keep_sample = false;
+        return kOk;
+    }
     return e->ex && AMediaExtractor_advance(e->ex) ? kOk : kEndOfStream;
 #else
     return kEndOfStream;
@@ -364,6 +376,7 @@ struct Decoder {
     std::deque<OutputItem> outputs;
     std::unordered_map<int, OutputItem> held;  // output buffers handed to the game
     uint64_t produced = 0, acquired = 0, released = 0, polls_empty = 0;  // statistics (logged)
+    uint64_t inputs_missing = 0;  // input index asked for while none was free
     int64_t last_pts = 0;
     // Decoded picture geometry (from the codec's output format).
     int width = 0, height = 0, stride = 0, slice_height = 0, crop_left = 0, crop_top = 0;
@@ -386,10 +399,10 @@ Decoder* Dec(void* self) { return ImplOf<Decoder>(self); }
 #if defined(__ANDROID__)
 void OnInput(AMediaCodec*, void* ud, int32_t index) {
     auto* d = static_cast<Decoder*>(ud);
-    {
-        std::lock_guard<std::mutex> lk(d->m);
-        d->inputs.push_back(index);
-    }
+    // Signalled under the lock, so the event is set exactly while free input buffers are queued (see
+    // DecAcquireInputBufferIndex).
+    std::lock_guard<std::mutex> lk(d->m);
+    d->inputs.push_back(index);
     dsr::hle::os::SignalGuestEvent(d->events.input_available);
 }
 void OnOutput(AMediaCodec*, void* ud, int32_t index, AMediaCodecBufferInfo* info) {
@@ -600,6 +613,7 @@ int DecAcquireInputBufferIndex(void* self, int* index, int* remaining) {
     Decoder* d = Dec(self);
     std::lock_guard<std::mutex> lk(d->m);
     if (d->inputs.empty()) {
+        d->inputs_missing++;
         *index = -1;
         *remaining = 0;
         return kFail;
@@ -607,6 +621,9 @@ int DecAcquireInputBufferIndex(void* self, int* index, int* remaining) {
     *index = d->inputs.front();
     d->inputs.pop_front();
     *remaining = int(d->inputs.size());
+    // The game keeps whatever index this returns, even -1 on failure, and then reads (and skips) the next
+    // sample into that non-buffer. So the input event must not stay set once no buffer is free.
+    if (d->inputs.empty()) dsr::hle::os::ClearGuestEvent(d->events.input_available);
     return kOk;
 }
 int DecGetInputBuffer(void* self, int index, void* buffer) {
@@ -659,9 +676,11 @@ int DecAcquireOutputBufferIndex(void* self, int* index, int64_t* time_us, uint32
              (unsigned long long)d->polls_empty, d->last_pts / 1e6);
         std::lock_guard<std::mutex> lk2(g_input_mutex);
         if (d->type == 1)
-            LOGI(kTag, "decoder inputs: %llu checked, %llu given to the wrong decoder, %llu reads failed",
+            LOGI(kTag, "decoder inputs: %llu checked, %llu given to the wrong decoder, %llu reads failed, "
+                 "%llu reads without a buffer (sample kept), %llu index requests with none free",
                  (unsigned long long)g_inputs_checked, (unsigned long long)g_inputs_mismatched,
-                 (unsigned long long)g_reads_failed);
+                 (unsigned long long)g_reads_failed, (unsigned long long)g_reads_kept,
+                 (unsigned long long)d->inputs_missing);
     }
     if (d->outputs.empty()) {
         d->polls_empty++;
