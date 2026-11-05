@@ -552,6 +552,7 @@ public:
         ApplyDirtyMarks();
         if (!watched_copies_.empty()) CheckWatchedCopies();
         PollReadbacks();
+        StartPrehash();
         ExecuteCommands(cmds, 0);
         if (capture_active_) CaptureEndOfPass();
         if (recording_) WriteBackSmallTargets();
@@ -1139,6 +1140,12 @@ private:
             vkAllocateCommandBuffers(device_, &cai, &sl.cmd);
             VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
             vkCreateFence(device_, &fci, nullptr, &sl.fence);
+            if (props_.limits.timestampComputeAndGraphics) {
+                VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+                qi.queryCount = 2;
+                if (vkCreateQueryPool(device_, &qi, nullptr, &sl.ts) != VK_SUCCESS) sl.ts = VK_NULL_HANDLE;
+            }
             if (!CreateStream() || !CreateDescriptorPool()) return false;
             if (!persist_pool_) CreatePersistentPool();
             sl.stream = stream_;
@@ -1820,11 +1827,29 @@ private:
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(cmd_, &bi);
+        if (VkQueryPool ts = slots_[slot_].ts) {
+            vkCmdResetQueryPool(cmd_, ts, 0, 2);
+            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ts, 0);
+        }
+    }
+    struct Slot;
+    // GPU time of a finished submission (its fence has signalled), added to the 10 s statistics.
+    double gpu_busy_ms_ = 0;
+    void CollectGpuTime(Slot& sl) {
+        if (!sl.ts || !sl.ts_written) return;
+        sl.ts_written = false;
+        uint64_t t[2];
+        if (vkGetQueryPoolResults(device_, sl.ts, 0, 2, sizeof(t), t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
+            gpu_busy_ms_ += double(t[1] - t[0]) * props_.limits.timestampPeriod / 1e6;
     }
 
     // Submits the current slot's commands and moves to the other slot. The CPU waits only if that slot's
     // previous submission is still running (so CPU recording and GPU execution overlap by one submission).
     void SubmitAndWait(VkSemaphore wait, VkSemaphore signal) {
+        if (VkQueryPool ts = slots_[slot_].ts) {
+            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts, 1);
+            slots_[slot_].ts_written = true;
+        }
         vkEndCommandBuffer(cmd_);
         VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -1856,7 +1881,6 @@ private:
         stream_memory_ = slots_[i].mem;
         stream_ptr_ = slots_[i].ptr;
     }
-    struct Slot;  // defined with the other members below
     // Writes the finished readbacks of a slot to game memory (its fence has signalled).
     void DeliverReadbacks(Slot& sl) {
         for (const Readback& rb : sl.readbacks) {
@@ -1920,6 +1944,7 @@ private:
             VkResult r = vkWaitForFences(device_, 1, &sl.fence, VK_TRUE, 5000000000ull);
             if (r != VK_SUCCESS) LogOnce("fence", "GPU did not finish within 5 s (%d)", r);
             DeliverReadbacks(sl);
+            CollectGpuTime(sl);
             vkResetFences(device_, 1, &sl.fence);
             sl.pending = false;
         }
@@ -1934,6 +1959,7 @@ private:
         for (Slot& sl : slots_)
             if (sl.pending) {
                 DeliverReadbacks(sl);
+                CollectGpuTime(sl);
                 vkResetFences(device_, 1, &sl.fence);
                 sl.pending = false;
             }
@@ -3674,7 +3700,90 @@ private:
         uint32_t interval;
         uint64_t checked_list = 0;  // content verified in this list already: memory a list draws from cannot change
                                     // while the list runs, so later draws of the same range skip the hash
+        const uint8_t* src = nullptr;  // the range (for hashing ahead)
+        size_t size = 0;
     };
+    // Hashing ahead: at the start of a list, the ranges the previous list used (almost all of them are used
+    // again) are hashed on worker threads while the render thread works; GeoCached takes a finished result
+    // instead of hashing on the render thread (content hashing was ~15% of the render thread).
+    struct PrehashJob {
+        uint64_t key;
+        const uint8_t* src;
+        size_t size;
+        uint64_t hash;
+        std::atomic<bool> done{false};
+    };
+    std::unique_ptr<PrehashJob[]> prehash_jobs_;
+    size_t prehash_capacity_ = 0;
+    std::atomic<size_t> prehash_count_{0};
+    std::unordered_map<uint64_t, size_t> prehash_index_;
+    std::atomic<size_t> prehash_next_{0};
+    std::atomic<int> prehash_active_{0};  // workers inside the job loop
+    uint64_t prehash_generation_ = 0;     // under prehash_mutex_
+    std::mutex prehash_mutex_;
+    std::condition_variable prehash_cv_;
+    bool prehash_started_ = false;
+    std::vector<uint64_t> geo_used_prev_, geo_used_now_;
+    uint64_t prehash_used_ = 0, prehash_inline_ = 0, stat_lists_ = 0;
+    static constexpr size_t kNoMoreJobs = SIZE_MAX / 2;
+    void PrehashWorker() {
+        uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(prehash_mutex_);
+                prehash_cv_.wait(lk, [&] { return prehash_generation_ != seen; });
+                seen = prehash_generation_;
+            }
+            prehash_active_.fetch_add(1);
+            for (;;) {
+                const size_t i = prehash_next_.fetch_add(1);
+                if (i >= prehash_count_.load()) break;
+                PrehashJob& j = prehash_jobs_[i];
+                j.hash = GuestRangeValid(uint64_t(uintptr_t(j.src)), j.size) ? GeoHash(j.src, j.size) : 0;
+                j.done.store(true, std::memory_order_release);
+            }
+            prehash_active_.fetch_sub(1);
+        }
+    }
+    // At the start of a list (render thread): queue the ranges the previous list used.
+    void StartPrehash() {
+        if (!prehash_started_) {
+            prehash_started_ = true;
+            const unsigned hw = std::thread::hardware_concurrency();
+            const int n = hw >= 6 ? 3 : hw >= 4 ? 2 : 1;
+            for (int i = 0; i < n; i++) std::thread([this] { PrehashWorker(); }).detach();
+        }
+        // Stop the previous generation: no new jobs are taken, and the ones being hashed finish.
+        prehash_next_.store(kNoMoreJobs);
+        while (prehash_active_.load() != 0) std::this_thread::yield();
+        geo_used_prev_.swap(geo_used_now_);
+        geo_used_now_.clear();
+        prehash_index_.clear();
+        const size_t n = geo_used_prev_.size();
+        if (n > prehash_capacity_) {
+            prehash_jobs_.reset(new PrehashJob[n * 2]);
+            prehash_capacity_ = n * 2;
+        }
+        size_t count = 0;
+        for (uint64_t key : geo_used_prev_) {
+            auto it = geo_.find(key);
+            if (it == geo_.end() || it->second.changes >= 2 || !it->second.src) continue;
+            PrehashJob& j = prehash_jobs_[count];
+            j.key = key;
+            j.src = it->second.src;
+            j.size = it->second.size;
+            j.done.store(false, std::memory_order_relaxed);
+            prehash_index_[key] = count;
+            count++;
+        }
+        prehash_count_.store(count);
+        prehash_next_.store(0);
+        {
+            std::lock_guard<std::mutex> lk(prehash_mutex_);
+            prehash_generation_++;
+        }
+        prehash_cv_.notify_all();
+    }
     std::unordered_map<uint64_t, GeoEntry> geo_;
     uint64_t geo_hits_ = 0, geo_misses_ = 0, geo_bytes_ = 0, geo_resets_ = 0, geo_volatile_ = 0;
 
@@ -3756,9 +3865,20 @@ private:
             geo_hits_++;
             return it->second.off;
         }
+        geo_used_now_.push_back(key);
         // Checked every list: skipping checks for ranges that had been stable showed other geometry (memory the
-        // game reused for another mesh of the same size) for a few frames: flickering textures.
-        const uint64_t h = GeoHash(src, size);
+        // game reused for another mesh of the same size) for a few frames: flickering textures. The hash usually
+        // comes from a worker thread (hashed at the start of the list).
+        uint64_t h;
+        auto pre = prehash_index_.find(key);
+        if (pre != prehash_index_.end() && prehash_jobs_[pre->second].done.load(std::memory_order_acquire) &&
+            prehash_jobs_[pre->second].src == src) {
+            h = prehash_jobs_[pre->second].hash;
+            prehash_used_++;
+        } else {
+            h = GeoHash(src, size);
+            prehash_inline_++;
+        }
         if (it != geo_.end() && it->second.hash == h) {
             geo_hits_++;
             it->second.checked_list = list_counter_;
@@ -3789,7 +3909,7 @@ private:
         geo_misses_++;
         geo_bytes_ += size;
         // A changed range gets new space (the old copy may still be read by frames in flight).
-        geo_[key] = {h, off, changes, list_counter_ + 1, 1, list_counter_};
+        geo_[key] = {h, off, changes, list_counter_ + 1, 1, list_counter_, src, size};
         return off;
     }
 
@@ -3882,6 +4002,12 @@ private:
         }
         LOGI(kTag, "last 10 s: %.0f ms executing lists (%.0f ms of it waiting for the GPU), %.1f MB streamed, %llu cached uploads",
              exec_ms_, wait_ms_, upload_bytes_ / 1048576.0, (unsigned long long)upload_hits_);
+        LOGI(kTag, "GPU busy %.0f ms in the last 10 s (%.1f ms per list); geometry hashed ahead: %llu of %llu checks",
+             gpu_busy_ms_, list_counter_ > stat_lists_ ? gpu_busy_ms_ / double(list_counter_ - stat_lists_) : 0.0,
+             (unsigned long long)prehash_used_, (unsigned long long)(prehash_used_ + prehash_inline_));
+        gpu_busy_ms_ = 0;
+        stat_lists_ = list_counter_;
+        prehash_used_ = prehash_inline_ = 0;
         if (geo_buf_) {
             LOGI(kTag, "geometry cache: %llu reused, %llu copied (%.1f MB), %llu volatile (streamed), %.0f of %llu MB used, "
                  "%llu resets", (unsigned long long)geo_hits_, (unsigned long long)geo_misses_, geo_bytes_ / 1048576.0,
@@ -4050,6 +4176,8 @@ private:
         VkFence fence = VK_NULL_HANDLE;
         bool pending = false;
         std::vector<Readback> readbacks;
+        VkQueryPool ts = VK_NULL_HANDLE;  // GPU time of the submission (start, end)
+        bool ts_written = false;
         VkDescriptorPool pool = VK_NULL_HANDLE;
         VkBuffer stream = VK_NULL_HANDLE;
         VkDeviceMemory mem = VK_NULL_HANDLE;

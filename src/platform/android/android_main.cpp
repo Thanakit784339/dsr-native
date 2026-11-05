@@ -312,8 +312,9 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "# exposure: scales the scene's exposure before tone mapping (1.0 = as the game draws it; 1.45\n"
                     "# is what the game's own light adaptation computes in dark areas)\n"
                     "exposure = %.2f\n"
-                    "# pin_render_thread: 1 = keep the render thread on the fastest CPU core (recommended)\n"
-                    "pin_render_thread = 1\n",
+                    "# pin_render_thread: 1 = keep the render thread on the fastest CPU core (was slower on an\n"
+                    "# 8 Gen 2: the GPU then waited; 0 = let Android choose)\n"
+                    "pin_render_thread = 0\n",
                     cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0,
                     cfg->gamma, cfg->exposure);
             fclose(w);
