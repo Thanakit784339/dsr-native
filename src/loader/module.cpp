@@ -28,7 +28,7 @@ size_t HostPageSize() {
 }
 
 Module::~Module() {
-    if (base_) munmap(reinterpret_cast<void*>(base_), size_);
+    if (base_) munmap(reinterpret_cast<void*>(base_), size_ + host_page_);
     if (thunk_block_) munmap(thunk_block_, thunk_block_size_);
     for (void* p : dummy_data_) free(p);
 }
@@ -65,6 +65,12 @@ bool Module::HookFunction(uint64_t off, void* host_fn, std::string* err) {
     }
     arch::FlushICache(reinterpret_cast<void*>(addr), sizeof(patch));
     return true;
+}
+
+uint32_t Module::EncodeAdrp(uint64_t pc_offset, int rd, uintptr_t target) const {
+    const int64_t pages = int64_t(target >> 12) - int64_t((base_ + pc_offset) >> 12);
+    const uint32_t imm = uint32_t(pages) & 0x1FFFFF;
+    return 0x90000000u | ((imm & 3u) << 29) | ((imm >> 2) << 5) | uint32_t(rd);
 }
 
 bool Module::PatchInstruction(uint64_t off, uint32_t expected, uint32_t replacement, std::string* err) {
@@ -108,7 +114,8 @@ bool Module::Load(const NsoImage& nso, const ImportResolver& resolver, std::stri
 
 bool Module::MapAndCopy(std::string* err) {
     size_ = AlignUp(nso_->image_size(), host_page_);
-    void* p = mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // One more page after the image: the scratch page (ScratchPage), zeroed and writable.
+    void* p = mmap(nullptr, size_ + host_page_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) {
         *err = "mmap of module image failed";
         return false;

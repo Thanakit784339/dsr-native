@@ -459,6 +459,7 @@ void QueuePresentTexture(void* queue, void* window, int index) {
     static clock::time_point last_present = now;
     static double ft_sum = 0, ft_max = 0;
     static uint64_t ft_n = 0, ft_hitches = 0;
+    static double step_sum = 0;
     {
         const double ms = std::chrono::duration<double, std::milli>(now - last_present).count();
         last_present = now;
@@ -466,6 +467,12 @@ void QueuePresentTexture(void* queue, void* window, int index) {
         ft_max = std::max(ft_max, ms);
         ft_n++;
         if (ms > 2.0 * 1000.0 / fps) ft_hitches++;
+        // The game's time step (60 fps mode): the recent frame time, smoothed, so it keeps normal speed whether
+        // a frame takes 16.7 or 30 ms.
+        static double smoothed = 1000.0 / fps;
+        smoothed += 0.25 * (std::min(ms, 100.0) - smoothed);
+        dsr::SetGameFrameTime(smoothed / 1000.0);
+        step_sum += dsr::GameFrameTime();
     }
     static bool caller_logged = false;
     if (!caller_logged) {
@@ -496,9 +503,9 @@ void QueuePresentTexture(void* queue, void* window, int index) {
     if (clock::now() - report > std::chrono::seconds(10)) {
         report = clock::now();
         if (ft_n)
-            LOGI(kTag, "frame times: %.1f ms average, %.1f ms worst, %llu over %.0f ms (hitches)", ft_sum / ft_n, ft_max,
-                 (unsigned long long)ft_hitches, 2.0 * 1000.0 / fps);
-        ft_sum = ft_max = 0;
+            LOGI(kTag, "frame times: %.1f ms average, %.1f ms worst, %llu over %.0f ms (hitches); game step %.1f ms average",
+                 ft_sum / ft_n, ft_max, (unsigned long long)ft_hitches, 2.0 * 1000.0 / fps, 1000.0 * step_sum / ft_n);
+        ft_sum = ft_max = step_sum = 0;
         ft_n = ft_hitches = 0;
         GpuStats s = Stats();
         double f = double(std::max<uint64_t>(1, n - frames_at_report));

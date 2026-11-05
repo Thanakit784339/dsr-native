@@ -59,6 +59,12 @@ public:
     // Replaces one instruction in .text, only if it currently is `expected`. Before guest code runs.
     bool PatchInstruction(uint64_t image_offset, uint32_t expected, uint32_t replacement, std::string* err);
 
+    // A zeroed, writable host page mapped right after the image (within ADRP range of all guest code): for
+    // variables that patched guest code reads (e.g. the game's time step).
+    uintptr_t ScratchPage() const { return base_ + size_; }
+    // "adrp xd, page" placed at image offset `pc_offset`, addressing `target` (any address within +-4 GB).
+    uint32_t EncodeAdrp(uint64_t pc_offset, int rd, uintptr_t target) const;
+
 private:
     bool MapAndCopy(std::string* err);
     bool Relocate(const ImportResolver& resolver, std::string* err);

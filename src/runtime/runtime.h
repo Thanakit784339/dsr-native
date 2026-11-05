@@ -44,8 +44,11 @@ bool LoadGame(const RuntimeConfig& cfg, std::string* err);
 // thread sized like the Switch main thread. Blocks until nnMain returns.
 int RunGame();
 
-// Patches engine functions of this game build (log/panic output). Called by LoadGame.
+// Patches engine functions of this game build (log/panic output, frame rate). Called by LoadGame.
 void InstallGameHooks();
+// With fps = 60: sets the game's per-frame time step (clamped to 1/60..1/30 s). No effect otherwise.
+void SetGameFrameTime(double seconds);
+float GameFrameTime();
 
 // Prints an import binding summary (implemented / unimplemented / data) to the log.
 void LogImportReport(bool list_unimplemented);

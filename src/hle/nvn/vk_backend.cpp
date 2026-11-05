@@ -1661,10 +1661,19 @@ private:
     // ======================================================================================================
     // command buffer helpers
     // ======================================================================================================
-    void BeginCommands() {
+    // Everything recorded state-skipping relies on starts over with a new command buffer.
+    void InvalidateBoundState() {
         bound_pipeline_ = VK_NULL_HANDLE;
         bound_layout_ = VK_NULL_HANDLE;
         bound_sets_[0] = bound_sets_[1] = VK_NULL_HANDLE;
+        dyn_valid_ = false;
+        for (auto& b : bound_vb_) b = {VK_NULL_HANDLE, 0};
+        bound_ib_ = {VK_NULL_HANDLE, 0};
+        bound_ib_type_ = VK_INDEX_TYPE_MAX_ENUM;
+        push_valid_ = false;
+    }
+    void BeginCommands() {
+        InvalidateBoundState();
         vkResetCommandBuffer(cmd_, 0);
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -1717,9 +1726,7 @@ private:
         }
         UseSlot(n);
         ResetTransient();
-        bound_pipeline_ = VK_NULL_HANDLE;
-        bound_layout_ = VK_NULL_HANDLE;
-        bound_sets_[0] = bound_sets_[1] = VK_NULL_HANDLE;
+        InvalidateBoundState();
     }
     // Waits for all submitted work (CPU readback of GPU results).
     void WaitGpuIdle() {
@@ -2447,13 +2454,16 @@ private:
         // the GPU applies the base vertex. Needs u16/u32 indices (or none), a topology Vulkan has, and bound
         // vertex buffers of a reasonable size. Otherwise indices are scanned and rewritten (slow path).
         std::vector<uint32_t> expanded;  // converted index list (slow path)
+        const uint64_t geo_resets_before = geo_resets_;
         VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         bool use_indices = false, fast = false;
         VkIndexType index_type = VK_INDEX_TYPE_UINT32;
         uint32_t index_count = 0, first_vertex = 0;
         int32_t vertex_offset = 0;
         VkDeviceSize vb_offsets[16] = {};
+        VkBuffer vb_bufs[16] = {};
         VkDeviceSize index_off = 0;
+        VkBuffer index_buf = stream_;
         {
             static const int8_t kTopology[14] = {
                 VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, -1, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP,
@@ -2495,7 +2505,13 @@ private:
                     const int64_t n = so.divisor ? (int64_t(p.instances) + so.divisor - 1) / so.divisor : vmax - vmin + 1;
                     const uint64_t start = uint64_t(first) * b.stride;
                     const uint64_t bytes = uint64_t(std::max<int64_t>(0, n - 1)) * b.stride + vin.extent[b.binding];
-                    VkDeviceSize off = UploadCached(reinterpret_cast<const uint8_t*>(r.address + start), size_t(bytes), 16);
+                    const uint8_t* src = reinterpret_cast<const uint8_t*>(r.address + start);
+                    VkDeviceSize off = GeoCached(src, size_t(bytes));
+                    vb_bufs[b.binding] = geo_buf_;
+                    if (off == VK_WHOLE_SIZE) {
+                        off = UploadCached(src, size_t(bytes), 16);
+                        vb_bufs[b.binding] = stream_;
+                    }
                     if (off == VK_WHOLE_SIZE) return Skip("vertex data too large");
                     // Instanced streams start at base_instance: the draw then uses firstInstance 0.
                     vb_offsets[b.binding] = off;
@@ -2506,7 +2522,13 @@ private:
                     use_indices = true;
                     index_type = p.index_type == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
                     index_count = uint32_t(p.count);
-                    index_off = UploadCached(reinterpret_cast<const uint8_t*>(p.index_address), size_t(p.count) * isz, 4);
+                    const uint8_t* isrc = reinterpret_cast<const uint8_t*>(p.index_address);
+                    index_off = GeoCached(isrc, size_t(p.count) * isz);
+                    index_buf = geo_buf_;
+                    if (index_off == VK_WHOLE_SIZE) {
+                        index_off = UploadCached(isrc, size_t(p.count) * isz, 4);
+                        index_buf = stream_;
+                    }
                     if (index_off == VK_WHOLE_SIZE) return Skip("index data too large");
                 }
                 fast_draws_++;
@@ -2588,12 +2610,15 @@ private:
                 VkDeviceSize off = UploadCached(reinterpret_cast<const uint8_t*>(r.address + start), size_t(bytes), 16);
                 if (off == VK_WHOLE_SIZE) return Skip("vertex data too large");
                 vb_offsets[b.binding] = off;
+                vb_bufs[b.binding] = stream_;
             }
             if (use_indices) {
                 index_off = StreamAlloc(expanded.size() * 4, 4);
                 memcpy(stream_ptr_ + index_off, expanded.data(), expanded.size() * 4);
             }
         }
+        // The geometry cache was emptied during this draw (a new command buffer, other offsets now stale): redo it.
+        if (geo_resets_ != geo_resets_before) return Draw(p);
         Phase(4);
         // ---- pipeline ----------------------------------------------------------------------------------------
         VkExtent2D extent;
@@ -2685,28 +2710,43 @@ private:
         if (layout != bound_layout_ || sets[0] != bound_sets_[0] || sets[1] != bound_sets_[1] ||
             dyn_count != bound_dyn_count_ || memcmp(dyn_offsets, bound_dyn_, dyn_count * 4) != 0) {
             vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 2, sets, dyn_count, dyn_offsets);
+            if (layout != bound_layout_) push_valid_ = false;
             bound_layout_ = layout;
             bound_sets_[0] = sets[0];
             bound_sets_[1] = sets[1];
             bound_dyn_count_ = dyn_count;
             memcpy(bound_dyn_, dyn_offsets, dyn_count * 4);
         }
-        for (const VkVertexInputBindingDescription& b : vin.bindings)
-            vkCmdBindVertexBuffers(cmd_, b.binding, 1, &stream_, &vb_offsets[b.binding]);
+        for (const VkVertexInputBindingDescription& b : vin.bindings) {
+            auto& bound = bound_vb_[b.binding];
+            if (bound.first == vb_bufs[b.binding] && bound.second == vb_offsets[b.binding]) continue;
+            vkCmdBindVertexBuffers(cmd_, b.binding, 1, &vb_bufs[b.binding], &vb_offsets[b.binding]);
+            bound = {vb_bufs[b.binding], vb_offsets[b.binding]};
+        }
         float push[4] = {st_.alpha_ref, 0, 0, 0};
-        vkCmdPushConstants(cmd_, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
+        if (!push_valid_ || memcmp(push, bound_push_, sizeof(push)) != 0) {
+            vkCmdPushConstants(cmd_, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
+            memcpy(bound_push_, push, sizeof(push));
+            push_valid_ = true;
+        }
         SetDynamicState(extent, modes);
         const bool query = capture_active_ && query_pool_ && query_pass_.size() < kMaxQueries;
         if (query) vkCmdBeginQuery(cmd_, query_pool_, uint32_t(query_pass_.size()), 0);
         if (fast) {
             if (use_indices) {
-                vkCmdBindIndexBuffer(cmd_, stream_, index_off, index_type);
+                if (bound_ib_.first != index_buf || bound_ib_.second != index_off || bound_ib_type_ != index_type) {
+                    vkCmdBindIndexBuffer(cmd_, index_buf, index_off, index_type);
+                    bound_ib_ = {index_buf, index_off};
+                    bound_ib_type_ = index_type;
+                }
                 vkCmdDrawIndexed(cmd_, index_count, uint32_t(p.instances), 0, vertex_offset, uint32_t(p.base_instance));
             } else {
                 vkCmdDraw(cmd_, uint32_t(p.count), uint32_t(p.instances), first_vertex, uint32_t(p.base_instance));
             }
         } else if (use_indices) {
             vkCmdBindIndexBuffer(cmd_, stream_, index_off, VK_INDEX_TYPE_UINT32);
+            bound_ib_ = {stream_, index_off};
+            bound_ib_type_ = VK_INDEX_TYPE_UINT32;
             vkCmdDrawIndexed(cmd_, index_count, uint32_t(p.instances), 0, 0, uint32_t(p.base_instance));
         } else {
             vkCmdDraw(cmd_, uint32_t(p.count), uint32_t(p.instances), 0, uint32_t(p.base_instance));
@@ -2768,7 +2808,6 @@ private:
         }
         vp.minDepth = std::clamp(st_.depth_range[0], 0.0f, 1.0f);
         vp.maxDepth = std::clamp(st_.depth_range[1], 0.0f, 1.0f);
-        vkCmdSetViewport(cmd_, 0, 1, &vp);
         VkRect2D sc{{0, 0}, extent};
         if (st_.scissor_set && st_.scissor[2] > 0 && st_.scissor[3] > 0) {
             int x = int(st_.scissor[0]), y = int(st_.scissor[1]), w = int(st_.scissor[2]), h = int(st_.scissor[3]);
@@ -2778,14 +2817,24 @@ private:
             h = std::max(0, std::min(h, int(extent.height) - y));
             sc = {{x, y}, {uint32_t(w), uint32_t(h)}};
         }
-        vkCmdSetScissor(cmd_, 0, 1, &sc);
-        vkCmdSetBlendConstants(cmd_, st_.blend_color);
-        vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_BIT, st_.stencil_ref[0]);
-        vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_BACK_BIT, st_.stencil_ref[1]);
-        vkCmdSetStencilWriteMask(cmd_, VK_STENCIL_FACE_FRONT_BIT, st_.stencil_write[0]);
-        vkCmdSetStencilWriteMask(cmd_, VK_STENCIL_FACE_BACK_BIT, st_.stencil_write[1]);
-        vkCmdSetStencilCompareMask(cmd_, VK_STENCIL_FACE_FRONT_BIT, st_.stencil_compare[0]);
-        vkCmdSetStencilCompareMask(cmd_, VK_STENCIL_FACE_BACK_BIT, st_.stencil_compare[1]);
+        // Dynamic state lasts for the whole command buffer: record only what changed since the last draw.
+        const uint32_t stencil[6] = {st_.stencil_ref[0], st_.stencil_ref[1], st_.stencil_write[0], st_.stencil_write[1],
+                                     st_.stencil_compare[0], st_.stencil_compare[1]};
+        const bool all = !dyn_valid_;
+        if (all || memcmp(&vp, &dyn_.vp, sizeof(vp)) != 0) vkCmdSetViewport(cmd_, 0, 1, &vp);
+        if (all || memcmp(&sc, &dyn_.sc, sizeof(sc)) != 0) vkCmdSetScissor(cmd_, 0, 1, &sc);
+        if (all || memcmp(st_.blend_color, dyn_.blend, sizeof(dyn_.blend)) != 0) vkCmdSetBlendConstants(cmd_, st_.blend_color);
+        if (all || stencil[0] != dyn_.stencil[0]) vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_BIT, stencil[0]);
+        if (all || stencil[1] != dyn_.stencil[1]) vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_BACK_BIT, stencil[1]);
+        if (all || stencil[2] != dyn_.stencil[2]) vkCmdSetStencilWriteMask(cmd_, VK_STENCIL_FACE_FRONT_BIT, stencil[2]);
+        if (all || stencil[3] != dyn_.stencil[3]) vkCmdSetStencilWriteMask(cmd_, VK_STENCIL_FACE_BACK_BIT, stencil[3]);
+        if (all || stencil[4] != dyn_.stencil[4]) vkCmdSetStencilCompareMask(cmd_, VK_STENCIL_FACE_FRONT_BIT, stencil[4]);
+        if (all || stencil[5] != dyn_.stencil[5]) vkCmdSetStencilCompareMask(cmd_, VK_STENCIL_FACE_BACK_BIT, stencil[5]);
+        dyn_.vp = vp;
+        dyn_.sc = sc;
+        memcpy(dyn_.blend, st_.blend_color, sizeof(dyn_.blend));
+        memcpy(dyn_.stencil, stencil, sizeof(stencil));
+        dyn_valid_ = true;
     }
 
     bool VertexFormatSupported(VkFormat f) {
@@ -3095,6 +3144,122 @@ private:
     // Copies guest data into the stream once per list: the same range bound by several draws (UBOs reused
     // across passes, a mesh drawn into depth, shadow and color) is uploaded once. Guest memory only changes
     // during a list through UpdateUniform, which clears the cache.
+    // ---- geometry cache: vertex and index data kept on the GPU across frames -------------------------------
+    // Most geometry (the level, characters) never changes after loading, yet was copied into the stream every
+    // frame (~30 MB a frame in Undead Burg). Ranges now live in one persistent buffer and are copied again only
+    // when their content changed: small ranges (where per-frame data like particles and UI lives) are hashed in
+    // full, large ones at 256 spots plus both ends. When the buffer fills up it is emptied (after the GPU is
+    // done with it) and refilled.
+    static constexpr VkDeviceSize kGeoSize = 192ull << 20;
+    VkBuffer geo_buf_ = VK_NULL_HANDLE;
+    VkDeviceMemory geo_mem_ = VK_NULL_HANDLE;
+    uint8_t* geo_ptr_ = nullptr;
+    VkDeviceSize geo_off_ = 0;
+    bool geo_failed_ = false;
+    struct GeoEntry {
+        uint64_t hash;
+        VkDeviceSize off;
+        uint32_t changes;  // content changes seen; from 2 on the range is streamed instead (volatile)
+    };
+    std::unordered_map<uint64_t, GeoEntry> geo_;
+    uint64_t geo_hits_ = 0, geo_misses_ = 0, geo_bytes_ = 0, geo_resets_ = 0, geo_volatile_ = 0;
+
+    bool EnsureGeo() {
+        if (geo_buf_) return true;
+        if (geo_failed_) return false;
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = kGeoSize;
+        bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+        VkMemoryRequirements req;
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        void* p = nullptr;
+        if (vkCreateBuffer(device_, &bi, nullptr, &geo_buf_) != VK_SUCCESS) goto fail;
+        vkGetBufferMemoryRequirements(device_, geo_buf_, &req);
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex =
+            FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (vkAllocateMemory(device_, &ai, nullptr, &geo_mem_) != VK_SUCCESS) goto fail;
+        vkBindBufferMemory(device_, geo_buf_, geo_mem_, 0);
+        if (vkMapMemory(device_, geo_mem_, 0, kGeoSize, 0, &p) != VK_SUCCESS) goto fail;
+        geo_ptr_ = static_cast<uint8_t*>(p);
+        LOGI(kTag, "geometry cache: %llu MB", (unsigned long long)(kGeoSize >> 20));
+        return true;
+    fail:
+        LOGW(kTag, "geometry cache unavailable: vertex data is streamed every frame");
+        if (geo_buf_) vkDestroyBuffer(device_, geo_buf_, nullptr);
+        if (geo_mem_) vkFreeMemory(device_, geo_mem_, nullptr);
+        geo_buf_ = VK_NULL_HANDLE;
+        geo_mem_ = VK_NULL_HANDLE;
+        geo_failed_ = true;
+        return false;
+    }
+    static uint64_t GeoHash(const uint8_t* p, size_t n) {
+        auto mix = [](uint64_t h, uint64_t v) { return (h ^ v) * 0x9E3779B97F4A7C15ull; };
+        uint64_t h = 0xcbf29ce484222325ull ^ n;
+        uint64_t v;
+        if (n <= 16384) {  // small: the whole range
+            size_t i = 0;
+            for (; i + 8 <= n; i += 8) {
+                memcpy(&v, p + i, 8);
+                h = mix(h, v);
+            }
+            for (; i < n; i++) h = mix(h, p[i]);
+            return h;
+        }
+        for (size_t i = 0; i < 64; i += 8) {  // both ends
+            memcpy(&v, p + i, 8);
+            h = mix(h, v);
+            memcpy(&v, p + n - 64 + i, 8);
+            h = mix(h, v);
+        }
+        const size_t step = (n - 8) / 256;
+        for (size_t k = 0; k < 256; k++) {
+            memcpy(&v, p + k * step, 8);
+            h = mix(h, v);
+        }
+        return h;
+    }
+    // Offset of the range in geo_buf_ (content checked), or VK_WHOLE_SIZE if it cannot be cached.
+    VkDeviceSize GeoCached(const uint8_t* src, size_t size) {
+        if (size == 0 || size > (16u << 20) || !EnsureGeo()) return VK_WHOLE_SIZE;
+        const uint64_t key = (uint64_t(reinterpret_cast<uintptr_t>(src)) * 0x9E3779B97F4A7C15ull) ^ uint64_t(size);
+        auto it = geo_.find(key);
+        if (it != geo_.end() && it->second.changes >= 2) {
+            geo_volatile_++;
+            return VK_WHOLE_SIZE;  // rewritten every frame or so: streamed with the list
+        }
+        const uint64_t h = GeoHash(src, size);
+        if (it != geo_.end() && it->second.hash == h) {
+            geo_hits_++;
+            return it->second.off;
+        }
+        const uint32_t changes = it != geo_.end() ? it->second.changes + 1 : 0;
+        if (changes >= 2) {
+            it->second.changes = changes;
+            geo_volatile_++;
+            return VK_WHOLE_SIZE;
+        }
+        const VkDeviceSize need = (size + 63) & ~VkDeviceSize(63);
+        if (geo_off_ + need > kGeoSize) {
+            // Full: start over once the GPU no longer reads any of it.
+            Flush();
+            WaitGpuIdle();
+            geo_.clear();
+            geo_off_ = 0;
+            geo_resets_++;
+            InvalidateBoundState();
+            it = geo_.end();
+        }
+        const VkDeviceSize off = geo_off_;
+        geo_off_ += need;
+        memcpy(geo_ptr_ + off, src, size);
+        geo_misses_++;
+        geo_bytes_ += size;
+        // A changed range gets new space (the old copy may still be read by frames in flight).
+        geo_[key] = {h, off, changes};
+        return off;
+    }
+
     VkDeviceSize UploadCached(const uint8_t* src, size_t size, VkDeviceSize align) {
         const uint64_t key = (uint64_t(reinterpret_cast<uintptr_t>(src)) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(size) << 1) ^ align;
         auto it = stream_cache_.find(key);
@@ -3184,6 +3349,13 @@ private:
         }
         LOGI(kTag, "last 10 s: %.0f ms executing lists (%.0f ms of it waiting for the GPU), %.1f MB streamed, %llu cached uploads",
              exec_ms_, wait_ms_, upload_bytes_ / 1048576.0, (unsigned long long)upload_hits_);
+        if (geo_buf_) {
+            LOGI(kTag, "geometry cache: %llu reused, %llu copied (%.1f MB), %llu volatile (streamed), %.0f of %llu MB used, "
+                 "%llu resets", (unsigned long long)geo_hits_, (unsigned long long)geo_misses_, geo_bytes_ / 1048576.0,
+                 (unsigned long long)geo_volatile_, geo_off_ / 1048576.0, (unsigned long long)(kGeoSize >> 20),
+                 (unsigned long long)geo_resets_);
+            geo_hits_ = geo_misses_ = geo_bytes_ = geo_volatile_ = 0;
+        }
         std::string phases;
         for (int i = 0; i < 7; i++) {
             phases += " " + std::string(kPhaseNames[i]) + "=" + std::to_string(int(phase_ms_[i]));
@@ -3332,6 +3504,20 @@ private:
     std::unordered_map<uint64_t, std::pair<VkDescriptorSet, VkDescriptorSet>> desc_cache_;
     uint64_t desc_reused_ = 0;
     VkPipeline bound_pipeline_ = VK_NULL_HANDLE;
+    // Last recorded dynamic state, vertex/index bindings and push constants (skipped when unchanged).
+    struct DynState {
+        VkViewport vp;
+        VkRect2D sc;
+        float blend[4];
+        uint32_t stencil[6];
+    };
+    DynState dyn_{};
+    bool dyn_valid_ = false;
+    std::pair<VkBuffer, VkDeviceSize> bound_vb_[16] = {};
+    std::pair<VkBuffer, VkDeviceSize> bound_ib_ = {};
+    VkIndexType bound_ib_type_ = VK_INDEX_TYPE_MAX_ENUM;
+    float bound_push_[4] = {};
+    bool push_valid_ = false;
     VkPipelineLayout bound_layout_ = VK_NULL_HANDLE;
     VkDescriptorSet bound_sets_[2] = {};
     uint32_t bound_dyn_[36] = {};
