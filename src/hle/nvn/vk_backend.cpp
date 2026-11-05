@@ -2535,6 +2535,8 @@ private:
     // This game does not bind textures through NVN: it writes texture handles (from
     // nvnDeviceGetTextureHandle) into its own uniform buffer at binding 10, which shaders read as
     // c[13][0x20 + 8 * slot]. Read the handle from there and resolve it like a bind would.
+    std::unordered_map<uint32_t, BoundTexture> handle_memo_;
+    uint64_t handle_memo_list_ = ~0ull;
     BoundTexture HandleFromUniforms(int stage, uint32_t slot) {
         BoundTexture bt;
         const BufferRange& r = st_.uniforms[stage][13 - kCbufBase];
@@ -2542,9 +2544,18 @@ private:
         if (!r.address || off + 4 > r.size || !GuestRangeValid(r.address + off, 4)) return bt;
         uint32_t handle;
         memcpy(&handle, reinterpret_cast<const void*>(r.address + off), 4);
+        // Resolved once per list (two locked lookups in the shared pools otherwise, for every texture of every
+        // draw); registrations are made before the list is submitted.
+        if (handle_memo_list_ != list_counter_) {
+            handle_memo_.clear();
+            handle_memo_list_ = list_counter_;
+        }
+        auto memo = handle_memo_.find(handle);
+        if (memo != handle_memo_.end()) return memo->second;
         bt.texture = TextureById(int(handle & 0xFFFFF));
         bt.sampler = SamplerById(int(handle >> 20));
         bt.valid = bt.texture.valid;
+        handle_memo_.emplace(handle, bt);
         if (!bt.valid && handles_logged_++ < 8)
             LOGW(kTag, "texture handle 0x%08x (stage %d slot %u) does not name a registered texture", handle, stage, slot);
         return bt;
