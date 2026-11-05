@@ -128,9 +128,34 @@ void SetBuffer(const void* self, uint8_t* data, size_t capacity, int offset, int
     b = {data, capacity, offset, size, false};
 }
 
+// Gives the game a copy of decoded data in `buffer` (its own memory when big enough), from offset 0. The game
+// releases the decoder's output buffer right after GetOutputBuffer and only then copies out of `buffer`, so a
+// pointer into the decoder's memory would be read after the decoder reused it (stuttering, garbled sound).
+void CopyToBuffer(const void* self, const uint8_t* src, size_t n) {
+    BufferState& b = Buf(self);
+    if (!(b.data && b.capacity >= n && (b.owned || b.from_game))) {
+        uint8_t* mem = static_cast<uint8_t*>(malloc(n ? n : 1));
+        if (b.owned) free(b.data);
+        b.data = mem;
+        b.capacity = n;
+        b.owned = true;
+        b.from_game = false;
+    }
+    if (n) memcpy(b.data, src, n);
+    b.offset = 0;
+    b.size = int(n);
+}
+
+// Diagnostics: which track's sample went into which decoder input buffer (a sample fed to the wrong decoder
+// would corrupt both).
+std::mutex g_input_mutex;
+std::unordered_map<const uint8_t*, int> g_input_kind;  // input buffer -> 1 video, 2 audio
+uint64_t g_inputs_checked = 0, g_inputs_mismatched = 0, g_reads_failed = 0;
+
 // ===== Extractor ==========================================================================================
 struct Extractor {
     int fd = -1;
+    std::vector<int> track_kind;  // 1 video, 2 audio, 0 other
 #if defined(__ANDROID__)
     AMediaExtractor* ex = nullptr;
 #endif
@@ -171,6 +196,16 @@ int ExSetDataSourcePath(void* self, const char* path) {
     media_status_t r = AMediaExtractor_setDataSourceFd(e->ex, e->fd, 0, st.st_size);
     LOGI(kTag, "Extractor::SetDataSource(%s): %s, %zu tracks", path, r == AMEDIA_OK ? "ok" : "FAILED",
          r == AMEDIA_OK ? AMediaExtractor_getTrackCount(e->ex) : size_t(0));
+    if (r == AMEDIA_OK)
+        for (size_t i = 0; i < AMediaExtractor_getTrackCount(e->ex); i++) {
+            AMediaFormat* f = AMediaExtractor_getTrackFormat(e->ex, i);
+            const char* mime = nullptr;
+            int kind = 0;
+            if (f && AMediaFormat_getString(f, AMEDIAFORMAT_KEY_MIME, &mime) && mime)
+                kind = strncmp(mime, "video/", 6) == 0 ? 1 : strncmp(mime, "audio/", 6) == 0 ? 2 : 0;
+            e->track_kind.push_back(kind);
+            if (f) AMediaFormat_delete(f);
+        }
     if (r == AMEDIA_OK) dsr::hle::nvn::GetBackend().RequestCapture(8);  // diagnostics: what a video frame shows
     return r == AMEDIA_OK ? kOk : kFail;
 #else
@@ -243,8 +278,19 @@ int ExRead(void* self, void* buffer) {
     Extractor* e = Ex(self);
     BufferState& b = Buf(buffer);
     if (!e->ex) return kFail;
+    const int track = AMediaExtractor_getSampleTrackIndex(e->ex);
     ssize_t n = AMediaExtractor_readSampleData(e->ex, b.data, b.capacity);
-    if (n < 0) return kEndOfStream;
+    if (n < 0) {
+        std::lock_guard<std::mutex> lk(g_input_mutex);
+        if (track >= 0 && g_reads_failed++ < 4)
+            LOGW(kTag, "Extractor::Read: sample of track %d (%lld bytes) not read into %zu bytes",
+                 track, (long long)AMediaExtractor_getSampleSize(e->ex), b.capacity);
+        return kEndOfStream;
+    }
+    if (track >= 0 && size_t(track) < e->track_kind.size()) {
+        std::lock_guard<std::mutex> lk(g_input_mutex);
+        g_input_kind[b.data] = e->track_kind[size_t(track)];
+    }
     b.offset = 0;
     b.size = int(n);
     return kOk;
@@ -580,6 +626,19 @@ int DecSendInputBufferForDecode(void* self, int index, int offset, int size, int
 #if defined(__ANDROID__)
     Decoder* d = Dec(self);
     if (!d->codec || index < 0) return kFail;
+    if (size > 0) {
+        size_t cap = 0;
+        const uint8_t* p = AMediaCodec_getInputBuffer(d->codec, size_t(index), &cap);
+        std::lock_guard<std::mutex> lk(g_input_mutex);
+        auto it = g_input_kind.find(p);
+        if (it != g_input_kind.end()) {
+            g_inputs_checked++;
+            const int want = d->type == 1 ? 1 : 2;
+            if (it->second != want && g_inputs_mismatched++ < 8)
+                LOGW(kTag, "decoder type %d was given a %s sample", d->type, it->second == 1 ? "VIDEO" : "AUDIO");
+            g_input_kind.erase(it);
+        }
+    }
     return AMediaCodec_queueInputBuffer(d->codec, size_t(index), off_t(offset), size_t(size), uint64_t(time_us),
                                         flags) == AMEDIA_OK
                ? kOk
@@ -598,6 +657,11 @@ int DecAcquireOutputBufferIndex(void* self, int* index, int64_t* time_us, uint32
              "%llu empty polls, last pts %.2f s", d->type, (unsigned long long)d->produced,
              (unsigned long long)d->acquired, (unsigned long long)d->released, d->outputs.size(), d->held.size(),
              (unsigned long long)d->polls_empty, d->last_pts / 1e6);
+        std::lock_guard<std::mutex> lk2(g_input_mutex);
+        if (d->type == 1)
+            LOGI(kTag, "decoder inputs: %llu checked, %llu given to the wrong decoder, %llu reads failed",
+                 (unsigned long long)g_inputs_checked, (unsigned long long)g_inputs_mismatched,
+                 (unsigned long long)g_reads_failed);
     }
     if (d->outputs.empty()) {
         d->polls_empty++;
@@ -649,7 +713,7 @@ int DecGetOutputBuffer(void* self, int index, void* buffer) {
                 d->logged_convert = true;
                 LOGW(kTag, "decoded frame smaller than expected (%zu < %zu bytes)", size_t(cap), need_src);
             }
-            SetBuffer(buffer, p, cap, o.offset, o.size);
+            CopyToBuffer(buffer, p + o.offset, size_t(cap) > size_t(o.offset) ? std::min(size_t(o.size), size_t(cap) - size_t(o.offset)) : 0);
             return kOk;
         }
         // Convert NV12 (BT.709, limited range) to RGBA: straight into the game's memory when it is big enough,
@@ -698,7 +762,7 @@ int DecGetOutputBuffer(void* self, int index, void* buffer) {
             return kOk;
         }
     }
-    SetBuffer(buffer, p, cap, o.offset, o.size);
+    CopyToBuffer(buffer, p + o.offset, size_t(cap) > size_t(o.offset) ? std::min(size_t(o.size), size_t(cap) - size_t(o.offset)) : 0);
     return kOk;
 #else
     return kFail;
