@@ -34,6 +34,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include "common/log.h"
@@ -1040,56 +1041,88 @@ public:
         if (!EnsureDevice()) return;
         ReportDraws();
         if (!EnsureSwapchain()) return;
-        uint32_t idx = 0;
-        VkResult r = vkAcquireNextImageKHR(device_, swapchain_, 1000000000ull, acquire_sem_, VK_NULL_HANDLE, &idx);
-        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
-            swapchain_dirty_ = true;
-            return;
-        }
-        if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
-            LogOnce("acquire", "vkAcquireNextImageKHR failed: %d", r);
-            return;
-        }
+        // Acquire, copy and present run on the recorder after this frame's commands; the render thread goes on.
         BeginCommands();
-        VkImage sc = sc_images_[idx];
-        RawBarrier(sc, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        VkClearColorValue black{};
-        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        Rec([sc, black, range](VkCommandBuffer cb) {
-            vkCmdClearColorImage(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
-        });
-
+        PresentJob pj;
         Image* src = tex.valid ? FindImage(tex) : nullptr;
         if (src && src->written && !IsDepthFormat(src->nvn_format)) {
+            Transition(*src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            pj.src = src->image;
+            pj.sw = src->width;
+            pj.sh = src->height;
+            if (!logged_first_image_) {
+                logged_first_image_ = true;
+                LOGI(kTag, "showing the game's frame: %dx%d (format %d)", pj.sw, pj.sh, src->nvn_format);
+            }
+        }
+        barriers_ += 2;
+        Slot& sl = slots_[slot_];
+        sl.ts_written = sl.ts != VK_NULL_HANDLE;
+        sl.pending = true;
+        sl.submits_queued++;
+        Rec([this, i = slot_, pj](VkCommandBuffer) { PresentSlot(i, pj); });
+        Publish();
+        NextSlot();
+        if (++presented_ == 1) LOGI(kTag, "first frame on screen");
+    }
+
+private:
+    struct PresentJob {
+        VkImage src = VK_NULL_HANDLE;  // the game's frame (in TRANSFER_SRC layout), or none: black
+        int sw = 0, sh = 0;
+    };
+    static void CmdImageBarrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to) {
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        b.oldLayout = from;
+        b.newLayout = to;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &b);
+    }
+    // Recorder: acquires a swapchain image, copies the frame into it, submits slot i and presents.
+    void PresentSlot(int i, const PresentJob& pj) {
+        uint32_t idx = 0;
+        VkResult r = vkAcquireNextImageKHR(device_, swapchain_, 1000000000ull, acquire_sem_, VK_NULL_HANDLE, &idx);
+        if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+            if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
+                swapchain_dirty_ = true;
+            } else {
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true)) LOGW(kTag, "vkAcquireNextImageKHR failed: %d", r);
+            }
+            SubmitSlot(i, VK_NULL_HANDLE, VK_NULL_HANDLE);  // nothing to show; the slot's fence still signals
+            return;
+        }
+        const VkImage sc = sc_images_[idx];
+        CmdImageBarrier(cmd_, sc, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        const VkClearColorValue black{};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cmd_, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+        if (pj.src) {
             // Fit the game's frame into the screen, keeping its aspect ratio.
-            int sw = src->width, sh = src->height;
-            int dw = int(sc_extent_.width), dh = int(sc_extent_.height);
-            int w = dw, h = int(int64_t(dw) * sh / std::max(1, sw));
+            const int dw = int(sc_extent_.width), dh = int(sc_extent_.height);
+            int w = dw, h = int(int64_t(dw) * pj.sh / std::max(1, pj.sw));
             if (h > dh) {
                 h = dh;
-                w = int(int64_t(dh) * sw / std::max(1, sh));
+                w = int(int64_t(dh) * pj.sw / std::max(1, pj.sh));
             }
-            int x = (dw - w) / 2, y = (dh - h) / 2;
-            Transition(*src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            const int x = (dw - w) / 2, y = (dh - h) / 2;
             VkImageBlit blit{};
             blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            blit.srcOffsets[1] = {sw, sh, 1};
+            blit.srcOffsets[1] = {pj.sw, pj.sh, 1};
             blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             blit.dstOffsets[0] = {x, y, 0};
             blit.dstOffsets[1] = {x + w, y + h, 1};
-            Rec([blit, sc, image = src->image](VkCommandBuffer cb) {
-                vkCmdBlitImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                               &blit, VK_FILTER_LINEAR);
-            });
-            if (!logged_first_image_) {
-                logged_first_image_ = true;
-                LOGI(kTag, "showing the game's frame: %dx%d (format %d) -> %dx%d at %d,%d", sw, sh, src->nvn_format, w,
-                     h, x, y);
-            }
+            vkCmdBlitImage(cmd_, pj.src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                           &blit, VK_FILTER_LINEAR);
         }
-        RawBarrier(sc, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-        SubmitAndWait(acquire_sem_, render_sem_);
-
+        CmdImageBarrier(cmd_, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        SubmitSlot(i, acquire_sem_, render_sem_);
         VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         pi.waitSemaphoreCount = 1;
         pi.pWaitSemaphores = &render_sem_;
@@ -1097,14 +1130,14 @@ public:
         pi.pSwapchains = &swapchain_;
         pi.pImageIndices = &idx;
         r = vkQueuePresentKHR(queue_, &pi);
-        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR)
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
             swapchain_dirty_ = true;
-        else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
-            LogOnce("present", "vkQueuePresentKHR failed: %d", r);
-        if (++presented_ == 1) LOGI(kTag, "first frame on screen");
+        } else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) LOGW(kTag, "vkQueuePresentKHR failed: %d", r);
+        }
     }
 
-private:
     // ======================================================================================================
     // device
     // ======================================================================================================
@@ -1323,7 +1356,17 @@ private:
         }
         LOGI(kTag, "pipeline cache: %zu bytes loaded", data.size());
     }
+    // Written on a background thread: fetching the cache data (megabytes) and writing the file took the render
+    // thread tens of milliseconds, 10 s after new scenery came into view (a stutter).
+    std::atomic<bool> cache_saving_{false};
     void SavePipelineCache() {
+        if (!pipeline_cache_ || cache_saving_.exchange(true)) return;
+        std::thread([this] {
+            WritePipelineCache();
+            cache_saving_ = false;
+        }).detach();
+    }
+    void WritePipelineCache() {
         const std::string path = PipelineCachePath();
         if (!pipeline_cache_ || path.empty()) return;
         size_t n = 0;
@@ -1367,16 +1410,20 @@ private:
         return pool;
     }
 
+    // The current slot starts over: its stream (render thread) and its descriptor pools (recorder, in order with
+    // the commands; the slot's earlier submission has finished on the GPU).
     void ResetTransient() {
-        Drain();
         stream_off_ = kMaxUniformRange;  // [0, 64K) is the zero buffer
-        Slot& sl = slots_[slot_];
-        if (sl.pool) desc_pool_ = sl.pool;
-        vkResetDescriptorPool(device_, desc_pool_, 0);
-        for (size_t i = 0; i < sl.extra_used; i++) vkResetDescriptorPool(device_, sl.extra_pools[i], 0);
-        sl.extra_used = 0;
-        desc_cache_.clear();
         stream_cache_.clear();
+        Rec([this, i = slot_](VkCommandBuffer) {
+            Slot& sl = slots_[i];
+            rec_slot_ = i;
+            desc_pool_ = sl.pool;
+            vkResetDescriptorPool(device_, sl.pool, 0);
+            for (size_t k = 0; k < sl.extra_used; k++) vkResetDescriptorPool(device_, sl.extra_pools[k], 0);
+            sl.extra_used = 0;
+            desc_cache_.clear();
+        });
     }
     void Begin() {
         if (recording_) return;
@@ -1389,7 +1436,6 @@ private:
         EndRendering();
         SubmitAndWait(VK_NULL_HANDLE, VK_NULL_HANDLE);
         recording_ = false;
-        ResetTransient();
         Begin();
         flushes_++;
     }
@@ -1427,6 +1473,8 @@ private:
             }
         }
         if (swapchain_ && !swapchain_dirty_) return true;
+        Drain();  // the recorder acquires and presents with the swapchain
+        if (swapchain_) vkQueueWaitIdle(queue_);
 
         VkSurfaceCapabilitiesKHR caps;
         if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(phys_, surface_, &caps) != VK_SUCCESS) return false;
@@ -2146,17 +2194,20 @@ private:
         bound_ib_type_ = VK_INDEX_TYPE_MAX_ENUM;
         push_valid_ = false;
     }
+    // Starts the current slot's command buffer (on the recorder: cmd_ is the recorder's).
     void BeginCommands() {
-        Drain();  // the recorder is idle from here (nothing is queued until this returns)
-        InvalidateBoundState();
-        vkResetCommandBuffer(cmd_, 0);
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cmd_, &bi);
-        if (VkQueryPool ts = slots_[slot_].ts) {
-            vkCmdResetQueryPool(cmd_, ts, 0, 2);
-            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ts, 0);
-        }
+        Rec([this, i = slot_](VkCommandBuffer) {
+            cmd_ = slots_[i].cmd;
+            InvalidateBoundState();
+            vkResetCommandBuffer(cmd_, 0);
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkBeginCommandBuffer(cmd_, &bi);
+            if (VkQueryPool ts = slots_[i].ts) {
+                vkCmdResetQueryPool(cmd_, ts, 0, 2);
+                vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ts, 0);
+            }
+        });
     }
     struct Slot;
     // GPU time of a finished submission (its fence has signalled), added to the 10 s statistics.
@@ -2171,12 +2222,21 @@ private:
 
     // Submits the current slot's commands and moves to the other slot. The CPU waits only if that slot's
     // previous submission is still running (so CPU recording and GPU execution overlap by one submission).
+    // The recorder ends the buffer and submits it once it has recorded everything queued before; the render
+    // thread moves on to the next slot without waiting (it waited ~1.5 ms a frame for the recorder's tail).
     void SubmitAndWait(VkSemaphore wait, VkSemaphore signal) {
-        Drain();  // everything queued is recorded before the buffer ends
-        if (VkQueryPool ts = slots_[slot_].ts) {
-            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts, 1);
-            slots_[slot_].ts_written = true;
-        }
+        Slot& sl = slots_[slot_];
+        sl.ts_written = sl.ts != VK_NULL_HANDLE;
+        sl.pending = true;
+        sl.submits_queued++;
+        Rec([this, i = slot_, wait, signal](VkCommandBuffer) { SubmitSlot(i, wait, signal); });
+        Publish();  // the GPU gets it as soon as the recorder is done
+        NextSlot();
+    }
+    // Recorder: ends slot i's command buffer and submits it (its fence always gets signalled).
+    void SubmitSlot(int i, VkSemaphore wait, VkSemaphore signal) {
+        Slot& sl = slots_[i];
+        if (sl.ts) vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sl.ts, 1);
         vkEndCommandBuffer(cmd_);
         VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -2191,19 +2251,27 @@ private:
             si.signalSemaphoreCount = 1;
             si.pSignalSemaphores = &signal;
         }
-        VkResult r = vkQueueSubmit(queue_, 1, &si, fence_);
+        VkResult r = vkQueueSubmit(queue_, 1, &si, sl.fence);
         if (r != VK_SUCCESS) {
-            LogOnce("submit", "vkQueueSubmit failed: %d", r);
-            return;
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) LOGW(kTag, "vkQueueSubmit failed: %d", r);
+            vkQueueSubmit(queue_, 0, nullptr, sl.fence);  // the render thread waits on this fence
         }
-        slots_[slot_].pending = true;
-        NextSlot();
+        sl.submits_done.fetch_add(1, std::memory_order_release);
+    }
+    // A slot's fence may be waited on once the recorder has submitted it (a fence must not be used by two
+    // threads at once).
+    void WaitSubmitted(Slot& sl) {
+        if (sl.submits_done.load(std::memory_order_acquire) == sl.submits_queued) return;
+        Publish();
+        MsTimer t(drain_ms_);
+        for (int i = 0; sl.submits_done.load(std::memory_order_acquire) != sl.submits_queued; i++) {
+            if ((i & 1023) == 1023) std::this_thread::yield();
+            else CpuRelax();
+        }
     }
     void UseSlot(int i) {
         slot_ = i;
-        cmd_ = slots_[i].cmd;
-        fence_ = slots_[i].fence;
-        desc_pool_ = slots_[i].pool;
         stream_ = slots_[i].stream;
         stream_memory_ = slots_[i].mem;
         stream_ptr_ = slots_[i].ptr;
@@ -2260,13 +2328,16 @@ private:
     // Slots whose work has finished deliver their readbacks without waiting (called once per list).
     void PollReadbacks() {
         for (Slot& sl : slots_)
-            if (sl.pending && !sl.readbacks.empty() && vkGetFenceStatus(device_, sl.fence) == VK_SUCCESS)
+            if (sl.pending && !sl.readbacks.empty() &&
+                sl.submits_done.load(std::memory_order_acquire) == sl.submits_queued &&
+                vkGetFenceStatus(device_, sl.fence) == VK_SUCCESS)
                 DeliverReadbacks(sl);
     }
     void NextSlot() {
         const int n = (slot_ + 1) % kSlots;
         Slot& sl = slots_[n];
         if (sl.pending) {
+            WaitSubmitted(sl);
             MsTimer wait_timer(wait_ms_);
             VkResult r = vkWaitForFences(device_, 1, &sl.fence, VK_TRUE, 5000000000ull);
             if (r != VK_SUCCESS) LogOnce("fence", "GPU did not finish within 5 s (%d)", r);
@@ -2277,7 +2348,6 @@ private:
         }
         UseSlot(n);
         ResetTransient();
-        InvalidateBoundState();
     }
     // Waits for all submitted work (CPU readback of GPU results).
     void WaitGpuIdle() {
@@ -3678,7 +3748,7 @@ private:
         for (int tries = 0; tries < 3; tries++) {
             dai.descriptorPool = desc_pool_;
             if (vkAllocateDescriptorSets(device_, &dai, sets) == VK_SUCCESS) return true;
-            Slot& sl = slots_[slot_];
+            Slot& sl = slots_[rec_slot_];
             if (sl.extra_used >= sl.extra_pools.size()) {
                 const VkDescriptorPool np = MakeDescriptorPool();
                 if (!np) return false;
@@ -3990,6 +4060,9 @@ private:
         if (!compilers_.empty()) return;
         for (int i = 0; i < 2; i++)
             compilers_.emplace_back([this] {
+                // Below the render threads: new pipelines are built in the background and must not take CPU
+                // time from the frame being drawn (camera turns into new scenery stuttered).
+                setpriority(PRIO_PROCESS, 0, 8);
                 for (;;) {
                     std::shared_ptr<PipelineJob> j;
                     {
@@ -4624,8 +4697,7 @@ private:
     uint32_t family_ = 0;
     VkQueue queue_ = VK_NULL_HANDLE;
     VkCommandPool pool_ = VK_NULL_HANDLE;
-    VkCommandBuffer cmd_ = VK_NULL_HANDLE;
-    VkFence fence_ = VK_NULL_HANDLE;
+    VkCommandBuffer cmd_ = VK_NULL_HANDLE;  // recorder: the command buffer being recorded
     VkSemaphore acquire_sem_ = VK_NULL_HANDLE, render_sem_ = VK_NULL_HANDLE;
     PFN_vkCmdBeginRendering begin_rendering_ = nullptr;
     PFN_vkCmdEndRendering end_rendering_ = nullptr;
@@ -4686,7 +4758,7 @@ private:
     void* window_ = nullptr;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
-    bool swapchain_dirty_ = false;
+    std::atomic<bool> swapchain_dirty_{false};  // set by the recorder (acquire/present), read by the render thread
     VkExtent2D sc_extent_{};
     std::vector<VkImage> sc_images_;
 
@@ -4720,6 +4792,8 @@ private:
         bool ts_written = false;
         VkDescriptorPool pool = VK_NULL_HANDLE;
         std::vector<VkDescriptorPool> extra_pools;  // when `pool` fills up (recorder thread)
+        uint64_t submits_queued = 0;                // render thread
+        std::atomic<uint64_t> submits_done{0};      // recorder, after vkQueueSubmit
         size_t extra_used = 0;
         VkBuffer stream = VK_NULL_HANDLE;
         VkDeviceMemory mem = VK_NULL_HANDLE;
@@ -4729,7 +4803,8 @@ private:
     // record while the previous frame is still on the GPU (with two, it waited for the frame just submitted).
     static constexpr int kSlots = 4;
     Slot slots_[kSlots];
-    int slot_ = 0;
+    int slot_ = 0;      // render thread: the slot being filled
+    int rec_slot_ = 0;  // recorder: the slot whose descriptor pools it allocates from
     // Hashed fronts of the caches above (no allocation per lookup).
     std::unordered_map<uint64_t, VkSampler> samplers_fast_;
     std::unordered_map<uint64_t, Shader*> shaders_fast_;
@@ -4748,7 +4823,7 @@ private:
     // Last recorded dynamic state, vertex/index bindings and push constants (skipped when unchanged).
     DynState dyn_{};
     bool dyn_valid_ = false;
-    bool persist_full_ = false;      // set by the recorder; the render thread empties the pool
+    std::atomic<bool> persist_full_{false};  // set by the recorder; the render thread empties the pool
     uint64_t skipped_desc_ = 0, desc_pools_added_ = 0;
     std::pair<VkBuffer, VkDeviceSize> bound_vb_[16] = {};
     std::pair<VkBuffer, VkDeviceSize> bound_ib_ = {};

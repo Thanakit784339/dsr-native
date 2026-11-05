@@ -576,29 +576,37 @@ bool SubmitTextureFrame(uint64_t addr, std::shared_ptr<const std::vector<uint8_t
     return true;
 }
 bool GuestRangeValid(uint64_t addr, size_t size) {
-    // Called many times per draw: the pools last matched on this thread are checked first, without the lock.
+    // Called many times per draw (~5% of the render thread with a 4-entry cache and a lock on misses): each
+    // thread keeps a copy of the sorted pool list, refreshed only when pools change, and searches it lock-free.
     struct Range {
         uintptr_t lo, hi;
     };
     thread_local uint64_t cached_version = 0;
-    thread_local Range cached[4] = {};
-    thread_local unsigned next_slot = 0;
-    const uint64_t version = g_pool_ranges_version.load(std::memory_order_acquire);
+    thread_local std::vector<Range> ranges;
+    thread_local size_t last = 0;
     if (addr + size < addr) return false;
-    if (version == cached_version) {
-        for (const Range& r : cached)
-            if (r.hi && addr >= r.lo && addr + size <= r.hi) return true;
-    } else {
-        for (Range& r : cached) r = {0, 0};
-        cached_version = version;
+    const uint64_t version = g_pool_ranges_version.load(std::memory_order_acquire);
+    if (version != cached_version) {
+        std::lock_guard<std::mutex> lk(g_pool_range_mutex);
+        ranges.clear();
+        for (const auto& [base, sz] : g_pool_ranges) ranges.push_back({base, base + sz});
+        cached_version = g_pool_ranges_version.load(std::memory_order_relaxed);
+        last = 0;
     }
-    std::lock_guard<std::mutex> lk(g_pool_range_mutex);
-    auto it = g_pool_ranges.upper_bound(uintptr_t(addr));
-    if (it == g_pool_ranges.begin()) return false;
-    --it;
-    const bool ok = addr >= it->first && addr + size <= it->first + it->second;
-    if (ok) cached[next_slot++ & 3] = {it->first, it->first + it->second};
-    return ok;
+    const uintptr_t lo = uintptr_t(addr), hi = uintptr_t(addr + size);
+    if (last < ranges.size() && lo >= ranges[last].lo && hi <= ranges[last].hi) return true;
+    // The last pool starting at or below addr.
+    size_t l = 0, r = ranges.size();
+    while (l < r) {
+        const size_t m = (l + r) / 2;
+        if (ranges[m].lo <= lo) l = m + 1;
+        else r = m;
+    }
+    if (l == 0) return false;
+    const Range& p = ranges[l - 1];
+    if (hi > p.hi) return false;
+    last = l - 1;
+    return true;
 }
 
 TexRef MakeTexRef(const void* nvn_texture) {
