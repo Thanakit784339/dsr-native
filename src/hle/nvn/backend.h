@@ -59,6 +59,7 @@ enum class CmdType : uint8_t {
     FenceSync,          // src_addr: the NVNsync, signalled once the list has executed (handled by the queue)
     CopyTextureToBuffer,// src, src_region, dst_addr, flags, f[0] = row stride, f[1] = image stride
     CopyBufferToBuffer, // src_addr, dst_addr, index = size (bytes; see `size64`)
+    Report,             // dst_addr; index 0: value (`mask` = the value), 1: counter (`mask` = NVNcounterType)
 };
 
 struct BufferRange {  // NVNbufferRange

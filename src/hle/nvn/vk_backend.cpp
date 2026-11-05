@@ -41,6 +41,7 @@
 #include "hle/nvn/backend.h"
 #include "runtime/runtime.h"
 #include "hle/nvn/layout.h"
+#include "hle/os/os.h"
 #include "hle/nvn/shader/translator.h"
 #include "hle/nvn/state.h"
 #include "hle/video.h"
@@ -428,6 +429,14 @@ public:
                 }
                 case CmdType::CopyBufferToTexture: CopyBufferToTexture(c); break;
                 case CmdType::CopyTextureToBuffer: CopyTextureToBuffer(c); break;
+                case CmdType::Report: {
+                    Begin();
+                    Readback rb{0, c.dst_addr, 0, 0, 1, 0, 0};
+                    rb.report = c.index;
+                    rb.value = uint32_t(c.mask);
+                    slots_[slot_].readbacks.push_back(rb);
+                    break;
+                }
                 case CmdType::CopyBufferToBuffer:
                     if (c.size64 && GuestRangeValid(c.src_addr, c.size64) && GuestRangeValid(c.dst_addr, c.size64))
                         memmove(reinterpret_cast<void*>(c.dst_addr), reinterpret_cast<const void*>(c.src_addr), c.size64);
@@ -1843,6 +1852,20 @@ private:
     // Writes the finished readbacks of a slot to game memory (its fence has signalled).
     void DeliverReadbacks(Slot& sl) {
         for (const Readback& rb : sl.readbacks) {
+            if (rb.report >= 0) {
+                if (!GuestRangeValid(rb.dst, rb.report ? 16 : 4)) continue;
+                if (rb.report == 0) {
+                    memcpy(reinterpret_cast<void*>(rb.dst), &rb.value, 4);
+                } else if (rb.value == 0) {
+                    // Timestamp counter. NVNcounterData: the counter, then a timestamp (GPU ticks, 19.2 MHz like
+                    // the CPU's). Other counters (samples passed, ...) are left alone, as before.
+                    const int64_t ticks = hle::os::NowTicks();
+                    const uint64_t data[2] = {uint64_t(ticks), uint64_t(ticks)};
+                    memcpy(reinterpret_cast<void*>(rb.dst), data, 16);
+                }
+                reports_done_++;
+                continue;
+            }
             if (rb.texture) {
                 const TextureLayout layout = ComputeLayout(rb.tex);
                 if (layout.levels.empty() || !GuestRangeValid(rb.dst, layout.levels[0].offset + layout.levels[0].size))
@@ -2065,7 +2088,7 @@ private:
             CopyBufferToTexture(c, true);
         }
     }
-    uint64_t readbacks_done_ = 0, readbacks_recorded_ = 0, rt_writebacks_ = 0;
+    uint64_t readbacks_done_ = 0, readbacks_recorded_ = 0, rt_writebacks_ = 0, reports_done_ = 0;
     // Small render targets (luminance / exposure textures) are copied back to game memory after each list, in
     // the texture's own layout: on Switch the CPU can read what the GPU rendered straight from memory, and the
     // game computes its auto exposure that way (it stayed at its default without it: too dark).
@@ -3809,9 +3832,10 @@ private:
                  (unsigned long long)readbacks_done_);
             readbacks_recorded_ = readbacks_done_ = 0;
         }
-        if (rt_writebacks_) {
-            LOGI(kTag, "small render targets written back to game memory: %llu", (unsigned long long)rt_writebacks_);
-            rt_writebacks_ = 0;
+        if (rt_writebacks_ || reports_done_) {
+            LOGI(kTag, "small render targets written back to game memory: %llu; reports written: %llu",
+                 (unsigned long long)rt_writebacks_, (unsigned long long)reports_done_);
+            rt_writebacks_ = reports_done_ = 0;
         }
         LOGI(kTag, "descriptor sets: %llu reused from earlier frames, %zu kept, %llu resets", (unsigned long long)persist_hits_,
              persist_cache_.size(), (unsigned long long)persist_resets_);
@@ -3951,6 +3975,8 @@ private:
         size_t row, rows, depth, dst_stride, dst_image_stride;
         bool texture = false;  // dst is a texture's storage: written in its own layout (level 0, layer 0)
         TextureState tex{};
+        int report = -1;       // 0: write the 32-bit `value`; 1: write a counter report {counter, timestamp}
+        uint32_t value = 0;
     };
     struct Slot {
         VkCommandBuffer cmd = VK_NULL_HANDLE;

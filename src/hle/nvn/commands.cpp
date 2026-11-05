@@ -451,14 +451,27 @@ void CopyBufferToBuffer(void* cb, uint64_t src, uint64_t dst, size_t size, int f
     c.flags = flags;
     Append(cb, std::move(c));
 }
-// Not emulated yet: logged once, so a log shows whether the game uses them.
-void ReportCounter(void*, int counter, uint64_t) {
+// Reports: written to game memory once the GPU has executed everything before them. Engines use them as
+// lightweight fences ("the GPU is past this point, its results can be read").
+void ReportCounter(void* cb, int counter, uint64_t dst) {
+    Cmd c;
+    c.type = CmdType::Report;
+    c.index = 1;
+    c.mask = counter;
+    c.dst_addr = dst;
+    Append(cb, std::move(c));
     static std::atomic<int> n{0};
-    if (n++ < 4) LOGI(kTag, "nvnCommandBufferReportCounter(counter %d): not emulated", counter);
+    if (n++ < 4) LOGI(kTag, "nvnCommandBufferReportCounter(counter %d) -> @%llx", counter, (unsigned long long)dst);
 }
-void ReportValue(void*, uint32_t value, uint64_t) {
+void ReportValue(void* cb, uint32_t value, uint64_t dst) {
+    Cmd c;
+    c.type = CmdType::Report;
+    c.index = 0;
+    c.mask = int(value);
+    c.dst_addr = dst;
+    Append(cb, std::move(c));
     static std::atomic<int> n{0};
-    if (n++ < 4) LOGI(kTag, "nvnCommandBufferReportValue(%u): not emulated", value);
+    if (n++ < 4) LOGI(kTag, "nvnCommandBufferReportValue(%u) -> @%llx", value, (unsigned long long)dst);
 }
 
 // ---- queue ------------------------------------------------------------------------------------------------
