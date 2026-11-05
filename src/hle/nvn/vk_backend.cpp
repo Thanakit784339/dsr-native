@@ -468,16 +468,19 @@ public:
                     break;
                 }
                 case CmdType::CopyBufferToBuffer:
-                    if (c.size64 && GuestRangeValid(c.src_addr, c.size64) && GuestRangeValid(c.dst_addr, c.size64))
+                    if (c.size64 && GuestRangeValid(c.src_addr, c.size64) && GuestRangeValid(c.dst_addr, c.size64)) {
                         memmove(reinterpret_cast<void*>(c.dst_addr), reinterpret_cast<const void*>(c.src_addr), c.size64);
-                    else
+                        MemoryWrittenInList(c.dst_addr, c.size64);
+                        list_b2b_copies_++;
+                    } else
                         LogOnce("b2b-range", "buffer-to-buffer copy outside known memory");
                     break;
                 case CmdType::UpdateUniform: {
                     const std::span<const uint8_t> data = Items<uint8_t>(c);
                     if (!data.empty() && GuestRangeValid(c.dst_addr, data.size())) {
                         memcpy(reinterpret_cast<void*>(c.dst_addr), data.data(), data.size());
-                        stream_cache_.clear();  // cached copies may include the old bytes
+                        MemoryWrittenInList(c.dst_addr, data.size());  // cached copies may include the old bytes
+                        list_updates_++;
                     }
                     break;
                 }
@@ -633,6 +636,9 @@ public:
         ApplyDirtyMarks();
         if (!watched_copies_.empty()) CheckWatchedCopies();
         PollReadbacks();
+        geo_token_list_ = ++geo_token_;
+        geo_lo_ = UINTPTR_MAX;
+        geo_hi_ = 0;
         StartPrehash();
         ExecuteCommands(cmds, 0);
         if (capture_active_) CaptureEndOfPass();
@@ -4472,6 +4478,23 @@ private:
         prehash_cv_.notify_all();
     }
     std::unordered_map<uint64_t, GeoEntry> geo_;
+    // Geometry content is checked once per token: a new token with each list, and whenever the list itself
+    // writes game memory (buffer-to-buffer copies, inline buffer updates). Draws after such a write in the same
+    // list used the copy checked before it: stale particle quads (holes in smoke and dust). Hashes made ahead
+    // by the workers (list start) are not used after such a write either.
+    uint64_t geo_token_ = 1, geo_token_list_ = 1;
+    uint64_t list_b2b_copies_ = 0, list_updates_ = 0;
+    uintptr_t geo_lo_ = UINTPTR_MAX, geo_hi_ = 0;  // span of the geometry checked under the current token
+    void MemoryWrittenInList(uint64_t addr, uint64_t size) {
+        stream_cache_.clear();
+        if (addr < geo_hi_ && addr + size > geo_lo_) {
+            geo_token_++;
+            geo_lo_ = UINTPTR_MAX;
+            geo_hi_ = 0;
+            geo_rechecks_++;
+        }
+    }
+    uint64_t geo_rechecks_ = 0;
     uint64_t geo_hits_ = 0, geo_misses_ = 0, geo_bytes_ = 0, geo_resets_ = 0, geo_volatile_ = 0;
 
     bool EnsureGeo() {
@@ -4551,17 +4574,20 @@ private:
             geo_volatile_++;
             return VK_WHOLE_SIZE;  // rewritten every frame or so: streamed with the list
         }
-        if (it != geo_.end() && it->second.checked_list == list_counter_) {
+        if (it != geo_.end() && it->second.checked_list == geo_token_) {
             geo_hits_++;
             return it->second.off;
         }
         geo_used_now_.push_back(key);
+        geo_lo_ = std::min(geo_lo_, reinterpret_cast<uintptr_t>(src));
+        geo_hi_ = std::max(geo_hi_, reinterpret_cast<uintptr_t>(src) + size);
         // Checked every list: skipping checks for ranges that had been stable showed other geometry (memory the
         // game reused for another mesh of the same size) for a few frames: flickering textures. The hash usually
         // comes from a worker thread (hashed at the start of the list).
         uint64_t h;
         auto pre = prehash_index_.find(key);
-        if (pre != prehash_index_.end() && prehash_jobs_[pre->second].done.load(std::memory_order_acquire) &&
+        if (pre != prehash_index_.end() && geo_token_ == geo_token_list_ &&
+            prehash_jobs_[pre->second].done.load(std::memory_order_acquire) &&
             prehash_jobs_[pre->second].src == src) {
             h = prehash_jobs_[pre->second].hash;
             prehash_used_++;
@@ -4571,7 +4597,7 @@ private:
         }
         if (it != geo_.end() && it->second.hash == h) {
             geo_hits_++;
-            it->second.checked_list = list_counter_;
+            it->second.checked_list = geo_token_;
             it->second.interval = std::min<uint32_t>(it->second.interval * 2, 8);
             it->second.next_check_list = list_counter_ + it->second.interval;
             return it->second.off;
@@ -4599,7 +4625,7 @@ private:
         geo_misses_++;
         geo_bytes_ += size;
         // A changed range gets new space (the old copy may still be read by frames in flight).
-        geo_[key] = {h, off, changes, list_counter_ + 1, 1, list_counter_, src, size};
+        geo_[key] = {h, off, changes, list_counter_ + 1, 1, geo_token_, src, size};
         return off;
     }
 
@@ -4769,6 +4795,12 @@ private:
         }
         LOGI(kTag, "descriptor sets: %llu reused from earlier frames, %zu kept, %llu resets", (unsigned long long)persist_hits_,
              persist_cache_.size(), (unsigned long long)persist_resets_);
+        if (list_b2b_copies_ || list_updates_) {
+            LOGI(kTag, "game memory written by command lists: %llu buffer copies, %llu buffer updates; geometry re-checked "
+                 "after %llu of them", (unsigned long long)list_b2b_copies_, (unsigned long long)list_updates_,
+                 (unsigned long long)geo_rechecks_);
+            list_b2b_copies_ = list_updates_ = geo_rechecks_ = 0;
+        }
         if (padded_fetches_ || view_standins_) {
             LOGI(kTag, "draws reading vertex data past their bound buffer: %llu; with a stand-in for a "
                  "texture of the wrong dimension: %llu", (unsigned long long)padded_fetches_,
