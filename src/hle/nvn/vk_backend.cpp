@@ -1773,6 +1773,7 @@ private:
         stream_memory_ = slots_[i].mem;
         stream_ptr_ = slots_[i].ptr;
     }
+    struct Slot;  // defined with the other members below
     // Writes the finished readbacks of a slot to game memory (its fence has signalled).
     void DeliverReadbacks(Slot& sl) {
         for (const Readback& rb : sl.readbacks) {
