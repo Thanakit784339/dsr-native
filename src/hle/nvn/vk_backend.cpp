@@ -3343,7 +3343,16 @@ private:
                 }
                 VkImageView view = SampledView(*img, info.texture_dim[slot], info.texture_array[slot], swz,
                                                bt.valid ? &bt.texture : nullptr);
-                if (!view) return Skip("texture view does not match the shader");
+                if (!view) {
+                    char k[160];
+                    snprintf(k, sizeof(k), "view: shader %s%d dim %d array %d | image type %d %dx%dx%d layers %d fmt %d",
+                             stage ? "fs" : "vs", int(slot), int(info.texture_dim[slot]), int(info.texture_array[slot]),
+                             int(img->type), img->width, img->height, img->depth, img->layers, img->nvn_format);
+                    if (view_mismatch_logged_.size() < 16 && view_mismatch_logged_.insert(k).second)
+                        LOGW(kTag, "texture view does not match the shader: %s (target %d, view layers %d, layer %d)", k,
+                             bt.texture.tex.target, bt.texture.view_layers, bt.texture.layer);
+                    return Skip("texture view does not match the shader");
+                }
                 if (plain)
                     tex_writes.push_back({uint32_t(stage), 32 + slot,
                                           {Sampler(bt.sampler, false, Filterable(*img)), view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
@@ -4477,7 +4486,10 @@ private:
         auto mix = [](uint64_t h, uint64_t v) { return (h ^ v) * K; };
         uint64_t h = 0xcbf29ce484222325ull ^ n;
         uint64_t v;
-        if (n <= 16384) {  // small: the whole range, four independent lanes (a single chain is latency bound)
+        // Up to 512 KB: the whole range, four independent lanes (a single chain is latency bound). Per-frame
+        // geometry (particles, effects) lives in ranges like these; sampling them missed partial rewrites and
+        // left stale particle quads on screen (flickering squares). Most of this runs on the hash workers.
+        if (n <= (512u << 10)) {
             uint64_t a = h, b = h + 1, c = h + 2, d = h + 3;
             size_t i = 0;
             for (; i + 32 <= n; i += 32) {
@@ -4824,6 +4836,7 @@ private:
     int new_pipelines_ = 0;
     double compile_ms_ = 0;
     std::unordered_set<uint64_t> viewport_keys_;
+    std::set<std::string> view_mismatch_logged_;
     std::unordered_map<uint64_t, uint64_t> snapshot_gen_;
     double exec_ms_ = 0, wait_ms_ = 0;
     VkDescriptorPool desc_pool_ = VK_NULL_HANDLE;
