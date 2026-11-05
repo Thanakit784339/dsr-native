@@ -2778,7 +2778,7 @@ private:
                     char d[64];
                     snprintf(d, sizeof(d), " %s c%u(%zu B):", stage ? "fs" : "vs", n, size);
                     pass_ubo_desc_ += d;
-                    const size_t nf = std::min<size_t>(size / 4, 512);  // all of it (brightness hunt)
+                    const size_t nf = std::min<size_t>(size / 4, 1024);  // all of it (brightness hunt)
                     for (size_t k = 0; k < nf; k++) {
                         float f;
                         memcpy(&f, src + k * 4, 4);
