@@ -114,6 +114,14 @@ public:
         }
         return slot;
     }
+    Id ConstNull(Id type) {
+        auto it = nulls_.find(type);
+        if (it != nulls_.end()) return it->second;
+        Id id = NewId();
+        Emit(types_, SpvOpConstantNull, {type, id});
+        nulls_[type] = id;
+        return id;
+    }
     Id ConstComposite(Id type, std::initializer_list<Id> parts) {
         std::vector<uint32_t> key = {type};
         key.insert(key.end(), parts.begin(), parts.end());
@@ -246,6 +254,7 @@ private:
     Id glsl_ = 0, true_ = 0, false_ = 0;
     std::map<uint32_t, int> caps_;
     std::map<std::vector<uint32_t>, Id> types_map_, composites_;
+    std::map<Id, Id> nulls_;
     std::map<std::pair<Id, uint32_t>, Id> consts_;
     std::vector<uint32_t> capabilities_, imports_, entry_points_, exec_modes_, debug_, annotations_, types_, locals_,
         body_;

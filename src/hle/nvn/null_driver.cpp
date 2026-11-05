@@ -459,6 +459,19 @@ bool QueueInitialize(void* q, const void* b) {
 
 // Present: pace to the configured rate (settings: 30 as on Switch, or 60), then let the backend show the
 // window texture. Every 10 s, report what the game submitted per frame and how even the frame times were.
+// Queue position of each window texture's latest present (window acquire syncs wait for it).
+std::mutex g_present_seq_mutex;
+std::map<std::pair<const void*, int>, uint64_t> g_present_seqs;
+void NoteWindowTexturePresent(const void* window, int index, uint64_t seq) {
+    std::lock_guard<std::mutex> lk(g_present_seq_mutex);
+    g_present_seqs[{window, index}] = seq;
+}
+uint64_t WindowTexturePresentSeq(const void* window, int index) {
+    std::lock_guard<std::mutex> lk(g_present_seq_mutex);
+    auto it = g_present_seqs.find({window, index});
+    return it == g_present_seqs.end() ? 0 : it->second;
+}
+
 void QueuePresentTexture(void* queue, void* window, int index) {
     using clock = std::chrono::steady_clock;
     static thread_local clock::time_point next = clock::now();
@@ -502,6 +515,7 @@ void QueuePresentTexture(void* queue, void* window, int index) {
     GpuWait(presents[0]);
     presents[0] = presents[1];
     presents[1] = GpuEnqueue([tex] { GetBackend().Present(tex); });
+    NoteWindowTexturePresent(window, index, presents[1]);
 
     static uint64_t frames_at_report = 0;
     uint64_t n = ++frames;
@@ -567,6 +581,9 @@ int WindowAcquireTexture(void* w, void* sync, int* index) {
     int n = std::max(1, s.num_textures);
     *index = s.next;
     s.next = (s.next + 1) % n;
+    // The sync is signalled once the texture's previous present has run (it was left signalled: a game that
+    // paces its per-frame buffers on it could overwrite data the render thread had not read yet).
+    if (sync) SetSyncTarget(sync, WindowTexturePresentSeq(w, *index));
     return 0;  // success
 }
 int WindowGetNumTextures(const void* w) { return g_windows.Copy(w).num_textures; }
@@ -693,7 +710,7 @@ const Proc kProcs[] = {
     P("nvnQueueBuilderSetComputeMemorySize", QueueBuilderSetComputeMemorySize),
     P("nvnQueueBuilderSetCommandFlushThreshold", Nop), P("nvnQueueBuilderSetQueueMemory", Nop),
     P("nvnQueueBuilderGetQueueMemorySize", QueueBuilderGetQueueMemorySize),
-    P("nvnQueueInitialize", QueueInitialize), P("nvnQueueFinalize", Nop), P("nvnQueueFlush", Nop), P("nvnQueueFenceSync", Nop), P("nvnQueueWaitSync", Nop),
+    P("nvnQueueInitialize", QueueInitialize), P("nvnQueueFinalize", Nop), P("nvnQueueFlush", Nop), P("nvnQueueWaitSync", Nop),
     P("nvnQueuePresentTexture", QueuePresentTexture),
     // command buffers (recording is a no-op)
     P("nvnCommandBufferInitialize", True), P("nvnCommandBufferFinalize", Nop),

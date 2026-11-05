@@ -266,7 +266,11 @@ private:
     // ---- registers --------------------------------------------------------------------------------------------
     Id RegVar(uint32_t r) {
         if (!reg_[r]) {
-            reg_[r] = b_.LocalVariable(p_fn_u32_);
+            // Zero, not undefined: code that reads a register before writing it (on some path) gave values that
+            // differed between the driver's builds of the shader (Adreno compiles a position-only copy for its
+            // binning pass): geometry binned to the wrong screen tiles left tile-sized holes in particles, and
+            // depth prepass and colour pass disagreed.
+            reg_[r] = b_.LocalVariable(p_fn_u32_, b_.ConstUint(0));
             char name[8];
             snprintf(name, sizeof(name), "R%u", r);
             b_.Name(reg_[r], name);
@@ -1078,7 +1082,7 @@ private:
     Id LocalWord(Id byte_address) {
         if (!local_) {
             Id arr = b_.TypeArray(t_u32_, 1024);
-            local_ = b_.LocalVariable(b_.TypePointer(SpvStorageClassFunction, arr));
+            local_ = b_.LocalVariable(b_.TypePointer(SpvStorageClassFunction, arr), b_.ConstNull(arr));
             b_.Name(local_, "lmem");
         }
         Id idx = b_.OpResult(SpvOpShiftRightLogical, t_u32_, {byte_address, b_.ConstUint(2)});

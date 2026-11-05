@@ -678,6 +678,15 @@ void SyncFinalize(void* sync) {
     std::lock_guard<std::mutex> lk(g_sync_mutex);
     g_sync_targets.erase(sync);
 }
+// nvnQueueFenceSync: signalled once everything submitted so far has run. (It was a no-op, leaving the sync
+// signalled: the game reused per-frame memory, such as skinning matrices, while the render thread had yet to
+// read it, so a character's depth prepass and colour pass could see different poses.)
+std::atomic<uint64_t> g_queue_fences{0};
+void QueueFenceSync(void* /*queue*/, void* sync, int /*condition*/, int /*flags*/) {
+    if (!sync) return;
+    if (g_queue_fences++ == 0) LOGI(kTag, "nvnQueueFenceSync used: queue syncs now wait for the render thread");
+    SetSyncTarget(sync, Queue().Submitted());
+}
 // NVNsyncWaitResult: 0 already signalled, 1 condition satisfied, 2 timeout expired.
 // Time game threads spend waiting for the render thread: [0] at present (frames queued ahead), [1] in
 // nvnSyncWait / nvnQueueFinish. Reported with the frame times: shows whether the game or the render side sets
@@ -698,6 +707,9 @@ int SyncWait(const void* sync, uint64_t timeout_ns) {
         auto it = g_sync_targets.find(sync);
         if (it != g_sync_targets.end()) target = it->second;
     }
+    static std::atomic<int> logged{0};
+    if (logged < 6 && logged++ < 6)
+        LOGI(kTag, "nvnSyncWait(%p): %s", sync, !target ? "no pending work" : Queue().Completed() >= target ? "already done" : "waits");
     if (!target || Queue().Completed() >= target) return 0;
     WaitTimer wt{1};
     const auto timeout = timeout_ns >= uint64_t(INT64_MAX) ? std::chrono::nanoseconds::max()
@@ -818,7 +830,7 @@ const Proc kProcs[] = {
     P("nvnCommandBufferReportCounter", ReportCounter),
     P("nvnCommandBufferReportValue", ReportValue),
     P("nvnQueueSubmitCommands", QueueSubmitCommands),
-    P("nvnCommandBufferFenceSync", FenceSync), P("nvnQueueFinish", QueueFinish),
+    P("nvnCommandBufferFenceSync", FenceSync), P("nvnQueueFinish", QueueFinish), P("nvnQueueFenceSync", QueueFenceSync),
     P("nvnSyncInitialize", SyncInitialize), P("nvnSyncFinalize", SyncFinalize), P("nvnSyncWait", SyncWait),
 };
 #undef P
@@ -838,6 +850,13 @@ GpuStats& Stats() {
     return g_stats;
 }
 
+void SetSyncTarget(const void* sync, uint64_t seq) {
+    std::lock_guard<std::mutex> lk(g_sync_mutex);
+    if (seq && Queue().Completed() < seq)
+        g_sync_targets[sync] = seq;
+    else
+        g_sync_targets.erase(sync);
+}
 uint64_t GpuEnqueue(std::function<void()> task) { return Queue().Enqueue(std::move(task)); }
 void GpuWait(uint64_t seq) {
     if (Queue().Completed() >= seq) return;
