@@ -420,6 +420,7 @@ void TexWriteTexelsStrided(const void* tex, const void* /*view*/, const CopyRegi
                              w_bytes, rows, 1, src + size_t(z) * slice_pitch, row_pitch, slice_pitch);
         }
     }
+    GetBackend().MarkTextureDirty(uint64_t(reinterpret_cast<uintptr_t>(base)));
     static std::atomic<int> logged{0};
     if (logged.fetch_add(1) < 4)
         LOGI(kTag, "nvnTextureWriteTexels %dx%d at %d,%d into %dx%d format %d", w, h, region->x, region->y, t.width,

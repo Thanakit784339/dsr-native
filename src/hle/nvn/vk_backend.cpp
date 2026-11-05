@@ -27,6 +27,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <unistd.h>
@@ -297,10 +298,13 @@ struct Image {
     bool written = false;  // has the GPU (or an upload) put anything in it
     bool uploaded = false;
     // Contents came from game memory (not rendered by the GPU): re-uploaded when the game rewrites the
-    // memory (e.g. video frames). Checked at most once per command list via a sparse hash.
+    // memory. Checked via a sparse hash: after an unchanged check the next one comes twice as many command
+    // lists later (up to kMaxCheckInterval); a change, or an explicit MarkTextureDirty, resets that.
     bool cpu_source = false;
     uint64_t sample_hash = 0;
     uint64_t checked_in_list = 0;
+    uint64_t next_check_list = 0;
+    uint32_t check_interval = 1;
     std::map<std::vector<uint32_t>, VkImageView> views;
     std::unordered_map<uint64_t, VkImageView> fast_views;  // same views by hashed key
 };
@@ -525,6 +529,23 @@ public:
     std::unordered_map<uint64_t, PendingFrame> pending_frames_;
     std::atomic<int> pending_count_{0};
     uint64_t frames_set_ = 0, frames_uploaded_ = 0;  // statistics (frames_set_ under frames_mutex_)
+
+    // Textures the CPU wrote through NVN (nvnTextureWriteTexels): checked at their next use. Thread-safe.
+    std::mutex dirty_mutex_;
+    std::unordered_set<uint64_t> dirty_addrs_;
+    std::atomic<int> dirty_count_{0};
+    static constexpr uint32_t kMaxCheckInterval = 16;
+    void MarkTextureDirty(uint64_t addr) override {
+        std::lock_guard<std::mutex> lk(dirty_mutex_);
+        if (dirty_addrs_.insert(addr).second) dirty_count_++;
+    }
+    bool TakeDirty(uint64_t addr) {
+        if (dirty_count_.load(std::memory_order_relaxed) == 0) return false;
+        std::lock_guard<std::mutex> lk(dirty_mutex_);
+        if (!dirty_addrs_.erase(addr)) return false;
+        dirty_count_--;
+        return true;
+    }
 
     void SetTextureFrame(uint64_t addr, std::shared_ptr<const std::vector<uint8_t>> rgba, int w, int h) override {
         std::lock_guard<std::mutex> lk(frames_mutex_);
@@ -1069,7 +1090,7 @@ private:
     // ---- streaming buffer: per-list copies of vertex/index/uniform data and upload staging -------------------
     bool CreateStream() {
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bi.size = kStreamSize;
+        bi.size = kStreamSize + kMaxUniformRange;  // slack: a uniform range may start anywhere in the stream
         bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         if (vkCreateBuffer(device_, &bi, nullptr, &stream_) != VK_SUCCESS) return false;
@@ -1082,7 +1103,7 @@ private:
         if (vkAllocateMemory(device_, &ai, nullptr, &stream_memory_) != VK_SUCCESS) return false;
         vkBindBufferMemory(device_, stream_, stream_memory_, 0);
         void* p = nullptr;
-        if (vkMapMemory(device_, stream_memory_, 0, kStreamSize, 0, &p) != VK_SUCCESS) return false;
+        if (vkMapMemory(device_, stream_memory_, 0, kStreamSize + kMaxUniformRange, 0, &p) != VK_SUCCESS) return false;
         stream_ptr_ = static_cast<uint8_t*>(p);
         // A zero-filled uniform range for constant buffers the game did not bind.
         zero_offset_ = 0;
@@ -1148,12 +1169,16 @@ private:
     }
 
     bool CreateDescriptorPool() {
+        LOGI(kTag, "uniform buffers: up to %u with dynamic offsets per pipeline layout, alignment %llu, range %u",
+             props_.limits.maxDescriptorSetUniformBuffersDynamic,
+             (unsigned long long)props_.limits.minUniformBufferOffsetAlignment, props_.limits.maxUniformBufferRange);
         VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16384},
                                         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16384},
-                                        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}};
+                                        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024},
+                                        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 16384}};
         VkDescriptorPoolCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         ci.maxSets = 4096;
-        ci.poolSizeCount = 3;
+        ci.poolSizeCount = 4;
         ci.pPoolSizes = sizes;
         return vkCreateDescriptorPool(device_, &ci, nullptr, &desc_pool_) == VK_SUCCESS;
     }
@@ -1333,11 +1358,17 @@ private:
         if (upload && TakeFrame(*img, t)) return img;
         if (upload && !img->written && !img->uploaded) {
             Upload(*img, t);
-        } else if (upload && img->cpu_source && img->checked_in_list != list_counter_) {
+        } else if (upload && img->cpu_source && img->checked_in_list != list_counter_ &&
+                   (list_counter_ >= img->next_check_list || TakeDirty(t.addr))) {
+            // Most game textures never change after loading; hashing every one every frame cost ~15 ms a
+            // frame (a 1 MB texture is thousands of cache misses). So checks back off while nothing changes.
             img->checked_in_list = list_counter_;
             const bool big = size_t(img->width) * img->height >= 512 * 512;
             if (big) big_checks_++;
-            if (SampleHash(t) != img->sample_hash) {
+            if (SampleHash(t) == img->sample_hash) {
+                img->check_interval = std::min<uint32_t>(img->check_interval * 2, kMaxCheckInterval);
+                img->next_check_list = list_counter_ + img->check_interval;
+            } else {
                 if (big) big_changes_++;
                 Upload(*img, t);
                 if (++reuploads_ <= 8 || reuploads_ % 300 == 0)
@@ -1433,7 +1464,7 @@ private:
         uint64_t h = Fnv(p, std::min<size_t>(256, total));
         h = Fnv(p + total - std::min<size_t>(256, total), std::min<size_t>(256, total), h);
         // Large textures (video frames: mostly dark, letterboxed) need many spots or changes go unnoticed.
-        const size_t spots = total >= (1u << 20) ? 4096 : 64, len = total >= (1u << 20) ? 16 : 64;
+        const size_t spots = total >= (1u << 20) ? 1024 : 64, len = total >= (1u << 20) ? 32 : 64;
         for (size_t i = 1; i < spots; i++) {
             size_t off = total / spots * i;
             h = Fnv(p + off, std::min<size_t>(len, total - off), h);
@@ -1447,6 +1478,8 @@ private:
         img.cpu_source = true;
         img.sample_hash = SampleHash(t);
         img.checked_in_list = list_counter_;
+        img.check_interval = 1;
+        img.next_check_list = list_counter_ + 1;
         const TextureLayout layout = ComputeLayout(t.tex);
         if (!GuestRangeValid(t.addr, layout.total)) {
             LogOnce("upload-range", "texture %dx%d format %d: storage outside known memory, not uploaded",
@@ -1981,22 +2014,30 @@ private:
         return &s;
     }
 
+    // Uniform buffers of a stage are bound with dynamic offsets (so descriptor sets do not depend on where this
+    // draw's uniform data landed in the stream, and are shared between draws) when the device allows that many.
+    bool DynamicUniforms(const shader::ShaderInfo& info) const {
+        return uint32_t(__builtin_popcount(info.cbuf_mask)) <= props_.limits.maxDescriptorSetUniformBuffersDynamic / 2;
+    }
     VkDescriptorSetLayout SetLayout(VkShaderStageFlags stage, const shader::ShaderInfo& info) {
+        const uint32_t stage_key = uint32_t(stage) | (DynamicUniforms(info) ? 0x80000000u : 0);
         const uint64_t fast_key = (uint64_t(info.cbuf_mask) << 40) ^ (uint64_t(info.texture_mask) << 20) ^
                                   (uint64_t(info.shadow_mask) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(info.image_mask) << 58) ^
-                                  uint64_t(stage);
+                                  uint64_t(stage_key);
         auto fast = set_layouts_fast_.find(fast_key);
-        if (fast != set_layouts_fast_.end() && fast->second.first.size() == 5 && fast->second.first[0] == uint32_t(stage) &&
+        if (fast != set_layouts_fast_.end() && fast->second.first.size() == 5 && fast->second.first[0] == stage_key &&
             fast->second.first[1] == info.cbuf_mask && fast->second.first[2] == info.texture_mask &&
             fast->second.first[3] == info.shadow_mask && fast->second.first[4] == info.image_mask)
             return fast->second.second;
-        std::vector<uint32_t> key = {uint32_t(stage), info.cbuf_mask, info.texture_mask, info.shadow_mask, info.image_mask};
+        std::vector<uint32_t> key = {stage_key, info.cbuf_mask, info.texture_mask, info.shadow_mask, info.image_mask};
         auto it = set_layouts_.find(key);
         if (it != set_layouts_.end()) set_layouts_fast_[fast_key] = {key, it->second};
         if (it != set_layouts_.end()) return it->second;
         std::vector<VkDescriptorSetLayoutBinding> b;
         for (uint32_t i = 0; i < 18; i++)
-            if (info.cbuf_mask >> i & 1) b.push_back({i, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, stage, nullptr});
+            if (info.cbuf_mask >> i & 1)
+                b.push_back({i, DynamicUniforms(info) ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                             1, stage, nullptr});
         for (uint32_t i = 0; i < 32; i++) {
             if (info.texture_mask >> i & 1) b.push_back({32 + i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, stage, nullptr});
             if (info.shadow_mask >> i & 1) b.push_back({64 + i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, stage, nullptr});
@@ -2326,7 +2367,10 @@ private:
         struct UboWrite {
             uint32_t set, binding;
             VkDescriptorBufferInfo info;
+            bool dynamic;
+            uint32_t dyn_offset;
         };
+        const bool dyn_stage[2] = {DynamicUniforms(vs->info), DynamicUniforms(fs->info)};
         std::vector<UboWrite> ubo_writes;
         const VkDeviceSize ubo_align = std::max<VkDeviceSize>(16, props_.limits.minUniformBufferOffsetAlignment);
         for (int stage = 0; stage < 2; stage++) {
@@ -2368,7 +2412,12 @@ private:
                 } else {
                     MissingUniform(stage, n);
                 }
-                ubo_writes.push_back({uint32_t(stage), n, bi});
+                if (dyn_stage[stage]) {
+                    // Fixed descriptor (whole range from 0); the offset goes in at bind time.
+                    ubo_writes.push_back({uint32_t(stage), n, {stream_, 0, kMaxUniformRange}, true, uint32_t(bi.offset)});
+                } else {
+                    ubo_writes.push_back({uint32_t(stage), n, bi, false, 0});
+                }
                 if (capture_active_ && stage == 1 && src && size && n >= kCbufBase) {
                     if (ubo_desc_draw_ != drawn_) {
                         pass_ubo_desc_.clear();
@@ -2564,10 +2613,13 @@ private:
         Key64 dk;
         dk.Add(vsl);
         dk.Add(fsl);
+        uint32_t dyn_offsets[36];
+        uint32_t dyn_count = 0;
         for (const UboWrite& u : ubo_writes) {
             dk.Add(u.set);
             dk.Add(u.binding);
-            dk.Add(u.info);
+            dk.Add(u.info);  // for dynamic ones: buffer, 0, range (the same for every draw of the list)
+            if (u.dynamic && dyn_count < 36) dyn_offsets[dyn_count++] = u.dyn_offset;
         }
         for (const TexWrite& t : tex_writes) {
             dk.Add(t.set);
@@ -2599,7 +2651,7 @@ private:
             w.dstSet = sets[u.set];
             w.dstBinding = u.binding;
             w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            w.descriptorType = u.dynamic ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             w.pBufferInfo = &u.info;
             writes.push_back(w);
         }
@@ -2623,11 +2675,14 @@ private:
             vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             bound_pipeline_ = pipeline;
         }
-        if (layout != bound_layout_ || sets[0] != bound_sets_[0] || sets[1] != bound_sets_[1]) {
-            vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 2, sets, 0, nullptr);
+        if (layout != bound_layout_ || sets[0] != bound_sets_[0] || sets[1] != bound_sets_[1] ||
+            dyn_count != bound_dyn_count_ || memcmp(dyn_offsets, bound_dyn_, dyn_count * 4) != 0) {
+            vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 2, sets, dyn_count, dyn_offsets);
             bound_layout_ = layout;
             bound_sets_[0] = sets[0];
             bound_sets_[1] = sets[1];
+            bound_dyn_count_ = dyn_count;
+            memcpy(bound_dyn_, dyn_offsets, dyn_count * 4);
         }
         for (const VkVertexInputBindingDescription& b : vin.bindings)
             vkCmdBindVertexBuffers(cmd_, b.binding, 1, &stream_, &vb_offsets[b.binding]);
@@ -3162,6 +3217,8 @@ private:
     VkPipeline bound_pipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout bound_layout_ = VK_NULL_HANDLE;
     VkDescriptorSet bound_sets_[2] = {};
+    uint32_t bound_dyn_[36] = {};
+    uint32_t bound_dyn_count_ = 0;
 
     // diagnostics
     uint64_t presented_ = 0, drawn_ = 0, list_counter_ = 0, reuploads_ = 0;

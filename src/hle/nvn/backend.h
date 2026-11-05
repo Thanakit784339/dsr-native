@@ -112,6 +112,9 @@ public:
     virtual void RequestCapture(int /*delay_s*/) {}
     // A new picture (linear RGBA8, w x h) for the texture whose storage is at `addr` (a video frame): used as
     // that texture's level 0 from its next use on. Thread-safe; a newer frame replaces one not yet used.
+    // The CPU rewrote the storage of the texture at `addr` (nvnTextureWriteTexels): re-check it at its next
+    // use. Thread-safe.
+    virtual void MarkTextureDirty(uint64_t /*addr*/) {}
     virtual void SetTextureFrame(uint64_t /*addr*/, std::shared_ptr<const std::vector<uint8_t>> /*rgba*/, int /*w*/,
                                  int /*h*/) {}
 };
