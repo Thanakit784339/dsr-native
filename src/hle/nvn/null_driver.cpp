@@ -465,7 +465,7 @@ void QueuePresentTexture(void* queue, void* window, int index) {
     static std::atomic<uint64_t> frames{0};
     static clock::time_point report = clock::now();
     static GpuStats last{};
-    static const int fps = std::clamp(dsr::GetRuntime().config.target_fps, 30, 60);
+    const int fps = dsr::FrameRateNow();  // 30 while a movie plays
     const auto frame = std::chrono::microseconds(1000000 / fps);
     auto now = clock::now();
     // Frame times (present to present): average, worst, and how many took over twice the target (hitches).

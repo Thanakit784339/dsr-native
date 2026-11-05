@@ -10,6 +10,8 @@
 
 #include "common/log.h"
 #include "hle/os/os.h"
+#include <atomic>
+
 #include "runtime/runtime.h"
 
 namespace dsr {
@@ -25,7 +27,7 @@ void FrameLimiter(uint8_t* self, int /*fps*/) {
     if (*reinterpret_cast<const int32_t*>(rt.main.base() + 0x251fb4c) != 0) return;
     using clock = std::chrono::steady_clock;
     static clock::time_point last;
-    const int fps = std::clamp(rt.config.target_fps, 31, 60);
+    const int fps = FrameRateNow();
     const auto period = std::chrono::nanoseconds(1'000'000'000 / fps);
     auto now = clock::now();
     if (last.time_since_epoch().count() != 0 && now < last + period) {
@@ -101,6 +103,16 @@ const Hook kHooks[] = {
 }  // namespace
 
 float GameFrameTime() { return g_game_step ? *g_game_step : 1.0f / 30.0f; }
+namespace {
+std::atomic<int> g_movies{0};
+}
+void SetMoviePlaying(bool playing) {
+    const int n = playing ? ++g_movies : --g_movies;
+    LOGI("hooks", "movie %s: frame rate %d fps", playing ? "started" : "ended", n > 0 ? 30 : std::clamp(GetRuntime().config.target_fps, 30, 60));
+}
+int FrameRateNow() {
+    return g_movies.load(std::memory_order_relaxed) > 0 ? 30 : std::clamp(GetRuntime().config.target_fps, 30, 60);
+}
 
 void InstallGameHooks() {
     Runtime& rt = GetRuntime();

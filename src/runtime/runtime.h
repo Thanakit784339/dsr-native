@@ -24,7 +24,7 @@ struct RuntimeConfig {
     bool auto_capture = false;    // diagnostics: save a few frame captures automatically during play
     bool profile = true;          // diagnostics: sampling CPU profile of the busy threads, logged every 10 s
     float gamma = 1.0f;           // extra display gamma applied through the game's brightness ramp (> 1 lifts shadows)
-    bool audio_smooth = true;  // release audio buffers to the game at a smooth pace (movie timing)
+    bool audio_smooth = false;  // release audio buffers at a smoothed pace (experiment; movies were not timed by it)
     bool fast_cores = true;  // keep the game's frame-critical threads off the efficiency cores
     bool record_thread = true;  // record Vulkan commands on a second thread (draw preparation stays on the render thread)
     bool pin_render_thread = false;  // keep the render thread on the fastest CPU core(s) (slower on 8 Gen 2: off)
@@ -55,6 +55,11 @@ int RunGame();
 void InstallGameHooks();
 // The game's current per-frame time step in seconds (1/30 unless the 60 fps patches are active).
 float GameFrameTime();
+// The game's movie player shows one video frame per game frame (30 fps on the Switch): while a video
+// plays, frames are paced at 30 instead of the configured rate (at 60 the video ran at double speed and
+// stopped every few frames to wait for its sound).
+void SetMoviePlaying(bool playing);
+int FrameRateNow();  // the configured rate (30..60), or 30 while a movie plays
 
 // Prints an import binding summary (implemented / unimplemented / data) to the log.
 void LogImportReport(bool list_unimplemented);

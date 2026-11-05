@@ -381,6 +381,7 @@ struct Decoder {
     // Decoded picture geometry (from the codec's output format).
     int width = 0, height = 0, stride = 0, slice_height = 0, crop_left = 0, crop_top = 0;
     bool logged_convert = false;
+    bool counted_playing = false;  // SetMoviePlaying(true) made for this (video) decoder
     // Diagnostics (movie stutter): when the game took its first video frames, against their timestamps.
     std::string take_trace;
     int takes_traced = 0;
@@ -391,6 +392,7 @@ struct Decoder {
     AMediaCodec* codec = nullptr;
 #endif
     ~Decoder() {
+        if (counted_playing) dsr::SetMoviePlaying(false);
 #if defined(__ANDROID__)
         if (codec) {
             AMediaCodec_stop(codec);
@@ -582,7 +584,12 @@ int DecStart(void* self) {
 #if defined(__ANDROID__)
     Decoder* d = Dec(self);
     if (!d->codec) return kFail;
-    return AMediaCodec_start(d->codec) == AMEDIA_OK ? kOk : kFail;
+    const bool ok = AMediaCodec_start(d->codec) == AMEDIA_OK;
+    if (ok && d->type == 1 && !d->counted_playing) {
+        d->counted_playing = true;
+        dsr::SetMoviePlaying(true);
+    }
+    return ok ? kOk : kFail;
 #else
     return kFail;
 #endif
@@ -591,6 +598,10 @@ int DecStop(void* self) {
 #if defined(__ANDROID__)
     Decoder* d = Dec(self);
     if (d->codec) AMediaCodec_stop(d->codec);
+    if (d->counted_playing) {
+        d->counted_playing = false;
+        dsr::SetMoviePlaying(false);
+    }
     std::lock_guard<std::mutex> lk(d->m);
     d->inputs.clear();
     d->outputs.clear();

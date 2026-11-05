@@ -320,8 +320,8 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "record_thread = 1\n"
                     "# fast_cores: 1 = keep the game's main, recording and submit threads on the performance cores\n"
                     "fast_cores = 1\n"
-                    "# audio_smooth: 1 = report audio progress to the game smoothly (movies time video by it)\n"
-                    "audio_smooth = 1\n",
+                    "# audio_smooth: 1 = release audio buffers to the game at a smoothed pace (experimental)\n"
+                    "audio_smooth = 0\n",
                     cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0,
                     cfg->gamma, cfg->exposure);
             fclose(w);
