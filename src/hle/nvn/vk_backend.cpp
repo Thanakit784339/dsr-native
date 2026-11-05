@@ -654,6 +654,7 @@ public:
         if (req && std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() >= req) {
             capture_request_ms_ = 0;
             capture_active_ = true;
+            world_draws_logged_ = 0;
             capture_pass_ = 0;
             pass_written_.clear();
             pass_draws_ = 0;
@@ -677,6 +678,7 @@ public:
         if (now < next_capture_) return;
         next_capture_ = now + std::chrono::seconds(45);
         capture_active_ = true;
+        world_draws_logged_ = 0;
         capture_pass_ = 0;
         if (!query_pool_) {
             VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -3132,6 +3134,31 @@ private:
                      int(st_.depth.depth_test), int(st_.depth.depth_write), int(st_.depth.stencil_test));
             pass_state_desc_ = d;
         }
+        // Diagnostics (darkness): the first few lit world draws of a capture (shadow map + cube map sampled)
+        // log their textures and constants, and their sampled textures are captured.
+        if (capture_active_ && world_draws_logged_ < 3 && fs->info.shadow_mask) {
+            bool cube = false;
+            for (int k = 0; k < 32; k++) cube |= fs->info.texture_dim[k] == shader::TexDim::Cube;
+            if (cube) {
+                world_draws_logged_++;
+                LOGI(kTag, "capture world draw %d (pass %u): fs code @%llx vs code @%llx, textures:%s", world_draws_logged_,
+                     capture_pass_, (unsigned long long)(st_.program[1] ? st_.program[1]->address : 0),
+                     (unsigned long long)(st_.program[0] ? st_.program[0]->address : 0), pass_tex_desc_.c_str());
+                for (size_t at = 0; at < pass_ubo_desc_.size(); at += 2800)
+                    LOGI(kTag, "capture world draw %d constants%s:%s", world_draws_logged_, at ? " (cont.)" : "",
+                         pass_ubo_desc_.substr(at, 2800).c_str());
+                for (int k = 0; k < 32; k++) {
+                    const BoundTexture& bt = st_.textures[1][k];
+                    if (!bt.valid || fs->info.texture_dim[k] == shader::TexDim::None) continue;
+                    auto it = images_.find(bt.texture.addr);
+                    if (it == images_.end()) continue;
+                    LOGI(kTag, "capture world draw %d texture fs%d: NVN format %d %dx%d, %d layers, %d levels -> item %zu",
+                         world_draws_logged_, k, it->second.nvn_format, it->second.width, it->second.height,
+                         it->second.layers, it->second.levels, capture_items_.size());
+                    CaptureImage(it->second);
+                }
+            }
+        }
         drawn_++;
         pass_draws_++;
         if (st_.program[1]) {
@@ -3850,6 +3877,7 @@ private:
     std::map<std::string, uint64_t> sampled_breaks_;
     std::vector<uint32_t> query_pass_;
     uint64_t ubo_desc_draw_ = ~0ull;
+    int world_draws_logged_ = 0;
     uint64_t tex_desc_draw_ = ~0ull;
     std::vector<CaptureItem> capture_items_;
     VkExtent2D no_attachment_extent_{0, 0};  // render area for a draw with no attachments (storage-only)
