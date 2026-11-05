@@ -24,6 +24,7 @@ struct RuntimeConfig {
     bool auto_capture = false;    // diagnostics: save a few frame captures automatically during play
     bool profile = true;          // diagnostics: sampling CPU profile of the busy threads, logged every 10 s
     float gamma = 1.0f;           // extra display gamma applied through the game's brightness ramp (> 1 lifts shadows)
+    bool pin_render_thread = true;  // keep the render thread on the fastest CPU core(s)
     float exposure = 1.0f;        // scales the tone-mapping exposure (1.45: what the game's own adaptation computes)
 };
 

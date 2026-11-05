@@ -311,7 +311,9 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "gamma = %.2f\n"
                     "# exposure: scales the scene's exposure before tone mapping (1.0 = as the game draws it; 1.45\n"
                     "# is what the game's own light adaptation computes in dark areas)\n"
-                    "exposure = %.2f\n",
+                    "exposure = %.2f\n"
+                    "# pin_render_thread: 1 = keep the render thread on the fastest CPU core (recommended)\n"
+                    "pin_render_thread = 1\n",
                     cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0,
                     cfg->gamma, cfg->exposure);
             fclose(w);
@@ -327,6 +329,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "async_pipelines")) cfg->async_pipelines = v != 0;
             else if (!strcmp(key, "auto_capture")) cfg->auto_capture = v != 0;
             else if (!strcmp(key, "profile")) cfg->profile = v != 0;
+            else if (!strcmp(key, "pin_render_thread")) cfg->pin_render_thread = v != 0;
             else if (!strcmp(key, "gamma")) {
                 const float g = float(atof(value));
                 cfg->gamma = g >= 0.5f && g <= 3.0f ? g : 1.0f;

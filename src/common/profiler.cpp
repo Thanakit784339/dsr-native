@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -149,7 +150,7 @@ void Report() {
     if (samples.empty()) return;
     const int n = g_nslots.load();
     for (int slot = 0; slot < n; slot++) {
-        std::map<std::string, int> self, ours, game;
+        std::map<std::string, int> self, ours, game, libs;
         int total = 0;
         for (const Sample& s : samples) {
             if (s.slot != slot) continue;
@@ -157,6 +158,10 @@ void Report() {
             // Self: the pc, labelled down to the function where our symbols allow it (rounded to 64 bytes so
             // nearby instructions add up; exact offsets are not needed to find a function).
             Where w = Locate(s.pc[0]);
+            {  // by library: the part of the label before '+'
+                const size_t plus = w.label.find('+');
+                libs[w.kind == 0 ? "game" : w.kind == 1 ? "ours" : plus != std::string::npos ? w.label.substr(0, plus) : "?"]++;
+            }
             self[w.kind == 1 || w.kind == 0 ? Locate(s.pc[0] & ~uintptr_t(63)).label : w.label]++;
             bool got_ours = false, got_game = false;
             for (int d = 0; d < s.depth && (!got_ours || !got_game); d++) {
@@ -205,8 +210,22 @@ void Report() {
             }
             LOGI(kTag, "  %s: %s", what, line.c_str());
         };
-        LOGI(kTag, "thread '%s' (tid %d): %d samples, %.1f s of CPU in the last 10 s", g_slots[slot].name, tid, total,
-             cpu_s);
+        // The CPU it last ran on (field 39 of /proc/.../stat), to see which cores the busy threads get.
+        int cpu = -1;
+        snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+        if (FILE* f = fopen(path, "r")) {
+            char buf[1024];
+            const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+            buf[n] = 0;
+            fclose(f);
+            const char* p = strrchr(buf, ')');  // the name may contain spaces
+            for (int field = 2; p && *p && field < 39; p++)
+                if (*p == ' ') field++;
+            if (p) cpu = atoi(p);
+        }
+        LOGI(kTag, "thread '%s' (tid %d, last on CPU %d): %d samples, %.1f s of CPU in the last 10 s", g_slots[slot].name,
+             tid, cpu, total, cpu_s);
+        top("by library", libs);
         top("self", self);
         top("in our code", ours);
         top("in game code", game);

@@ -9,7 +9,14 @@
 // Every texture referenced by a command is captured by value (description + storage address) at
 // record time, so later Finalize/re-Initialize of the NVN object does not affect recorded work.
 
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
 #include <atomic>
+#include <cstdio>
+#include <string>
+#include <vector>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -24,6 +31,7 @@
 #include "hle/nvn.h"
 #include "hle/nvn/backend.h"
 #include "hle/nvn/state.h"
+#include "runtime/runtime.h"
 
 namespace dsr::hle::nvn {
 namespace {
@@ -527,8 +535,43 @@ private:
         return false;
 #endif
     }
+    // The render thread is the frame's critical path (all of the game's draws are turned into Vulkan commands
+    // here): it is kept on the fastest cores (highest maximum clock; the prime core on Snapdragon 8 Gen 2).
+    static void PinToFastestCores() {
+#if defined(__linux__)
+        if (!dsr::GetRuntime().config.pin_render_thread) return;
+        long best = 0;
+        std::vector<int> cpus;
+        for (int cpu = 0; cpu < 16; cpu++) {
+            char path[96];
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+            FILE* f = fopen(path, "r");
+            if (!f) continue;
+            long khz = 0;
+            if (fscanf(f, "%ld", &khz) != 1) khz = 0;
+            fclose(f);
+            if (khz > best) {
+                best = khz;
+                cpus.clear();
+            }
+            if (khz == best && khz > 0) cpus.push_back(cpu);
+        }
+        if (cpus.empty()) return;
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        std::string list;
+        for (int c : cpus) {
+            CPU_SET(c, &set);
+            list += " " + std::to_string(c);
+        }
+        const int r = sched_setaffinity(0, sizeof(set), &set);
+        LOGI(kTag, "render thread pinned to the fastest CPU(s)%s (%ld MHz): %s", list.c_str(), best / 1000,
+             r == 0 ? "ok" : "refused");
+#endif
+    }
     void Run() {
         dsr::profiler::RegisterCurrentThread("render (Vulkan)");
+        PinToFastestCores();
         for (;;) {
             std::function<void()> task;
             {
