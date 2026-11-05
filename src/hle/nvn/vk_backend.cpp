@@ -777,6 +777,13 @@ public:
             pass_written_.clear();
             pass_draws_ = 0;
             query_pass_.clear();
+            capture_draws_logged_ = 0;
+            if (!query_pool_) {  // requested captures had no pool: no per-draw sample counts
+                VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                qi.queryType = VK_QUERY_TYPE_OCCLUSION;
+                qi.queryCount = kMaxQueries;
+                vkCreateQueryPool(device_, &qi, nullptr, &query_pool_);
+            }
             if (query_pool_) {
                 Begin();
                 EndRendering();
@@ -980,6 +987,7 @@ public:
         capture_items_.push_back(it);
     }
     void FinishCapture() {
+        capture_draws_logged_ = 0;
         WaitGpuIdle();  // the readback buffers are written by the submission that just went out
         capture_active_ = false;
         if (ts_pool_ && ts_count_ > 1) {
@@ -1017,6 +1025,17 @@ public:
                     line += d;
                 }
                 LOGI(kTag, "capture %d samples passed per pass (samples/draws):%s", captures_done_, line.c_str());
+                // Per draw, for passes of few draws (single objects): did it cover any pixels?
+                std::string per_draw;
+                for (size_t q = 0; q < res.size(); q++) {
+                    if (per_pass[query_pass_[q]].second > 4) continue;
+                    char d[48];
+                    snprintf(d, sizeof(d), " q%zu(p%u):%llu", q, query_pass_[q], (unsigned long long)res[q]);
+                    per_draw += d;
+                }
+                for (size_t at = 0; at < per_draw.size(); at += 2800)
+                    LOGI(kTag, "capture %d samples per draw (passes of up to 4 draws)%s:%s", captures_done_,
+                         at ? " (cont.)" : "", per_draw.substr(at, 2800).c_str());
             }
         }
         char name[64];
@@ -3738,6 +3757,38 @@ private:
             d.query = uint32_t(query_pass_.size());
             query_pass_.push_back(capture_pass_);
         }
+        if (capture_active_ && capture_draws_logged_ < 400) {
+            capture_draws_logged_++;
+            std::string desc;
+            char b[160];
+            snprintf(b, sizeof(b), "capture draw q%d (pass %u): vs %016llx, %s count %d, %d instances (base %d), base vertex %d, "
+                     "first %d, viewport %g,%g %gx%g on %ux%u | streams:", d.query == UINT32_MAX ? -1 : int(d.query),
+                     capture_pass_, (unsigned long long)st_.program[0]->hash, p.index_type >= 0 ? "indexed" : "arrays",
+                     p.count, p.instances, p.base_instance, p.base_vertex, p.first, d.dyn.vp.x, d.dyn.vp.y, d.dyn.vp.width,
+                     d.dyn.vp.height, extent.width, extent.height);
+            desc = b;
+            for (const VkVertexInputBindingDescription& vb_ : vin.bindings) {
+                const BufferRange& r = st_.vertex_buffers[vb_.binding];
+                snprintf(b, sizeof(b), " s%u stride %u%s @%llx size %llu", vb_.binding, vb_.stride,
+                         vb_.inputRate == VK_VERTEX_INPUT_RATE_INSTANCE ? " (instanced)" : "", (unsigned long long)r.address,
+                         (unsigned long long)r.size);
+                desc += b;
+            }
+            desc += " | attribs:";
+            for (const VkVertexInputAttributeDescription& a : vin.attributes) {
+                snprintf(b, sizeof(b), " %u:s%u fmt %d +%u", a.location, a.binding, st_.attribs[a.location].format, a.offset);
+                desc += b;
+            }
+            desc += " | uniforms:";
+            for (int stage = 0; stage < 2; stage++)
+                for (int n = 0; n < 15; n++)
+                    if (st_.uniforms[stage][n].address) {
+                        snprintf(b, sizeof(b), " %s%d %llu", stage ? "fs" : "vs", n + int(kCbufBase),
+                                 (unsigned long long)st_.uniforms[stage][n].size);
+                        desc += b;
+                    }
+            LOGI(kTag, "%s", desc.c_str());
+        }
         VbBind vb[16];
         for (const VkVertexInputBindingDescription& b : vin.bindings)
             vb[d.n_vb++] = {b.binding, vb_bufs[b.binding], vb_offsets[b.binding]};
@@ -4926,6 +4977,7 @@ private:
     std::unordered_set<uint64_t> viewport_keys_;
     std::set<std::string> view_mismatch_logged_;
     uint64_t view_standins_ = 0;
+    int capture_draws_logged_ = 0;
     std::unordered_map<uint64_t, uint64_t> snapshot_gen_;
     double exec_ms_ = 0, wait_ms_ = 0;
     VkDescriptorPool desc_pool_ = VK_NULL_HANDLE;
