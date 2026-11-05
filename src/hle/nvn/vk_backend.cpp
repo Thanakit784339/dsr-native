@@ -1919,20 +1919,26 @@ private:
             const uint64_t h = Fnv(p, w.size);
             if (h == w.hash) continue;
             w.hash = h;
-            const float* f = reinterpret_cast<const float*>(p);
             // Only something that still looks like a ramp is copied (the memory may be a reused upload buffer):
-            // 256 RGBA32F entries, finite, 0..4, non-decreasing per colour channel.
-            bool ramp = w.size >= 256 * 16 && w.cmd.dst.tex.width == 256;
-            for (int i = 0; ramp && i < 256; i++)
+            // one entry per texel (8-bit or 32-bit float channels), each colour channel non-decreasing.
+            const int width = w.cmd.dst.tex.width;
+            const size_t bpp = width > 0 ? w.size / size_t(width) : 0;
+            auto channel = [&](int i, int ch) -> float {
+                if (bpp == 4) return p[size_t(i) * 4 + size_t(ch)] / 255.f;
+                if (bpp == 16) return reinterpret_cast<const float*>(p)[size_t(i) * 4 + size_t(ch)];
+                return -1.f;
+            };
+            bool ramp = (bpp == 4 || bpp == 16) && width >= 16;
+            for (int i = 0; ramp && i < width; i++)
                 for (int ch = 0; ch < 3 && ramp; ch++) {
-                    const float v = f[i * 4 + ch];
-                    ramp = v == v && v >= 0.f && v <= 4.f && (i == 0 || v + 1e-6f >= f[(i - 1) * 4 + ch]);
+                    const float v = channel(i, ch);
+                    ramp = v == v && v >= 0.f && v <= 4.f && (i == 0 || v + 1e-6f >= channel(i - 1, ch));
                 }
             static int logged = 0;
             if (logged++ < 30)
-                LOGI(kTag, "copy source @%llx of a %dx%d table changed: [0] %.4f %.4f %.4f | [128] %.4f | [255] %.4f: %s",
-                     (unsigned long long)w.cmd.src_addr, w.cmd.dst.tex.width, w.cmd.dst.tex.height, f[0], f[1], f[2],
-                     w.size >= 129 * 16 ? f[128 * 4] : 0.f, w.size >= 256 * 16 ? f[255 * 4] : 0.f,
+                LOGI(kTag, "copy source @%llx of a %dx%d table changed (%zu B/texel): [0] %.3f %.3f %.3f | [%d] %.3f | [%d] %.3f: %s",
+                     (unsigned long long)w.cmd.src_addr, width, w.cmd.dst.tex.height, bpp, channel(0, 0),
+                     channel(0, 1), channel(0, 2), width / 2, channel(width / 2, 0), width - 1, channel(width - 1, 0),
                      ramp ? "copied again" : "not a ramp, ignored");
             if (!ramp) continue;
             const Cmd c = w.cmd;
