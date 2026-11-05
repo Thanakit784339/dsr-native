@@ -11,6 +11,7 @@
 #include "arch/arch.h"
 #include "common/crash.h"
 #include "common/log.h"
+#include "common/platform.h"
 #include "hle/os/os.h"
 #include "hle/registry.h"
 
@@ -142,6 +143,7 @@ int g_exit_code = 0;
 void* GameThread(void*) {
     Runtime& rt = GetRuntime();
     hle::os::AdoptMainThread("MainThread", kMainThreadStack, kMainThreadPriority);
+    platform::PreferFastCores("game main thread");
 
     const uintptr_t init_startup = rt.main.Export("nninitStartup");
     const uintptr_t init = rt.main.Export("_init");

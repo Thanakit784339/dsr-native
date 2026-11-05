@@ -21,4 +21,8 @@ void DeliverText(bool ok, const std::u16string& text);
 // True once a result is available (then fills ok/text and clears it).
 bool TakeText(bool* ok, std::u16string* text);
 
+// Keeps the calling thread on the performance cores (off the slowest cluster, where the scheduler puts
+// threads that sleep between bursts of work every frame). Once per thread; logs `who`. No-op elsewhere.
+void PreferFastCores(const char* who);
+
 }  // namespace dsr::platform

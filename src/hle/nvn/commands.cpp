@@ -29,6 +29,7 @@
 #include <unordered_map>
 
 #include "common/log.h"
+#include "common/platform.h"
 #include "common/profiler.h"
 #include "hle/nvn.h"
 #include "hle/nvn/backend.h"
@@ -152,6 +153,7 @@ void Append(void* cb, Cmd&& c) {
 
 // ---- recording ------------------------------------------------------------------------------------------
 void BeginRecording(void* cb) {
+    dsr::platform::PreferFastCores("game command recording thread");  // the game's MTR_* workers
     Recorder& r = RecorderOf(cb);
     r.recording = true;
     r.cmds.clear();
@@ -708,6 +710,7 @@ void QueueFinish(void* /*queue*/) {
 }
 
 void QueueSubmitCommands(void* /*queue*/, int n, const uint64_t* handles) {
+    dsr::platform::PreferFastCores("game submit thread");
     g_submit_calls++;
     for (int i = 0; i < n; i++) {
         auto list = FindHandle(handles[i]);

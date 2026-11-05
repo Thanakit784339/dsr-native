@@ -35,6 +35,7 @@
 #include <vector>
 
 #include <sys/resource.h>
+#include <dlfcn.h>
 #include <unistd.h>
 
 #include "common/log.h"
@@ -746,6 +747,11 @@ public:
         img.sample_hash = SampleHash(t);
         img.checked_in_list = list_counter_;
         frames_uploaded_++;
+        {
+            const uint64_t shown = presented_ - last_video_present_;  // presents since the previous video frame
+            last_video_present_ = presented_;
+            video_cadence_[std::min<uint64_t>(shown, 4)]++;
+        }
         return true;
     }
 
@@ -1462,6 +1468,20 @@ private:
         }
     }
 
+    // Tells Android the frame rate we present at, so the display runs at a rate that is a multiple of it (on a
+    // 120 Hz or 90 Hz panel, 60 fps frames otherwise land on uneven numbers of refreshes: smooth video and
+    // camera pans judder). ANativeWindow_setFrameRate is API 30+: looked up at run time.
+    void SetWindowFrameRate() {
+        using Fn = int32_t (*)(ANativeWindow*, float, int8_t);
+        static Fn fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "ANativeWindow_setFrameRate"));
+        const float fps = float(std::clamp(dsr::GetRuntime().config.target_fps, 30, 60));
+        if (!fn) {
+            LOGI(kTag, "ANativeWindow_setFrameRate not available: display rate left to the system");
+            return;
+        }
+        const int32_t r = fn(static_cast<ANativeWindow*>(window_), fps, 1 /* FIXED_SOURCE */);
+        LOGI(kTag, "window frame rate set to %.0f fps (fixed source): %s", fps, r == 0 ? "ok" : "refused");
+    }
     bool EnsureSwapchain() {
         void* w = dsr::video::GetNativeWindow();
         if (w != window_) {
@@ -1479,6 +1499,7 @@ private:
                 surface_ = VK_NULL_HANDLE;
                 return false;
             }
+            SetWindowFrameRate();
         }
         if (swapchain_ && !swapchain_dirty_) return true;
         Drain();  // the recorder acquires and presents with the swapchain
@@ -4619,9 +4640,14 @@ private:
         {
             std::lock_guard<std::mutex> lk(frames_mutex_);
             if (frames_set_) {
-                LOGI(kTag, "video frames: %llu decoded into textures, %llu uploaded (newer ones replace unused ones)",
-                     (unsigned long long)frames_set_, (unsigned long long)frames_uploaded_);
+                LOGI(kTag, "video frames: %llu decoded into textures, %llu uploaded (newer ones replace unused ones); "
+                     "shown for 0/1/2/3/4+ frames: %llu/%llu/%llu/%llu/%llu",
+                     (unsigned long long)frames_set_, (unsigned long long)frames_uploaded_,
+                     (unsigned long long)video_cadence_[0], (unsigned long long)video_cadence_[1],
+                     (unsigned long long)video_cadence_[2], (unsigned long long)video_cadence_[3],
+                     (unsigned long long)video_cadence_[4]);
                 frames_set_ = frames_uploaded_ = 0;
+                for (uint64_t& c : video_cadence_) c = 0;
             }
         }
         LOGI(kTag, "last 10 s: %llu render passes started, %llu image barriers", (unsigned long long)render_passes_,
@@ -4884,6 +4910,7 @@ private:
     uint32_t bound_dyn_count_ = 0;
 
     // diagnostics
+    uint64_t last_video_present_ = 0, video_cadence_[5] = {};
     uint64_t presented_ = 0, drawn_ = 0, list_counter_ = 0, reuploads_ = 0;
     int swapchains_created_ = 0, images_created_ = 0, clear_colors_logged_ = 0, copies_logged_ = 0,
         target_sets_logged_ = 0, shaders_translated_ = 0, shader_failures_logged_ = 0, uploads_ = 0, flushes_ = 0,
