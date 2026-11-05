@@ -18,6 +18,7 @@
 #include "common/log.h"
 #include "hle/nvn.h"
 #include "hle/nvn/backend.h"
+#include "runtime/runtime.h"
 #include "hle/nvn/layout.h"
 #include "hle/nvn/state.h"
 #include "hle/nvn/shader_dump.h"
@@ -443,16 +444,37 @@ bool QueueInitialize(void* q, const void* b) {
     return true;
 }
 
-// Present: pace to 30 fps (Dark Souls Remastered's rate on Switch), then let the backend show the window
-// texture. Every 10 s, report what the game submitted per frame.
+// Present: pace to the configured rate (settings: 30 as on Switch, or 60), then let the backend show the
+// window texture. Every 10 s, report what the game submitted per frame and how even the frame times were.
 void QueuePresentTexture(void* queue, void* window, int index) {
     using clock = std::chrono::steady_clock;
     static thread_local clock::time_point next = clock::now();
     static std::atomic<uint64_t> frames{0};
     static clock::time_point report = clock::now();
     static GpuStats last{};
-    const auto frame = std::chrono::microseconds(33333);
+    static const int fps = dsr::GetRuntime().config.target_fps == 30 ? 30 : 60;
+    const auto frame = std::chrono::microseconds(fps == 30 ? 33333 : 16667);
     auto now = clock::now();
+    // Frame times (present to present): average, worst, and how many took over twice the target (hitches).
+    static clock::time_point last_present = now;
+    static double ft_sum = 0, ft_max = 0;
+    static uint64_t ft_n = 0, ft_hitches = 0;
+    {
+        const double ms = std::chrono::duration<double, std::milli>(now - last_present).count();
+        last_present = now;
+        ft_sum += ms;
+        ft_max = std::max(ft_max, ms);
+        ft_n++;
+        if (ms > 2.0 * 1000.0 / fps) ft_hitches++;
+    }
+    static bool caller_logged = false;
+    if (!caller_logged) {
+        caller_logged = true;
+        const loader::Module& m = dsr::GetRuntime().main;
+        const uintptr_t ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        LOGI(kTag, "presenting at up to %d fps (settings); nvnQueuePresentTexture called from main+0x%lx", fps,
+             (unsigned long)(m.Contains(ra) ? ra - m.base() : 0));
+    }
     if (next > now)
         std::this_thread::sleep_until(next);
     else if (now - next > frame * 4)
@@ -473,6 +495,11 @@ void QueuePresentTexture(void* queue, void* window, int index) {
              tex.tex.height, tex.tex.format);
     if (clock::now() - report > std::chrono::seconds(10)) {
         report = clock::now();
+        if (ft_n)
+            LOGI(kTag, "frame times: %.1f ms average, %.1f ms worst, %llu over %.0f ms (hitches)", ft_sum / ft_n, ft_max,
+                 (unsigned long long)ft_hitches, 2.0 * 1000.0 / fps);
+        ft_sum = ft_max = 0;
+        ft_n = ft_hitches = 0;
         GpuStats s = Stats();
         double f = double(std::max<uint64_t>(1, n - frames_at_report));
         LOGI(kTag,
@@ -499,7 +526,15 @@ void WindowBuilderSetTextures(void* b, int n, const void* const* textures) {
     w.num_textures = std::min(n, 4);
     for (int i = 0; i < w.num_textures; i++) w.textures[i] = textures[i];
 }
-void WindowBuilderSetPresentInterval(void* b, int v) { g_window_builders.Get(b).present_interval = v; }
+void WindowBuilderSetPresentInterval(void* b, int v) {
+    LOGI(kTag, "game asks for present interval %d (window builder); pacing follows settings instead", v);
+    g_window_builders.Get(b).present_interval = v;
+}
+void WindowSetPresentInterval(void* /*window*/, int v) {
+    static int last = -1;
+    if (v != last) LOGI(kTag, "game asks for present interval %d; pacing follows settings instead", v);
+    last = v;
+}
 bool WindowInitialize(void* w, const void* b) {
     WindowState s = g_window_builders.Copy(b);
     g_windows.Get(w) = s;
@@ -626,7 +661,7 @@ const Proc kProcs[] = {
     P("nvnWindowBuilderSetPresentInterval", WindowBuilderSetPresentInterval),
     P("nvnWindowInitialize", WindowInitialize), P("nvnWindowFinalize", WindowFinalize),
     P("nvnWindowAcquireTexture", WindowAcquireTexture), P("nvnWindowGetNumActiveTextures", WindowGetNumTextures),
-    P("nvnWindowGetNumTextures", WindowGetNumTextures), P("nvnWindowSetPresentInterval", Nop),
+    P("nvnWindowGetNumTextures", WindowGetNumTextures), P("nvnWindowSetPresentInterval", WindowSetPresentInterval),
     P("nvnWindowSetCrop", Nop), P("nvnWindowSetNumActiveTextures", Nop),
 };
 #undef P

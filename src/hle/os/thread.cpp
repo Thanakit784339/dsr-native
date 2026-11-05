@@ -5,6 +5,11 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <vector>
+#include <string>
+#include <map>
+#include <chrono>
+#include <algorithm>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -13,6 +18,7 @@
 #include "common/log.h"
 #include "hle/os/os.h"
 #include "hle/registry.h"
+#include "runtime/runtime.h"
 
 namespace dsr::hle::os {
 
@@ -257,7 +263,58 @@ HLE_FUNC(_ZN2nn2os19GetCurrentStackInfoEPmS1_, void, nn_os_GetCurrentStackInfo, 
     if (size) *size = t_current->stack_hi - t_current->stack_lo;
 }
 
+namespace dsr::hle::os {
+namespace {
+// Diagnostics: who sleeps how long (finds the game's frame limiter). Per caller (guest return address and the
+// caller's own return address, both as main+offset), every 10 s, the ones that slept the most.
+struct SleepSite {
+    uint64_t calls = 0;
+    int64_t total_ns = 0, min_ns = INT64_MAX, max_ns = 0;
+    std::string thread;
+};
+std::mutex g_sleep_mutex;
+std::map<std::pair<uintptr_t, uintptr_t>, SleepSite> g_sleep_sites;
+std::chrono::steady_clock::time_point g_sleep_report = std::chrono::steady_clock::now();
+
+uintptr_t MainOffset(uintptr_t a) {
+    const dsr::loader::Module& m = dsr::GetRuntime().main;
+    return m.Contains(a) ? a - m.base() : 0;
+}
+
+void RecordSleep(uintptr_t ret, uintptr_t frame, int64_t ns) {
+    // `frame` is the calling guest function's frame record (its x29): [frame + 8] is where it returns to.
+    uintptr_t ret2 = 0;
+    if (t_current && frame >= t_current->stack_lo && frame + 16 <= t_current->stack_hi)
+        ret2 = *reinterpret_cast<const uintptr_t*>(frame + 8);
+    const auto key = std::make_pair(MainOffset(ret), MainOffset(ret2));
+    std::lock_guard<std::mutex> lk(g_sleep_mutex);
+    SleepSite& site = g_sleep_sites[key];
+    site.calls++;
+    site.total_ns += ns;
+    site.min_ns = std::min(site.min_ns, ns);
+    site.max_ns = std::max(site.max_ns, ns);
+    if (site.thread.empty() && t_current) site.thread = t_current->name;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_sleep_report < std::chrono::seconds(10)) return;
+    g_sleep_report = now;
+    std::vector<std::pair<int64_t, std::pair<std::pair<uintptr_t, uintptr_t>, SleepSite>>> top;
+    for (auto& [k, v] : g_sleep_sites) top.push_back({v.total_ns, {k, v}});
+    std::sort(top.begin(), top.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    for (size_t i = 0; i < top.size() && i < 6; i++) {
+        const auto& [k, v] = top[i].second;
+        if (v.total_ns < 50'000'000) break;
+        LOGI(kTag, "sleep: main+0x%lx (from main+0x%lx) thread '%s': %llu calls, %.1f s total, %.2f-%.2f ms",
+             (unsigned long)k.first, (unsigned long)k.second, v.thread.c_str(), (unsigned long long)v.calls,
+             v.total_ns / 1e9, v.min_ns / 1e6, v.max_ns / 1e6);
+    }
+    g_sleep_sites.clear();
+}
+}  // namespace
+}  // namespace dsr::hle::os
+
 HLE_FUNC(_ZN2nn2os11SleepThreadENS_8TimeSpanE, void, nn_os_SleepThread, (int64_t ns)) {
+    dsr::hle::os::RecordSleep(reinterpret_cast<uintptr_t>(__builtin_return_address(0)),
+                *static_cast<const uintptr_t*>(__builtin_frame_address(0)), ns);  // saved x29: the caller's frame
     if (ns <= 0) {
         sched_yield();
         return;

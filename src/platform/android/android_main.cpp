@@ -23,6 +23,8 @@
 #include <vector>
 #include <cmath>
 #include <string>
+#include <cstdlib>
+#include <cstdio>
 #include <thread>
 
 #include "common/crash.h"
@@ -285,6 +287,40 @@ void LogDeviceInfo() {
     LOGI(kTag, "ram: %ld MiB", pages > 0 ? long((int64_t(pages) * sysconf(_SC_PAGESIZE)) >> 20) : -1L);
 }
 
+// settings.txt beside the game folder: "key = value" lines, '#' comments. Written with defaults if missing.
+void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) {
+        if (FILE* w = fopen(path.c_str(), "w")) {
+            fprintf(w,
+                    "# DSR Native settings (read at start-up)\n"
+                    "# fps: 30 (as on Switch) or 60\n"
+                    "fps = %d\n"
+                    "# async_pipelines: 1 = compile new GPU pipelines in the background (no hitch; a new object may\n"
+                    "# appear a frame late), 0 = compile on the spot (can hitch the first time something is seen)\n"
+                    "async_pipelines = %d\n"
+                    "# auto_capture: 1 = save a few frame captures (dsr_frame_*.bin) during play, for diagnostics\n"
+                    "auto_capture = %d\n",
+                    cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0);
+            fclose(w);
+            LOGI(kTag, "settings: wrote defaults to %s", path.c_str());
+        }
+    } else {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            char key[64], value[64];
+            if (line[0] == '#' || sscanf(line, " %63[a-z_0-9] = %63s", key, value) != 2) continue;
+            const int v = atoi(value);
+            if (!strcmp(key, "fps")) cfg->target_fps = v >= 50 ? 60 : 30;
+            else if (!strcmp(key, "async_pipelines")) cfg->async_pipelines = v != 0;
+            else if (!strcmp(key, "auto_capture")) cfg->auto_capture = v != 0;
+        }
+        fclose(f);
+    }
+    LOGI(kTag, "settings (%s): fps %d, async pipelines %s, auto capture %s", path.c_str(), cfg->target_fps,
+         cfg->async_pipelines ? "on" : "off", cfg->auto_capture ? "on" : "off");
+}
+
 void StartGame(android_app* app) {
     if (g_game_started.exchange(true)) return;
     std::string base = app->activity->externalDataPath ? app->activity->externalDataPath : "/sdcard";
@@ -294,6 +330,7 @@ void StartGame(android_app* app) {
     cfg.cache_dir = base + "/cache";
     mkdir(cfg.save_dir.c_str(), 0775);
     mkdir(cfg.cache_dir.c_str(), 0775);
+    LoadSettings(base + "/settings.txt", &cfg);
     LOGI(kTag, "game dir: %s", cfg.game_dir.c_str());
     if (!FileExists(cfg.game_dir + "/exefs/main")) {
         LOGE(kTag, "game files not found: expected %s/exefs/main", cfg.game_dir.c_str());

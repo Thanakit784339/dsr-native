@@ -18,6 +18,10 @@ struct RuntimeConfig {
     bool abort_on_unimplemented = false;
     bool docked = false;      // nn::oe::GetOperationMode: false = handheld (720p), true = console
     std::string language = "en-US";
+    // User settings (settings.txt next to the game folder on Android).
+    int target_fps = 60;          // presentation pace: 30 (the Switch rate) or 60
+    bool async_pipelines = true;  // compile new GPU pipelines off the render thread (no hitch; the draw waits a frame)
+    bool auto_capture = false;    // diagnostics: save a few frame captures automatically during play
 };
 
 struct Runtime {

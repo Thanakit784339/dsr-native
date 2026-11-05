@@ -14,7 +14,7 @@
         android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
 
         <activity
-            android:name="android.app.NativeActivity"
+            android:name=".GameActivity"
             android:exported="true"
             android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density"
