@@ -238,6 +238,7 @@ bool ProgramSetShaders(void* program, int count, const ShaderData* stages) {
             auto sc = std::make_shared<ShaderCode>();
             const uint8_t* p = reinterpret_cast<const uint8_t*>(a);
             sc->code.assign(p, p + n);
+            sc->address = a;
             if (stages[i].control) {
                 const uint8_t* c = static_cast<const uint8_t*>(stages[i].control);
                 sc->control.assign(c, c + control_size);

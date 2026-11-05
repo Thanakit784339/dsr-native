@@ -128,6 +128,7 @@ struct SamplerObj {
 
 struct ShaderCode {
     uint64_t hash = 0;
+    uint64_t address = 0;  // GPU address of the code (matches the address in the shader dump file)
     int stage = -1;  // 0 vertex, 1 fragment (from the SPH)
     std::vector<uint8_t> code;
     std::vector<uint8_t> control;  // NVN control section

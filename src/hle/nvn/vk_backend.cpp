@@ -691,8 +691,9 @@ public:
     void CaptureEndOfPass() {
         WriteTimestamp();
         if (!pass_written_.empty())
-            LOGI(kTag, "capture pass %u: %u draws, last fs %016llx, last textures:%s", capture_pass_, pass_draws_,
-                 (unsigned long long)pass_fs_hash_, pass_tex_desc_.empty() ? " none" : pass_tex_desc_.c_str());
+            LOGI(kTag, "capture pass %u: %u draws, last fs %016llx (code @%llx, vs @%llx), last textures:%s", capture_pass_,
+                 pass_draws_, (unsigned long long)pass_fs_hash_, (unsigned long long)pass_fs_addr_,
+                 (unsigned long long)pass_vs_addr_, pass_tex_desc_.empty() ? " none" : pass_tex_desc_.c_str());
         if (!pass_written_.empty() && !pass_state_desc_.empty())
             LOGI(kTag, "capture pass %u state: %s", capture_pass_, pass_state_desc_.c_str());
         pass_state_desc_.clear();
@@ -2908,7 +2909,11 @@ private:
         }
         drawn_++;
         pass_draws_++;
-        if (st_.program[1]) pass_fs_hash_ = st_.program[1]->hash;
+        if (st_.program[1]) {
+            pass_fs_hash_ = st_.program[1]->hash;
+            pass_fs_addr_ = st_.program[1]->address;
+        }
+        if (st_.program[0]) pass_vs_addr_ = st_.program[0]->address;
         if (depth && st_.depth.depth_test && st_.depth.depth_write) depth_gen_++;
         if (drawn_ == 1) LOGI(kTag, "first draw recorded");
     }
@@ -3597,6 +3602,7 @@ private:
     std::atomic<int64_t> capture_request_ms_{0};
     uint32_t capture_pass_ = 0, pass_draws_ = 0;
     uint64_t pass_fs_hash_ = 0, last_list_draws_ = 0, list_start_draws_ = 0;
+    uint64_t pass_fs_addr_ = 0, pass_vs_addr_ = 0;
     std::chrono::steady_clock::time_point next_capture_;
     std::vector<Image*> pass_written_;
     std::string pass_tex_desc_, pass_ubo_desc_, pass_state_desc_;
