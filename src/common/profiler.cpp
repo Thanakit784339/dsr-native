@@ -209,7 +209,11 @@ void StartTimer(ThreadSlot& t) {
     sigevent sev{};
     sev.sigev_notify = SIGEV_THREAD_ID;
     sev.sigev_signo = SIGPROF;
+#ifdef sigev_notify_thread_id
     sev.sigev_notify_thread_id = t.tid.load();
+#else
+    sev._sigev_un._tid = t.tid.load();  // glibc spells the field this way
+#endif
     if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &t.timer) != 0) return;
     itimerspec its{};
     its.it_interval.tv_nsec = 2'000'000;
