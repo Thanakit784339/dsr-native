@@ -110,9 +110,10 @@ public:
     virtual const char* Name() const = 0;
     // Diagnostics: capture a frame `delay_s` seconds from now (e.g. during a video). Thread-safe.
     virtual void RequestCapture(int /*delay_s*/) {}
-    // The CPU rewrote the storage of the texture at `addr` (a video frame): re-upload it before its next use.
-    // Called on the render thread.
-    virtual void TextureMemoryWritten(uint64_t /*addr*/) {}
+    // A new picture (linear RGBA8, w x h) for the texture whose storage is at `addr` (a video frame): used as
+    // that texture's level 0 from its next use on. Thread-safe; a newer frame replaces one not yet used.
+    virtual void SetTextureFrame(uint64_t /*addr*/, std::shared_ptr<const std::vector<uint8_t>> /*rgba*/, int /*w*/,
+                                 int /*h*/) {}
 };
 
 Backend& GetBackend();
@@ -124,10 +125,9 @@ TexRef MakeTexRef(const void* nvn_texture);
 TexRef WindowTexture(const void* nvn_window, int index);
 // True if [addr, addr+size) lies inside one registered NVN memory pool (safe to read).
 bool GuestRangeValid(uint64_t addr, size_t size);
-// Writes a linear RGBA8 picture into a texture (its own layout): `addr` is the texture's storage address or
-// an NVNtexture object pointer.
-// Call it on the render thread (GpuEnqueue): the backend reads that memory while it executes command lists.
-bool WriteTextureAtAddress(uint64_t addr, const void* rgba, int w, int h, size_t pitch);
+// Hands a linear RGBA8 picture (w x h, tightly packed) to the backend as the new contents of a texture:
+// `addr` is the texture's storage address or an NVNtexture object pointer. False if no such RGBA8 texture.
+bool SubmitTextureFrame(uint64_t addr, std::shared_ptr<const std::vector<uint8_t>> rgba, int w, int h);
 
 // Per-frame statistics, reported every 10 s by the present path.
 struct GpuStats {

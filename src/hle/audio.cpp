@@ -25,7 +25,7 @@ constexpr uint32_t kOk = 0;
 constexpr uint32_t kAudioInUnavailable = 153u | (1u << 9);
 constexpr int kSampleRate = 48000;
 constexpr int kChannels = 2;
-constexpr int32_t kBufferFrames = 3072;  // host stream buffer (64 ms at 48 kHz)
+constexpr int32_t kBufferFrames = 3072;  // host stream buffer: at least 64 ms at 48 kHz
 
 // Guest AudioOutBuffer: our layout within the SDK's struct.
 struct GuestBuffer {
@@ -56,7 +56,6 @@ public:
         AAudioStreamBuilder_setChannelCount(b, kChannels);
         AAudioStreamBuilder_setSampleRate(b, kSampleRate);
         AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-        AAudioStreamBuilder_setBufferCapacityInFrames(b, kBufferFrames * 2);
         aaudio_result_t r = AAudioStreamBuilder_openStream(b, &stream_);
         AAudioStreamBuilder_delete(b);
         if (r != AAUDIO_OK) {
@@ -66,8 +65,11 @@ public:
             // A low-latency stream defaults to a buffer of a burst or two (a few ms): the game's buffer is
             // released only once its samples fit in there, so any delay of the game's audio thread (busy
             // CPU, e.g. while a video plays) runs the device dry and the sound stutters. Keep ~64 ms queued.
+            // Never below two bursts (a normal-mode stream has bursts of tens of ms: one is not enough).
             const int32_t cap = AAudioStream_getBufferCapacityInFrames(stream_);
-            AAudioStream_setBufferSizeInFrames(stream_, std::min<int32_t>(kBufferFrames, cap));
+            const int32_t burst = AAudioStream_getFramesPerBurst(stream_);
+            const int32_t want = std::max({kBufferFrames, 2 * burst, AAudioStream_getBufferSizeInFrames(stream_)});
+            AAudioStream_setBufferSizeInFrames(stream_, std::min(want, cap));
             LOGI(kTag, "AAudio stream: %d Hz, burst %d frames, buffer %d of %d frames, %s", AAudioStream_getSampleRate(stream_),
                  AAudioStream_getFramesPerBurst(stream_), AAudioStream_getBufferSizeInFrames(stream_), cap,
                  AAudioStream_getPerformanceMode(stream_) == AAUDIO_PERFORMANCE_MODE_LOW_LATENCY ? "low latency"

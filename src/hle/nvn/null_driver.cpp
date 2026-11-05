@@ -353,9 +353,9 @@ bool TexInitialize(void* tex, const void* b) {
     return true;
 }
 
-// Writes a linear RGBA8 picture into level 0 / layer 0 of the texture whose storage starts at `addr`, in that
-// texture's layout (the video decoder fills the game's video texture this way). False if none is known.
-bool WriteTextureAtAddressImpl(uint64_t addr, const void* rgba, int w, int h, size_t pitch) {
+// The texture (storage address or NVNtexture object) the video decoder fills: its storage address, if it is
+// a single-level-0-writable RGBA8 texture at least w x h. 0 otherwise.
+uint64_t VideoTextureStorage(uint64_t addr, int w, int h) {
     TextureState t;
     {
         std::lock_guard<std::mutex> lk(g_tex_addr_mutex);
@@ -365,20 +365,13 @@ bool WriteTextureAtAddressImpl(uint64_t addr, const void* rgba, int w, int h, si
     if (!t.pool) {
         // Not a storage address: an NVNtexture object (the movie decoder gets the game's texture object).
         t = g_textures.Copy(reinterpret_cast<const void*>(addr));
-        if (!t.pool) return false;
+        if (!t.pool) return 0;
         addr = PoolBase(t.pool) + uint64_t(t.offset);
     }
     const FormatInfo fi = GetFormatInfo(t.format);
-    if (fi.bytes_per_block != 4 || fi.block_w != 1 || fi.block_h != 1) return false;
-    const TextureLayout layout = ComputeLayout(t);
-    if (layout.levels.empty() || !GuestRangeValid(addr, layout.total)) return false;
-    const LevelLayout& l = layout.levels[0];
-    const int cw = std::min(w, t.width), ch = std::min(h, t.height);
-    if (cw <= 0 || ch <= 0 || uint32_t(cw) * 4 > uint32_t(l.row_bytes) || uint32_t(ch) > uint32_t(l.rows)) return false;
-    WriteLevelRegion(reinterpret_cast<uint8_t*>(addr) + l.offset, l, layout.linear, 0, 0, 0, uint32_t(cw) * 4,
-                     uint32_t(ch), 1, static_cast<const uint8_t*>(rgba), pitch, pitch * size_t(ch));
-    GetBackend().TextureMemoryWritten(addr);
-    return true;
+    if (fi.bytes_per_block != 4 || fi.block_w != 1 || fi.block_h != 1) return 0;
+    if (t.width != w || t.height != h) return 0;
+    return addr;
 }
 void TexFinalize(void* tex) { g_textures.Erase(tex); }
 int TexGetWidth(const void* t) { return g_textures.Copy(t).width; }
@@ -525,8 +518,11 @@ int WindowGetNumTextures(const void* w) { return g_windows.Copy(w).num_textures;
 
 }  // namespace
 
-bool WriteTextureAtAddress(uint64_t addr, const void* rgba, int w, int h, size_t pitch) {
-    return WriteTextureAtAddressImpl(addr, rgba, w, h, pitch);
+bool SubmitTextureFrame(uint64_t addr, std::shared_ptr<const std::vector<uint8_t>> rgba, int w, int h) {
+    const uint64_t storage = VideoTextureStorage(addr, w, h);
+    if (!storage || !rgba || rgba->size() < size_t(w) * size_t(h) * 4) return false;
+    GetBackend().SetTextureFrame(storage, std::move(rgba), w, h);
+    return true;
 }
 bool GuestRangeValid(uint64_t addr, size_t size) {
     std::lock_guard<std::mutex> lk(g_pool_range_mutex);

@@ -27,6 +27,7 @@
 #include <chrono>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -397,13 +398,22 @@ struct YuvTables {
     }
 };
 inline uint8_t Clamp8(int v) { return uint8_t(v < 0 ? 0 : v > 255 ? 255 : v); }
-void ConvertNv12(const uint8_t* y_plane, int stride, int slice, int cl, int ct, int w, int h, uint8_t* dst,
-                 size_t pitch) {
+// Rows [y0, y1). The decoder's output buffer is uncached memory on some devices (slow to read byte by
+// byte), so each source row is first copied (wide loads) into a cached row buffer.
+void ConvertNv12Rows(const uint8_t* y_plane, const uint8_t* uv_plane, int stride, int cl, int ct, int w, int y0,
+                     int y1, uint8_t* dst, size_t pitch) {
     static const YuvTables T;
-    const uint8_t* uv_plane = y_plane + size_t(stride) * size_t(slice);
-    for (int yy = 0; yy < h; yy++) {
-        const uint8_t* yr = y_plane + size_t(yy + ct) * size_t(stride) + cl;
-        const uint8_t* uvr = uv_plane + size_t((yy + ct) / 2) * size_t(stride) + (cl & ~1);
+    std::vector<uint8_t> yrow(size_t(w) + 2), uvrow(size_t(w) + 4);
+    int uv_loaded = -1;
+    for (int yy = y0; yy < y1; yy++) {
+        memcpy(yrow.data(), y_plane + size_t(yy + ct) * size_t(stride) + cl, size_t(w));
+        const int uvy = (yy + ct) / 2;
+        if (uvy != uv_loaded) {
+            memcpy(uvrow.data(), uv_plane + size_t(uvy) * size_t(stride) + (cl & ~1), size_t((w + 1) & ~1));
+            uv_loaded = uvy;
+        }
+        const uint8_t* yr = yrow.data();
+        const uint8_t* uvr = uvrow.data();
         uint32_t* out = reinterpret_cast<uint32_t*>(dst + size_t(yy) * pitch);
         int xx = 0;
         for (; xx + 1 < w; xx += 2) {
@@ -421,6 +431,22 @@ void ConvertNv12(const uint8_t* y_plane, int stride, int slice, int cl, int ct, 
                       uint32_t(Clamp8((c + T.bu[u]) >> 8)) << 16 | 0xff000000u;
         }
     }
+}
+// The whole picture, split over 4 threads (a 1080p frame is ~2 M pixels, 30 times a second).
+void ConvertNv12(const uint8_t* y_plane, int stride, int slice, int cl, int ct, int w, int h, uint8_t* dst,
+                 size_t pitch) {
+    const uint8_t* uv_plane = y_plane + size_t(stride) * size_t(slice);
+    constexpr int kParts = 4;
+    const int band = ((h + kParts - 1) / kParts + 1) & ~1;  // even, so chroma rows are not split
+    std::thread workers[kParts - 1];
+    for (int i = 1; i < kParts; i++) {
+        const int y0 = std::min(h, band * i), y1 = std::min(h, band * (i + 1));
+        if (y0 < y1)
+            workers[i - 1] = std::thread(ConvertNv12Rows, y_plane, uv_plane, stride, cl, ct, w, y0, y1, dst, pitch);
+    }
+    ConvertNv12Rows(y_plane, uv_plane, stride, cl, ct, w, 0, std::min(h, band), dst, pitch);
+    for (auto& t : workers)
+        if (t.joinable()) t.join();
 }
 // Average conversion time, logged every 120 frames.
 void RecordConvertTime(std::chrono::steady_clock::duration d) {
@@ -632,40 +658,37 @@ int DecGetOutputBuffer(void* self, int index, void* buffer) {
         // runs on the render thread, between command lists: the backend reads (uploads) that memory while it
         // executes them, and a half-written frame shows up as blocks of two different frames.
         const bool direct = gb.capacity >= pitch * size_t(h);
-        auto frame = direct ? nullptr : std::make_shared<std::vector<uint8_t>>(pitch * size_t(h));
+        // Frame buffers are reused once the backend has uploaded (released) them.
+        static std::mutex pool_m;
+        static std::vector<std::shared_ptr<std::vector<uint8_t>>> pool;
+        std::shared_ptr<std::vector<uint8_t>> frame;
+        if (!direct) {
+            std::lock_guard<std::mutex> lk(pool_m);
+            for (auto& f : pool)
+                if (f.use_count() == 1 && f->size() == pitch * size_t(h)) {
+                    frame = f;
+                    break;
+                }
+            if (!frame && pool.size() < 8) {
+                frame = std::make_shared<std::vector<uint8_t>>(pitch * size_t(h));
+                pool.push_back(frame);
+            }
+            if (!frame) frame = std::make_shared<std::vector<uint8_t>>(pitch * size_t(h));
+        }
         uint8_t* dst = direct ? gb.data : frame->data();
         const auto t0 = std::chrono::steady_clock::now();
         ConvertNv12(p + o.offset, stride, slice, cl, ct, w, h, dst, pitch);
         RecordConvertTime(std::chrono::steady_clock::now() - t0);
+        // Into a texture: the picture goes to the backend, which uploads it at the texture's next use (writing
+        // the texture's memory instead raced with the backend reading it: blocks of two frames).
         bool ok = direct;
-        if (!direct) {
-            ok = true;  // checked on the render thread (logged once below)
-            const uint64_t addr = uint64_t(reinterpret_cast<uintptr_t>(gb.data));
-            const bool first = !d->logged_convert;
-            const uint64_t seq = dsr::hle::nvn::GpuEnqueue([frame, addr, w, h, pitch, first] {
-                const bool r = dsr::hle::nvn::WriteTextureAtAddress(addr, frame->data(), w, h, pitch);
-                if (first || !r) {
-                    static int logged = 0;
-                    if (logged++ < 4)
-                        LOGI(kTag, "video frame %dx%d -> texture %llx: %s", w, h, (unsigned long long)addr,
-                             r ? "written into that texture" : "NO TEXTURE THERE");
-                }
-            });
-            // At most a few frames (8 MB each) waiting for the render thread.
-            static std::mutex pending_m;
-            static std::deque<uint64_t> pending;
-            std::lock_guard<std::mutex> lk(pending_m);
-            pending.push_back(seq);
-            while (pending.size() > 3) {
-                dsr::hle::nvn::GpuWait(pending.front());
-                pending.pop_front();
-            }
-        }
+        if (!direct)
+            ok = dsr::hle::nvn::SubmitTextureFrame(uint64_t(reinterpret_cast<uintptr_t>(gb.data)), frame, w, h);
         if (!d->logged_convert) {
             d->logged_convert = true;
             LOGI(kTag, "video frame %dx%d (stride %d, slice height %d) -> game memory %p (capacity %zu): %s", w, h,
                  stride, slice, static_cast<void*>(gb.data), gb.capacity,
-                 direct ? "converted in place" : "queued for the render thread");
+                 direct ? "converted in place" : ok ? "handed to that texture" : "NO RGBA TEXTURE THERE");
         }
         if (ok) {
             if (direct) {

@@ -300,7 +300,6 @@ struct Image {
     // memory (e.g. video frames). Checked at most once per command list via a sparse hash.
     bool cpu_source = false;
     uint64_t sample_hash = 0;
-    bool force_reload = false;  // the CPU rewrote the storage (TextureMemoryWritten)
     uint64_t checked_in_list = 0;
     std::map<std::vector<uint32_t>, VkImageView> views;
     std::unordered_map<uint64_t, VkImageView> fast_views;  // same views by hashed key
@@ -517,11 +516,59 @@ public:
         uint32_t w = 0, h = 0, src_w = 0, src_h = 0, nvn_format = 0, draws = 0, pass = 0, flags = 0, raw_bpp = 4;
         uint64_t fs_hash = 0;
     };
-    void TextureMemoryWritten(uint64_t addr) override {
-        auto it = images_.find(addr);
-        if (it == images_.end()) return;
-        it->second.force_reload = true;
-        it->second.checked_in_list = 0;
+    // Video frames: the newest picture per texture storage address, uploaded at that texture's next use.
+    struct PendingFrame {
+        std::shared_ptr<const std::vector<uint8_t>> rgba;
+        int w = 0, h = 0;
+    };
+    std::mutex frames_mutex_;
+    std::unordered_map<uint64_t, PendingFrame> pending_frames_;
+    std::atomic<int> pending_count_{0};
+    uint64_t frames_set_ = 0, frames_uploaded_ = 0;  // statistics (frames_set_ under frames_mutex_)
+
+    void SetTextureFrame(uint64_t addr, std::shared_ptr<const std::vector<uint8_t>> rgba, int w, int h) override {
+        std::lock_guard<std::mutex> lk(frames_mutex_);
+        PendingFrame& f = pending_frames_[addr];
+        if (!f.rgba) pending_count_++;
+        f = {std::move(rgba), w, h};
+        frames_set_++;
+    }
+    // Uploads the pending frame for `img` (render thread). True if there was one.
+    bool TakeFrame(Image& img, const TexRef& t) {
+        if (pending_count_.load(std::memory_order_relaxed) == 0) return false;
+        PendingFrame f;
+        {
+            std::lock_guard<std::mutex> lk(frames_mutex_);
+            auto it = pending_frames_.find(t.addr);
+            if (it == pending_frames_.end() || !it->second.rgba) return false;
+            f = std::move(it->second);
+            pending_frames_.erase(it);
+            pending_count_--;
+        }
+        const int w = std::min(f.w, img.width), h = std::min(f.h, img.height);
+        const size_t row = size_t(f.w) * 4, n = row * size_t(h);
+        Begin();
+        EndRendering();
+        if (StreamRemaining() < n + 1024) Flush();
+        const VkDeviceSize off = StreamAlloc(n, 16);
+        if (off == VK_WHOLE_SIZE) return false;
+        memcpy(stream_ptr_ + off, f.rgba->data(), n);
+        VkBufferImageCopy r{};
+        r.bufferOffset = off;
+        r.bufferRowLength = uint32_t(f.w);
+        r.bufferImageHeight = uint32_t(h);
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.imageExtent = {uint32_t(w), uint32_t(h), 1};
+        Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdCopyBufferToImage(cmd_, stream_, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+        // The texture's game memory is not updated: keep the change detector from re-uploading it.
+        img.uploaded = true;
+        img.written = true;
+        img.cpu_source = true;
+        img.sample_hash = SampleHash(t);
+        img.checked_in_list = list_counter_;
+        frames_uploaded_++;
+        return true;
     }
 
     void RequestCapture(int delay_s) override {
@@ -1283,13 +1330,14 @@ private:
         Image* img = FindImage(t);
         if (!img) img = CreateImage(t);
         if (!img) return nullptr;
+        if (upload && TakeFrame(*img, t)) return img;
         if (upload && !img->written && !img->uploaded) {
             Upload(*img, t);
         } else if (upload && img->cpu_source && img->checked_in_list != list_counter_) {
             img->checked_in_list = list_counter_;
             const bool big = size_t(img->width) * img->height >= 512 * 512;
             if (big) big_checks_++;
-            if (img->force_reload || SampleHash(t) != img->sample_hash) {
+            if (SampleHash(t) != img->sample_hash) {
                 if (big) big_changes_++;
                 Upload(*img, t);
                 if (++reuploads_ <= 8 || reuploads_ % 300 == 0)
@@ -1397,7 +1445,6 @@ private:
     void Upload(Image& img, const TexRef& t) {
         img.uploaded = true;
         img.cpu_source = true;
-        img.force_reload = false;
         img.sample_hash = SampleHash(t);
         img.checked_in_list = list_counter_;
         const TextureLayout layout = ComputeLayout(t.tex);
@@ -2934,6 +2981,14 @@ private:
             LOGI(kTag, "game-written textures (>= 512x512): %llu checks, %llu changed and re-uploaded",
                  (unsigned long long)big_checks_, (unsigned long long)big_changes_);
             big_checks_ = big_changes_ = 0;
+        }
+        {
+            std::lock_guard<std::mutex> lk(frames_mutex_);
+            if (frames_set_) {
+                LOGI(kTag, "video frames: %llu decoded into textures, %llu uploaded (newer ones replace unused ones)",
+                     (unsigned long long)frames_set_, (unsigned long long)frames_uploaded_);
+                frames_set_ = frames_uploaded_ = 0;
+            }
         }
         LOGI(kTag, "last 10 s: %llu render passes started, %llu image barriers", (unsigned long long)render_passes_,
              (unsigned long long)barriers_);
