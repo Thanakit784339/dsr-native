@@ -471,7 +471,7 @@ public:
                         LogOnce("b2b-range", "buffer-to-buffer copy outside known memory");
                     break;
                 case CmdType::UpdateUniform: {
-                    auto data = std::static_pointer_cast<const std::vector<uint8_t>>(c.obj);
+                    const auto* data = static_cast<const std::vector<uint8_t>*>(c.obj.get());
                     if (data && GuestRangeValid(c.dst_addr, data->size())) {
                         memcpy(reinterpret_cast<void*>(c.dst_addr), data->data(), data->size());
                         stream_cache_.clear();  // cached copies may include the old bytes
@@ -479,29 +479,34 @@ public:
                     break;
                 }
                 case CmdType::BindProgram: {
-                    auto code = std::static_pointer_cast<const ShaderCode>(c.obj);
-                    if (program_binds_logged_.insert(c.index * 16 + (code ? code->stage + 1 : 0)).second &&
-                        program_binds_logged_.size() <= 12)
+                    const auto* code = static_cast<const ShaderCode*>(c.obj.get());
+                    if (program_binds_logged_.size() < 12 &&
+                        program_binds_logged_.insert(c.index * 16 + (code ? code->stage + 1 : 0)).second)
                         LOGI(kTag, "program bind: stage bits 0x%x, program stage %d", c.index, code ? code->stage : -1);
-                    for (int s = 0; s < 2; s++)
-                        if (c.index & (1 << s)) st_.program[s] = (code && code->stage == s) ? code : nullptr;
+                    for (int s = 0; s < 2; s++) {
+                        if (!(c.index & (1 << s))) continue;
+                        const ShaderCode* want = (code && code->stage == s) ? code : nullptr;
+                        if (st_.program[s].get() == want) continue;  // no shared_ptr copy (atomic refcounts)
+                        if (want) st_.program[s] = std::static_pointer_cast<const ShaderCode>(c.obj);
+                        else st_.program[s] = nullptr;
+                    }
                     break;
                 }
                 case CmdType::BindVertexAttribs:
-                    st_.attribs = *std::static_pointer_cast<const std::vector<VertexAttribObj>>(c.obj);
+                    st_.attribs = *static_cast<const std::vector<VertexAttribObj>*>(c.obj.get());
                     break;
                 case CmdType::BindVertexStreams:
-                    st_.streams = *std::static_pointer_cast<const std::vector<VertexStreamObj>>(c.obj);
+                    st_.streams = *static_cast<const std::vector<VertexStreamObj>*>(c.obj.get());
                     break;
                 case CmdType::BindVertexBuffers: {
-                    const auto& v = *std::static_pointer_cast<const std::vector<BufferRange>>(c.obj);
+                    const auto& v = *static_cast<const std::vector<BufferRange>*>(c.obj.get());
                     for (size_t i = 0; i < v.size(); i++)
                         if (c.index + i < 16) st_.vertex_buffers[c.index + i] = v[i];
                     break;
                 }
                 case CmdType::BindUniformBuffers: {
                     if (c.stage < 0 || c.stage > 1) break;  // only vertex / fragment
-                    const auto& v = *std::static_pointer_cast<const std::vector<BufferRange>>(c.obj);
+                    const auto& v = *static_cast<const std::vector<BufferRange>*>(c.obj.get());
                     for (size_t i = 0; i < v.size(); i++) {
                         const size_t idx = size_t(c.index) + i;
                         if (idx < 18) st_.uniforms[c.stage][idx] = v[i];
@@ -511,14 +516,14 @@ public:
                 }
                 case CmdType::BindTextures: {
                     if (c.stage < 0 || c.stage > 1) break;
-                    const auto& v = *std::static_pointer_cast<const std::vector<BoundTexture>>(c.obj);
+                    const auto& v = *static_cast<const std::vector<BoundTexture>*>(c.obj.get());
                     for (size_t i = 0; i < v.size(); i++)
                         if (c.index + i < 32) st_.textures[c.stage][c.index + i] = v[i];
                     break;
                 }
                 case CmdType::BindImages: {
                     if (c.stage < 0 || c.stage > 1) break;
-                    const auto& v = *std::static_pointer_cast<const std::vector<TexRef>>(c.obj);
+                    const auto& v = *static_cast<const std::vector<TexRef>*>(c.obj.get());
                     for (size_t i = 0; i < v.size(); i++) {
                         if (c.index + i >= 8) break;
                         st_.images[c.stage][c.index + i] = v[i];
@@ -531,20 +536,20 @@ public:
                     break;
                 }
                 case CmdType::BindBlend: {
-                    const auto& b = *std::static_pointer_cast<const BlendStateObj>(c.obj);
+                    const auto& b = *static_cast<const BlendStateObj*>(c.obj.get());
                     if (b.target >= 0 && b.target < 8) st_.blend[b.target] = b;
                     break;
                 }
-                case CmdType::BindColor: st_.color = *std::static_pointer_cast<const ColorStateObj>(c.obj); break;
+                case CmdType::BindColor: st_.color = *static_cast<const ColorStateObj*>(c.obj.get()); break;
                 case CmdType::BindChannelMask:
-                    st_.channel = *std::static_pointer_cast<const ChannelMaskStateObj>(c.obj);
+                    st_.channel = *static_cast<const ChannelMaskStateObj*>(c.obj.get());
                     break;
                 case CmdType::BindDepthStencil:
-                    st_.depth = *std::static_pointer_cast<const DepthStencilStateObj>(c.obj);
+                    st_.depth = *static_cast<const DepthStencilStateObj*>(c.obj.get());
                     break;
-                case CmdType::BindPolygon: st_.polygon = *std::static_pointer_cast<const PolygonStateObj>(c.obj); break;
+                case CmdType::BindPolygon: st_.polygon = *static_cast<const PolygonStateObj*>(c.obj.get()); break;
                 case CmdType::BindMultisample:
-                    st_.multisample = *std::static_pointer_cast<const MultisampleStateObj>(c.obj);
+                    st_.multisample = *static_cast<const MultisampleStateObj*>(c.obj.get());
                     break;
                 case CmdType::SetViewport:
                     memcpy(st_.viewport, c.f, sizeof(st_.viewport));
@@ -574,9 +579,43 @@ public:
         }
     }
 
+    // What a slow list spent its time on (stutters): counters at the start of the list.
+    struct ListMarks {
+        std::chrono::steady_clock::time_point t;
+        double drain, wait, compile;
+        uint64_t draws, geo_bytes, upload_bytes, pipelines, reuploads, uploads, flushes, waits, barriers, passes;
+    };
+    ListMarks Marks() const {
+        return {std::chrono::steady_clock::now(), drain_ms_, wait_ms_, compile_ms_, drawn_, geo_bytes_, upload_bytes_,
+                uint64_t(new_pipelines_), reuploads_, uint64_t(uploads_), uint64_t(flushes_), pipeline_waits_,
+                barriers_, render_passes_};
+    }
+    int slow_lists_logged_ = 0;
+    std::chrono::steady_clock::time_point slow_window_;
+    void CheckSlowList(const ListMarks& a) {
+        const ListMarks b = Marks();
+        const double ms = std::chrono::duration<double, std::milli>(b.t - a.t).count();
+        if (ms < 25) return;
+        if (b.t - slow_window_ > std::chrono::seconds(10)) {
+            slow_window_ = b.t;
+            slow_lists_logged_ = 0;
+        }
+        if (slow_lists_logged_++ >= 8) return;
+        LOGI(kTag, "slow list: %.1f ms, %llu draws, %llu passes, %llu barriers | waited %.1f ms for the recorder, %.1f ms "
+             "for the GPU | %llu pipelines new (%.1f ms compiling, %llu draws waited) | %llu texture uploads (%llu "
+             "re-uploads), %.2f MB geometry copied, %.2f MB streamed, %llu flushes",
+             ms, (unsigned long long)(b.draws - a.draws), (unsigned long long)(b.passes - a.passes),
+             (unsigned long long)(b.barriers - a.barriers), b.drain - a.drain, b.wait - a.wait,
+             (unsigned long long)(b.pipelines - a.pipelines), b.compile - a.compile, (unsigned long long)(b.waits - a.waits),
+             (unsigned long long)(b.uploads - a.uploads), (unsigned long long)(b.reuploads - a.reuploads),
+             (b.geo_bytes - a.geo_bytes) / 1048576.0, (b.upload_bytes - a.upload_bytes) / 1048576.0,
+             (unsigned long long)(b.flushes - a.flushes));
+    }
+
     void Execute(const CmdList& cmds) override {
         std::lock_guard<std::mutex> lk(m_);
         MsTimer timer(exec_ms_);
+        const ListMarks marks = Marks();
         if (!EnsureDevice()) return;
         StartRecorder();
         ResetTransient();
@@ -600,6 +639,7 @@ public:
             persist_full_ = false;
         }
         if (capture_active_) FinishCapture();
+        CheckSlowList(marks);
         last_list_draws_ = drawn_ - list_start_draws_;
         list_start_draws_ = drawn_;
     }
@@ -1931,9 +1971,10 @@ private:
             profiler::RegisterCurrentThread("dsr-record");
             KeepOffSlowCores();
             for (;;) {
-                // While the render thread is producing, batches arrive every few hundred microseconds: wait for
-                // the next one awake (a thread that keeps sleeping is moved to the slow cores and clocked down).
-                const auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(1500);
+                // Batches arrive every few hundred microseconds while the render thread produces: wait for the
+                // next one awake for a moment, then sleep (it stays on the performance cores either way; spinning
+                // longer kept a core busy for nothing: ~6 s of CPU per 10 s).
+                const auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(250);
                 for (int i = 0; rec_queued_.load(std::memory_order_acquire) == 0; i++) {
                     if ((i & 255) == 255 && std::chrono::steady_clock::now() > spin_until) break;
                     CpuRelax();
@@ -3032,6 +3073,7 @@ private:
     std::vector<Image*> scratch_colors_;
     std::vector<VkFormat> scratch_color_formats_;
     std::vector<uint64_t> scratch_rendering_key_;
+    VertexInput scratch_vin_;
 
     void Draw(const DrawParams& p) {
         phase_timing_ = (drawn_ & 7) == 0;
@@ -3057,7 +3099,10 @@ private:
         Shader* fs = st_.program[1] ? GetShader(*st_.program[1], fopt) : &no_fragment_;
         if (!vs->ok || (st_.program[1] && !fs->ok)) return Skip("shader not translated");
 
-        VertexInput vin;
+        VertexInput& vin = scratch_vin_;
+        vin.bindings.clear();
+        vin.attributes.clear();
+        memset(vin.extent, 0, sizeof(vin.extent));
         uint32_t used_streams = 0;
         for (uint32_t loc = 0; loc < 32; loc++) {
             if (!(vs->info.input_mask >> loc & 1)) continue;
@@ -3789,12 +3834,18 @@ private:
             vw = st_.viewport[2];
             vh = st_.viewport[3];
         }
-        if (st_.viewport_set && viewports_logged_ < 12) {
-            char key[96];
-            snprintf(key, sizeof(key), "%g,%g,%g,%g", st_.viewport[0], st_.viewport[1], st_.viewport[2], st_.viewport[3]);
+        // Logged while few have been seen (the game uses ~10, so a cap alone kept this running on every draw:
+        // ~6% of the render thread formatting floats).
+        if (st_.viewport_set && viewports_logged_ < 12 && list_counter_ < 2000) {
+            uint64_t key;
+            memcpy(&key, st_.viewport, 8);
+            uint64_t k2;
+            memcpy(&k2, st_.viewport + 2, 8);
+            key ^= k2 * 0x9E3779B97F4A7C15ull;
             if (viewport_keys_.insert(key).second) {
                 viewports_logged_++;
-                LOGI(kTag, "viewport (%s) on a %ux%u target", key, extent.width, extent.height);
+                LOGI(kTag, "viewport (%g, %g, %g, %g) on a %ux%u target", st_.viewport[0], st_.viewport[1], st_.viewport[2],
+                     st_.viewport[3], extent.width, extent.height);
             }
         }
         VkViewport vp;
@@ -4405,10 +4456,12 @@ private:
     }
 
     void LogUniformBind(int stage, int index, const BufferRange& r) {
-        auto key = std::to_string(stage) + ":" + std::to_string(index);
-        if (ubo_binds_logged_.insert(key).second && ubo_binds_logged_.size() <= 24)
-            LOGI(kTag, "uniform buffer bound: stage %d index %d (%llu bytes)", stage, index, (unsigned long long)r.size);
+        const uint64_t bit = 1ull << ((stage & 1) * 32 + (index & 31));  // called for every bind: no strings
+        if (ubo_binds_seen_ & bit) return;
+        ubo_binds_seen_ |= bit;
+        LOGI(kTag, "uniform buffer bound: stage %d index %d (%llu bytes)", stage, index, (unsigned long long)r.size);
     }
+    uint64_t ubo_binds_seen_ = 0;
 
     void ReportDraws() {
         auto now = std::chrono::steady_clock::now();
@@ -4528,9 +4581,17 @@ private:
     }
 
     void LogTargets(const std::vector<TexRef>& rts, int num_rt) {
-        if (target_sets_logged_ >= 24) return;
-        std::string desc;
+        if (target_sets_logged_ >= 24 || list_counter_ > 2000) return;
         uint64_t key = 1469598103934665603ull;
+        bool any = false;
+        for (size_t i = 0; i < rts.size(); i++) {
+            const TexRef& t = rts[i];
+            if (!t.valid) continue;
+            any = true;
+            key = (key ^ (t.addr + uint64_t(t.tex.format) * 7919 + i)) * 1099511628211ull;
+        }
+        if (!any || !logged_targets_.insert(key).second) return;
+        std::string desc;
         for (size_t i = 0; i < rts.size(); i++) {
             const TexRef& t = rts[i];
             if (!t.valid) continue;
@@ -4538,9 +4599,7 @@ private:
             snprintf(buf, sizeof(buf), "%s%s%dx%d fmt %d", desc.empty() ? "" : ", ",
                      int(i) == num_rt ? "depth " : "", t.tex.width, t.tex.height, t.tex.format);
             desc += buf;
-            key = (key ^ (t.addr + uint64_t(t.tex.format) * 7919 + i)) * 1099511628211ull;
         }
-        if (desc.empty() || !logged_targets_.insert(key).second) return;
         target_sets_logged_++;
         LOGI(kTag, "render targets: %s", desc.c_str());
     }
@@ -4619,7 +4678,7 @@ private:
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     int new_pipelines_ = 0;
     double compile_ms_ = 0;
-    std::set<std::string> viewport_keys_;  // bumped by every depth write (draw or clear)
+    std::unordered_set<uint64_t> viewport_keys_;
     std::unordered_map<uint64_t, uint64_t> snapshot_gen_;
     double exec_ms_ = 0, wait_ms_ = 0;
     VkDescriptorPool desc_pool_ = VK_NULL_HANDLE;
