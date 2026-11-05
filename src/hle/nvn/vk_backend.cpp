@@ -3722,7 +3722,12 @@ private:
         d.first_vertex = fast ? first_vertex : 0;
         d.vertex_offset = fast ? vertex_offset : 0;
         d.instances = uint32_t(p.instances);
-        d.base_instance = uint32_t(p.base_instance);
+        // Instanced streams were uploaded from base_instance on, so the GPU must start at instance 0 (it read
+        // them at twice the offset, past the uploaded data).
+        bool instanced = false;
+        for (const VkVertexInputBindingDescription& b : vin.bindings)
+            instanced |= b.inputRate == VK_VERTEX_INPUT_RATE_INSTANCE;
+        d.base_instance = instanced ? 0 : uint32_t(p.base_instance);
         if (capture_active_ && query_pool_ && query_pass_.size() < kMaxQueries) {
             d.query = uint32_t(query_pass_.size());
             query_pass_.push_back(capture_pass_);
@@ -4602,9 +4607,19 @@ private:
     // rest is zeros, as the hardware's out-of-range vertex fetches return. (Such draws were skipped: whole
     // batches of particles went missing, leaving see-through squares in smoke and dust.)
     uint64_t padded_fetches_ = 0;
+    int padded_logged_ = 0;
     VkDeviceSize UploadPadded(const BufferRange& r, uint64_t start, uint64_t bytes) {
         padded_fetches_++;
         if (bytes > kStreamSize / 4) return VK_WHOLE_SIZE;
+        const bool in_memory = GuestRangeValid(r.address + start, size_t(bytes));
+        if (padded_logged_ < 12) {
+            padded_logged_++;
+            LOGI(kTag, "vertex fetch past the bound buffer: buffer @%llx size %llu, reading %llu bytes from %llu (%s)",
+                 (unsigned long long)r.address, (unsigned long long)r.size, (unsigned long long)bytes,
+                 (unsigned long long)start, in_memory ? "inside game memory: read as is" : "outside known memory: zeros");
+        }
+        // The data is there (the fog wall's tiles drew grey with zeros): the bound size understates the buffer.
+        if (in_memory) return UploadCached(reinterpret_cast<const uint8_t*>(r.address + start), size_t(bytes), 16);
         if (StreamRemaining() < bytes + 1024) Flush();
         const VkDeviceSize off = StreamAlloc(bytes, 16);
         if (off == VK_WHOLE_SIZE) return off;
@@ -4755,7 +4770,7 @@ private:
         LOGI(kTag, "descriptor sets: %llu reused from earlier frames, %zu kept, %llu resets", (unsigned long long)persist_hits_,
              persist_cache_.size(), (unsigned long long)persist_resets_);
         if (padded_fetches_ || view_standins_) {
-            LOGI(kTag, "draws kept with zero-padded vertex data (read past their buffer): %llu; with a stand-in for a "
+            LOGI(kTag, "draws reading vertex data past their bound buffer: %llu; with a stand-in for a "
                  "texture of the wrong dimension: %llu", (unsigned long long)padded_fetches_,
                  (unsigned long long)view_standins_);
             padded_fetches_ = view_standins_ = 0;
