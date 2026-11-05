@@ -25,13 +25,14 @@ void FrameLimiter(uint8_t* self, int /*fps*/) {
     if (*reinterpret_cast<const int32_t*>(rt.main.base() + 0x251fb4c) != 0) return;
     using clock = std::chrono::steady_clock;
     static clock::time_point last;
-    const auto period = std::chrono::nanoseconds(1'000'000'000 / 60);
+    const int fps = std::clamp(rt.config.target_fps, 31, 60);
+    const auto period = std::chrono::nanoseconds(1'000'000'000 / fps);
     auto now = clock::now();
     if (last.time_since_epoch().count() != 0 && now < last + period) {
         std::this_thread::sleep_until(last + period);
         now = clock::now();
     }
-    const double seconds = last.time_since_epoch().count() ? std::chrono::duration<double>(now - last).count() : 1.0 / 60;
+    const double seconds = last.time_since_epoch().count() ? std::chrono::duration<double>(now - last).count() : 1.0 / fps;
     last = now;
     if (g_game_step) *g_game_step = float(std::clamp(seconds, 1.0 / 60.0, 1.0 / 30.0));
     *reinterpret_cast<int64_t*>(self + 0x310) = hle::os::NowTicks();
@@ -115,7 +116,7 @@ void InstallGameHooks() {
     //    replaced by FrameLimiter: it paces to 60 and sets that float to the measured frame period (1/60..1/30 s),
     //    so the game keeps normal speed at 60 fps and when heavy areas run slower. It also keeps the game's
     //    frame-skip mode off (with it, slow frames ran two updates per shown frame).
-    if (rt.config.target_fps == 60) {
+    if (rt.config.target_fps > 30) {
         std::string err;
         float* step = reinterpret_cast<float*>(rt.main.ScratchPage());
         *step = 1.0f / 30.0f;

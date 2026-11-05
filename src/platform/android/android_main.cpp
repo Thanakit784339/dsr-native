@@ -17,6 +17,7 @@
 
 #include <jni.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstring>
@@ -296,7 +297,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
         if (FILE* w = fopen(path.c_str(), "w")) {
             fprintf(w,
                     "# DSR Native settings (read at start-up)\n"
-                    "# fps: 30 (as on Switch) or 60\n"
+                    "# fps: frame rate cap, 30 (as on Switch) to 60; e.g. 45 for a steady rate in heavy areas\n"
                     "fps = %d\n"
                     "# async_pipelines: 1 = compile new GPU pipelines in the background (no hitch; a new object may\n"
                     "# appear a frame late), 0 = compile on the spot (can hitch the first time something is seen)\n"
@@ -326,7 +327,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             char key[64], value[64];
             if (line[0] == '#' || sscanf(line, " %63[a-z_0-9] = %63s", key, value) != 2) continue;
             const int v = atoi(value);
-            if (!strcmp(key, "fps")) cfg->target_fps = v >= 50 ? 60 : 30;
+            if (!strcmp(key, "fps")) cfg->target_fps = std::clamp(v, 30, 60);  // e.g. 45: a steady cap below 60
             else if (!strcmp(key, "async_pipelines")) cfg->async_pipelines = v != 0;
             else if (!strcmp(key, "auto_capture")) cfg->auto_capture = v != 0;
             else if (!strcmp(key, "profile")) cfg->profile = v != 0;
