@@ -20,7 +20,9 @@ android {
         }
         externalNativeBuild {
             cmake {
-                arguments '-DANDROID_STL=c++_static'
+                // Optimised native code even in the debug APK (the default Debug build type is -O0, which
+                // made everything several times slower). Debug info is kept.
+                arguments '-DANDROID_STL=c++_static', '-DCMAKE_BUILD_TYPE=RelWithDebInfo'
             }
         }
     }

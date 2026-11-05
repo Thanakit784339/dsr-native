@@ -42,3 +42,13 @@ bool TakeText(bool* ok, std::u16string* text) {
     return true;
 }
 }  // namespace dsr::platform
+
+namespace dsr::platform {
+bool NativeCodeOptimized() {
+#ifdef __OPTIMIZE__
+    return true;
+#else
+    return false;
+#endif
+}
+}  // namespace dsr::platform

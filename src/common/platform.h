@@ -3,6 +3,8 @@
 // Small hooks the platform layer provides to the runtime.
 
 namespace dsr::platform {
+// True if the core (dsrcore) was compiled with optimisation.
+bool NativeCodeOptimized();
 
 // Creates a new file the user can reach (Android: Download/DSRNative/<name> via MediaStore) and returns
 // a writable fd, or -1. Safe to call from any thread.
