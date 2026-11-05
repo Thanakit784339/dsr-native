@@ -566,21 +566,28 @@ bool SubmitTextureFrame(uint64_t addr, std::shared_ptr<const std::vector<uint8_t
     return true;
 }
 bool GuestRangeValid(uint64_t addr, size_t size) {
-    // Called many times per draw: the pool last matched on this thread is checked first, without the lock.
+    // Called many times per draw: the pools last matched on this thread are checked first, without the lock.
+    struct Range {
+        uintptr_t lo, hi;
+    };
     thread_local uint64_t cached_version = 0;
-    thread_local uintptr_t cached_lo = 0, cached_hi = 0;
+    thread_local Range cached[4] = {};
+    thread_local unsigned next_slot = 0;
     const uint64_t version = g_pool_ranges_version.load(std::memory_order_acquire);
-    if (version == cached_version && addr >= cached_lo && addr + size <= cached_hi && addr + size >= addr) return true;
+    if (addr + size < addr) return false;
+    if (version == cached_version) {
+        for (const Range& r : cached)
+            if (r.hi && addr >= r.lo && addr + size <= r.hi) return true;
+    } else {
+        for (Range& r : cached) r = {0, 0};
+        cached_version = version;
+    }
     std::lock_guard<std::mutex> lk(g_pool_range_mutex);
     auto it = g_pool_ranges.upper_bound(uintptr_t(addr));
     if (it == g_pool_ranges.begin()) return false;
     --it;
-    const bool ok = addr >= it->first && addr + size <= it->first + it->second && addr + size >= addr;
-    if (ok) {
-        cached_version = version;
-        cached_lo = it->first;
-        cached_hi = it->first + it->second;
-    }
+    const bool ok = addr >= it->first && addr + size <= it->first + it->second;
+    if (ok) cached[next_slot++ & 3] = {it->first, it->first + it->second};
     return ok;
 }
 

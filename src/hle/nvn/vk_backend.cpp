@@ -1899,7 +1899,13 @@ private:
         vkCmdCopyBufferToImage(cmd_, stream_, img->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
         img->written = true;
         img->uploaded = true;
-        img->cpu_source = false;
+        // The game may later rewrite this texture's memory with the CPU (the brightness lookup table is filled
+        // by a copy at start-up, then rewritten in place): watch that memory from here on, like an upload.
+        img->cpu_source = true;
+        img->sample_hash = SampleHash(c.dst);
+        img->checked_in_list = list_counter_;
+        img->check_interval = 1;
+        img->next_check_list = list_counter_ + 1;
         if (b2t_logged_++ < 8)
             LOGI(kTag, "buffer -> texture %dx%d at %d,%d (format %d)", w, h, r.x, r.y, img->nvn_format);
     }
@@ -2194,9 +2200,11 @@ private:
                                                    "pipeline", "descriptors+record"};
     double phase_ms_[7] = {};
     std::chrono::steady_clock::time_point phase_t_;
+    bool phase_timing_ = false;  // one draw in 8 is timed (7 clock reads per draw showed up in profiles)
     void Phase(int finished) {
+        if (!phase_timing_) return;
         auto now = std::chrono::steady_clock::now();
-        if (finished >= 0) phase_ms_[finished] += std::chrono::duration<double, std::milli>(now - phase_t_).count();
+        if (finished >= 0) phase_ms_[finished] += 8 * std::chrono::duration<double, std::milli>(now - phase_t_).count();
         phase_t_ = now;
     }
     struct PhaseEnd {
@@ -2205,6 +2213,7 @@ private:
     };
 
     void Draw(const DrawParams& p) {
+        phase_timing_ = (drawn_ & 7) == 0;
         Phase(-1);
         PhaseEnd phase_end{this};
         no_attachment_extent_ = {0, 0};
@@ -3242,10 +3251,8 @@ private:
             geo_volatile_++;
             return VK_WHOLE_SIZE;  // rewritten every frame or so: streamed with the list
         }
-        if (it != geo_.end() && list_counter_ < it->second.next_check_list) {
-            geo_hits_++;
-            return it->second.off;
-        }
+        // Checked every list: skipping checks for ranges that had been stable showed other geometry (memory the
+        // game reused for another mesh of the same size) for a few frames: flickering textures.
         const uint64_t h = GeoHash(src, size);
         if (it != geo_.end() && it->second.hash == h) {
             geo_hits_++;
