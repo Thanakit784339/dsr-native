@@ -79,7 +79,7 @@ CmdList TakePooledList() {
 void ReturnPooledList(CmdList&& v) {
     v.clear();
     std::lock_guard<std::mutex> lk(g_list_pool_mutex);
-    if (g_list_pool.size() < 96) g_list_pool.push_back(std::move(v));
+    if (g_list_pool.size() < 32) g_list_pool.push_back(std::move(v));
 }
 
 // The recorder of the command buffer last appended to by this thread (one lookup per command was a locked
@@ -116,6 +116,15 @@ size_t GetCommandMemoryUsed(const void* cb) { return RecorderOf(const_cast<void*
 size_t GetControlMemoryUsed(const void* cb) { return RecorderOf(const_cast<void*>(cb)).control_used; }
 uint64_t EndRecording(void* cb) {
     Recorder& r = RecorderOf(cb);
+    // A list much smaller than its (recycled) storage gets storage of its own size: the game keeps hundreds of
+    // lists alive, and each holding the capacity of the biggest list ever recorded added up to gigabytes.
+    if (r.cmds.capacity() > 2 * r.cmds.size() + 256) {
+        CmdList exact;
+        exact.reserve(r.cmds.size());
+        for (Cmd& c : r.cmds) exact.push_back(std::move(c));
+        ReturnPooledList(std::move(r.cmds));
+        r.cmds = std::move(exact);
+    }
     std::shared_ptr<const CmdList> list(new CmdList(std::move(r.cmds)), [](const CmdList* l) {
         ReturnPooledList(std::move(*const_cast<CmdList*>(l)));
         delete l;
