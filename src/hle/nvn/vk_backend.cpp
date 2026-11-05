@@ -3106,8 +3106,10 @@ private:
         return snap;
     }
 
-    Image* Fallback(shader::TexDim dim, bool array) {
-        const int key = int(dim) * 2 + (array ? 1 : 0);
+    // 1x1 stand-in of a dimension: white (missing textures) or opaque black (`black`: placeholders of the wrong
+    // dimension, like the game's 16x16 black texture bound where a cube map is sampled).
+    Image* Fallback(shader::TexDim dim, bool array, bool black = false) {
+        const int key = int(dim) * 2 + (array ? 1 : 0) + (black ? 64 : 0);
         auto it = fallbacks_.find(key);
         if (it != fallbacks_.end()) return it->second;
         TexRef t;
@@ -3127,7 +3129,8 @@ private:
             EndRendering();
             Transition(*img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             VkClearColorValue white;
-            white.float32[0] = white.float32[1] = white.float32[2] = white.float32[3] = 1.0f;
+            white.float32[0] = white.float32[1] = white.float32[2] = black ? 0.0f : 1.0f;
+            white.float32[3] = 1.0f;
             VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, uint32_t(img->layers)};
             Rec([white, range, image = img->image](VkCommandBuffer cb) {
                 vkCmdClearColorImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &white, 1, &range);
@@ -3351,7 +3354,17 @@ private:
                     if (view_mismatch_logged_.size() < 16 && view_mismatch_logged_.insert(k).second)
                         LOGW(kTag, "texture view does not match the shader: %s (target %d, view layers %d, layer %d)", k,
                              bt.texture.tex.target, bt.texture.view_layers, bt.texture.layer);
-                    return Skip("texture view does not match the shader");
+                    // The game binds a placeholder of another dimension (a 16x16 black 2D texture where the shader
+                    // samples a cube map); the hardware samples it anyway. A black stand-in of the right dimension
+                    // keeps the draw (it was skipped: objects went missing).
+                    img = Fallback(info.texture_dim[slot], info.texture_array[slot], true);
+                    if (img && img->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+                        EndRendering();
+                        Transition(*img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                    }
+                    view = img ? SampledView(*img, info.texture_dim[slot], info.texture_array[slot], swz, nullptr) : VK_NULL_HANDLE;
+                    if (!view) return Skip("texture view does not match the shader");
+                    view_standins_++;
                 }
                 if (plain)
                     tex_writes.push_back({uint32_t(stage), 32 + slot,
@@ -3529,11 +3542,9 @@ private:
                 if (!fast) break;
                 const BufferRange& r = st_.vertex_buffers[b.binding];
                 const VertexStreamObj so = b.binding < st_.streams.size() ? st_.streams[b.binding] : VertexStreamObj{};
-                const int64_t first = so.divisor ? p.base_instance : vmin;
                 const int64_t n = so.divisor ? (int64_t(p.instances) + so.divisor - 1) / so.divisor : vmax - vmin + 1;
-                const uint64_t start = uint64_t(first) * b.stride;
                 const uint64_t bytes = uint64_t(std::max<int64_t>(0, n - 1)) * b.stride + vin.extent[b.binding];
-                if (!r.address || start + bytes > r.size || !GuestRangeValid(r.address + start, size_t(bytes))) {
+                if (!r.address || bytes > (64u << 20)) {
                     fast = false;
                     break;
                 }
@@ -3547,11 +3558,17 @@ private:
                     const int64_t n = so.divisor ? (int64_t(p.instances) + so.divisor - 1) / so.divisor : vmax - vmin + 1;
                     const uint64_t start = uint64_t(first) * b.stride;
                     const uint64_t bytes = uint64_t(std::max<int64_t>(0, n - 1)) * b.stride + vin.extent[b.binding];
-                    const uint8_t* src = reinterpret_cast<const uint8_t*>(r.address + start);
-                    VkDeviceSize off = GeoCached(src, size_t(bytes));
-                    vb_bufs[b.binding] = geo_buf_;
-                    if (off == VK_WHOLE_SIZE) {
-                        off = UploadCached(src, size_t(bytes), 16);
+                    VkDeviceSize off;
+                    if (start + bytes <= r.size && GuestRangeValid(r.address + start, size_t(bytes))) {
+                        const uint8_t* src = reinterpret_cast<const uint8_t*>(r.address + start);
+                        off = GeoCached(src, size_t(bytes));
+                        vb_bufs[b.binding] = geo_buf_;
+                        if (off == VK_WHOLE_SIZE) {
+                            off = UploadCached(src, size_t(bytes), 16);
+                            vb_bufs[b.binding] = stream_;
+                        }
+                    } else {
+                        off = UploadPadded(r, start, bytes);
                         vb_bufs[b.binding] = stream_;
                     }
                     if (off == VK_WHOLE_SIZE) return Skip("vertex data too large");
@@ -3647,9 +3664,9 @@ private:
                 const uint64_t start = uint64_t(first) * b.stride;
                 const uint64_t bytes = uint64_t(std::max<int64_t>(0, n - 1)) * b.stride + vin.extent[b.binding];
                 if (!r.address) return Skip("vertex buffer not bound");
-                if (start + bytes > r.size || !GuestRangeValid(r.address + start, size_t(bytes)))
-                    return Skip("vertex data outside the bound buffer");
-                VkDeviceSize off = UploadCached(reinterpret_cast<const uint8_t*>(r.address + start), size_t(bytes), 16);
+                VkDeviceSize off = start + bytes <= r.size && GuestRangeValid(r.address + start, size_t(bytes))
+                                       ? UploadCached(reinterpret_cast<const uint8_t*>(r.address + start), size_t(bytes), 16)
+                                       : UploadPadded(r, start, bytes);
                 if (off == VK_WHOLE_SIZE) return Skip("vertex data too large");
                 vb_offsets[b.binding] = off;
                 vb_bufs[b.binding] = stream_;
@@ -4581,6 +4598,24 @@ private:
         return off;
     }
 
+    // Vertex data read past the end of the bound buffer (or of known memory): the part inside is copied and the
+    // rest is zeros, as the hardware's out-of-range vertex fetches return. (Such draws were skipped: whole
+    // batches of particles went missing, leaving see-through squares in smoke and dust.)
+    uint64_t padded_fetches_ = 0;
+    VkDeviceSize UploadPadded(const BufferRange& r, uint64_t start, uint64_t bytes) {
+        padded_fetches_++;
+        if (bytes > kStreamSize / 4) return VK_WHOLE_SIZE;
+        if (StreamRemaining() < bytes + 1024) Flush();
+        const VkDeviceSize off = StreamAlloc(bytes, 16);
+        if (off == VK_WHOLE_SIZE) return off;
+        uint8_t* dst = stream_ptr_ + off;
+        uint64_t avail = start < r.size ? std::min<uint64_t>(bytes, r.size - start) : 0;
+        // Only memory inside a known pool is read: shrink to what is valid (page granularity is enough).
+        while (avail && !GuestRangeValid(r.address + start, size_t(avail))) avail = avail > 4096 ? avail - 4096 : 0;
+        if (avail) memcpy(dst, reinterpret_cast<const void*>(r.address + start), size_t(avail));
+        memset(dst + avail, 0, size_t(bytes - avail));
+        return off;
+    }
     VkDeviceSize UploadCached(const uint8_t* src, size_t size, VkDeviceSize align) {
         const uint64_t key = (uint64_t(reinterpret_cast<uintptr_t>(src)) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(size) << 1) ^ align;
         auto it = stream_cache_.find(key);
@@ -4719,6 +4754,12 @@ private:
         }
         LOGI(kTag, "descriptor sets: %llu reused from earlier frames, %zu kept, %llu resets", (unsigned long long)persist_hits_,
              persist_cache_.size(), (unsigned long long)persist_resets_);
+        if (padded_fetches_ || view_standins_) {
+            LOGI(kTag, "draws kept with zero-padded vertex data (read past their buffer): %llu; with a stand-in for a "
+                 "texture of the wrong dimension: %llu", (unsigned long long)padded_fetches_,
+                 (unsigned long long)view_standins_);
+            padded_fetches_ = view_standins_ = 0;
+        }
         if (images_retired_) {
             LOGI(kTag, "images replaced by new textures in the same memory: %llu (destroyed after the GPU is done)",
                  (unsigned long long)images_retired_);
@@ -4837,6 +4878,7 @@ private:
     double compile_ms_ = 0;
     std::unordered_set<uint64_t> viewport_keys_;
     std::set<std::string> view_mismatch_logged_;
+    uint64_t view_standins_ = 0;
     std::unordered_map<uint64_t, uint64_t> snapshot_gen_;
     double exec_ms_ = 0, wait_ms_ = 0;
     VkDescriptorPool desc_pool_ = VK_NULL_HANDLE;
