@@ -366,6 +366,7 @@ public:
         list_counter_++;
         MaybeArmCapture();
         ApplyDirtyMarks();
+        if (!watched_copies_.empty()) CheckWatchedCopies();
         for (const Cmd& c : cmds) {
             switch (c.type) {
                 case CmdType::SetRenderTargets:
@@ -1903,7 +1904,42 @@ private:
     }
 
     // Linear buffer data (row stride from SetCopyRowStride, 0 = tight) into a texture region.
-    void CopyBufferToTexture(const Cmd& c) {
+    // Small tables filled by buffer->texture copies (the gamma ramp: 256x1, filled twice at start-up and never
+    // copied again): the copy source is watched, and when the game rewrites it the copy is repeated.
+    struct WatchedCopy {
+        Cmd cmd;
+        uint64_t hash;
+        size_t size;
+    };
+    std::vector<WatchedCopy> watched_copies_;
+    void CheckWatchedCopies() {
+        for (WatchedCopy& w : watched_copies_) {
+            if (!GuestRangeValid(w.cmd.src_addr, w.size)) continue;
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(w.cmd.src_addr);
+            const uint64_t h = Fnv(p, w.size);
+            if (h == w.hash) continue;
+            w.hash = h;
+            const float* f = reinterpret_cast<const float*>(p);
+            // Only something that still looks like a ramp is copied (the memory may be a reused upload buffer):
+            // 256 RGBA32F entries, finite, 0..4, non-decreasing per colour channel.
+            bool ramp = w.size >= 256 * 16 && w.cmd.dst.tex.width == 256;
+            for (int i = 0; ramp && i < 256; i++)
+                for (int ch = 0; ch < 3 && ramp; ch++) {
+                    const float v = f[i * 4 + ch];
+                    ramp = v == v && v >= 0.f && v <= 4.f && (i == 0 || v + 1e-6f >= f[(i - 1) * 4 + ch]);
+                }
+            static int logged = 0;
+            if (logged++ < 30)
+                LOGI(kTag, "copy source @%llx of a %dx%d table changed: [0] %.4f %.4f %.4f | [128] %.4f | [255] %.4f: %s",
+                     (unsigned long long)w.cmd.src_addr, w.cmd.dst.tex.width, w.cmd.dst.tex.height, f[0], f[1], f[2],
+                     w.size >= 129 * 16 ? f[128 * 4] : 0.f, w.size >= 256 * 16 ? f[255 * 4] : 0.f,
+                     ramp ? "copied again" : "not a ramp, ignored");
+            if (!ramp) continue;
+            const Cmd c = w.cmd;
+            CopyBufferToTexture(c, true);
+        }
+    }
+    void CopyBufferToTexture(const Cmd& c, bool rerun = false) {
         Image* img = GetImage(c.dst, false);
         if (!img || IsDepthFormat(img->nvn_format)) return;
         const FormatInfo fi = GetFormatInfo(img->nvn_format);
@@ -1918,6 +1954,18 @@ private:
         if (!GuestRangeValid(c.src_addr, src_size)) {
             LogOnce("b2t-range", "buffer-to-texture copy source outside known memory");
             return;
+        }
+        if (!rerun && h == 1 && w <= 1024 && src_size <= 65536) {
+            bool known = false;
+            for (WatchedCopy& wc : watched_copies_)
+                if (wc.cmd.dst.addr == c.dst.addr) {
+                    wc = {c, Fnv(reinterpret_cast<const uint8_t*>(c.src_addr), src_size), src_size};
+                    known = true;
+                }
+            if (!known && watched_copies_.size() < 16)
+                watched_copies_.push_back({c, Fnv(reinterpret_cast<const uint8_t*>(c.src_addr), src_size), src_size});
+            LOGI(kTag, "watching the source @%llx (%zu bytes) of a %dx%d table copy", (unsigned long long)c.src_addr,
+                 src_size, w, h);
         }
         Begin();
         EndRendering();
