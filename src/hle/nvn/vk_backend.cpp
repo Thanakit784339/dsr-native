@@ -1912,9 +1912,11 @@ private:
     OpBatch* rec_batch_ = nullptr;     // being filled (render thread)
     std::deque<OpBatch*> rec_queue_;   // under rec_mutex_
     std::vector<OpBatch*> rec_free_;   // under rec_mutex_
-    bool rec_busy_ = false;            // under rec_mutex_
+    bool rec_sleeping_ = false;        // under rec_mutex_: the recorder waits on rec_cv_
+    std::atomic<int> rec_queued_{0};   // batches in rec_queue_
+    std::atomic<bool> rec_busy_{false};
     std::mutex rec_mutex_;
-    std::condition_variable rec_cv_, rec_idle_cv_;
+    std::condition_variable rec_cv_;
     bool rec_started_ = false;
     std::atomic<uint64_t> rec_ns_{0};  // recorder busy time
     double drain_ms_ = 0;              // render thread waiting for the recorder
@@ -1927,14 +1929,27 @@ private:
         std::thread([this] {
             pthread_setname_np(pthread_self(), "dsr-record");
             profiler::RegisterCurrentThread("dsr-record");
+            KeepOffSlowCores();
             for (;;) {
+                // While the render thread is producing, batches arrive every few hundred microseconds: wait for
+                // the next one awake (a thread that keeps sleeping is moved to the slow cores and clocked down).
+                const auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(1500);
+                for (int i = 0; rec_queued_.load(std::memory_order_acquire) == 0; i++) {
+                    if ((i & 255) == 255 && std::chrono::steady_clock::now() > spin_until) break;
+                    CpuRelax();
+                }
                 OpBatch* b;
                 {
                     std::unique_lock<std::mutex> lk(rec_mutex_);
-                    rec_cv_.wait(lk, [&] { return !rec_queue_.empty(); });
+                    if (rec_queue_.empty()) {
+                        rec_sleeping_ = true;
+                        rec_cv_.wait(lk, [&] { return !rec_queue_.empty(); });
+                        rec_sleeping_ = false;
+                    }
                     b = rec_queue_.front();
                     rec_queue_.pop_front();
-                    rec_busy_ = true;
+                    rec_busy_.store(true, std::memory_order_relaxed);
+                    rec_queued_.fetch_sub(1, std::memory_order_release);  // publishes rec_busy_ = true
                 }
                 const auto t0 = std::chrono::steady_clock::now();
                 RunBatch(*b);
@@ -1943,9 +1958,8 @@ private:
                 {
                     std::lock_guard<std::mutex> lk(rec_mutex_);
                     rec_free_.push_back(b);
-                    if (rec_queue_.empty()) rec_busy_ = false;
                 }
-                rec_idle_cv_.notify_all();
+                rec_busy_.store(false, std::memory_order_release);  // Drain() sees everything recorded so far
             }
         }).detach();
         LOGI(kTag, "recorder thread on: draws are prepared on the render thread and recorded on a second thread");
@@ -1990,13 +2004,16 @@ private:
     void Publish() {
         if (!rec_batch_) return;
         if (!rec_batch_->ops) return;
+        bool wake;
         {
             std::lock_guard<std::mutex> lk(rec_mutex_);
             rec_queue_.push_back(rec_batch_);
+            rec_queued_.fetch_add(1, std::memory_order_release);
+            wake = rec_sleeping_;
         }
         rec_batch_ = nullptr;
         rec_batches_++;
-        rec_cv_.notify_one();
+        if (wake) rec_cv_.notify_one();
     }
     // Publishes small batches so the recorder starts early (about 32 draws' worth).
     void MaybePublish() {
@@ -2006,10 +2023,50 @@ private:
     void Drain() {
         if (!rec_started_) return;
         Publish();
-        std::unique_lock<std::mutex> lk(rec_mutex_);
-        if (rec_queue_.empty() && !rec_busy_) return;
+        auto idle = [&] {
+            return rec_queued_.load(std::memory_order_acquire) == 0 && !rec_busy_.load(std::memory_order_acquire);
+        };
+        if (idle()) return;
+        // The wait is short (the end of the recorder's last batch): spin, so neither thread is put to sleep.
         MsTimer t(drain_ms_);
-        rec_idle_cv_.wait(lk, [&] { return rec_queue_.empty() && !rec_busy_; });
+        for (int i = 0; !idle(); i++) {
+            if ((i & 1023) == 1023) std::this_thread::yield();
+            else CpuRelax();
+        }
+    }
+    static void CpuRelax() {
+#if defined(__aarch64__)
+        asm volatile("yield" ::: "memory");
+#endif
+    }
+    // The recorder runs on the performance cores: on the efficiency cores the driver's recording is several
+    // times slower, and the render thread would wait for it at every submit.
+    static void KeepOffSlowCores() {
+#if defined(__linux__)
+        long khz[32] = {};
+        long lowest = 0, highest = 0;
+        for (int cpu = 0; cpu < 32; cpu++) {
+            char path[96];
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+            if (FILE* f = fopen(path, "r")) {
+                if (fscanf(f, "%ld", &khz[cpu]) != 1) khz[cpu] = 0;
+                fclose(f);
+            }
+            if (khz[cpu] > 0 && (!lowest || khz[cpu] < lowest)) lowest = khz[cpu];
+            highest = std::max(highest, khz[cpu]);
+        }
+        if (!lowest || lowest == highest) return;  // one kind of core
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        std::string list;
+        for (int cpu = 0; cpu < 32; cpu++)
+            if (khz[cpu] > lowest) {
+                CPU_SET(cpu, &set);
+                list += " " + std::to_string(cpu);
+            }
+        const int r = sched_setaffinity(0, sizeof(set), &set);
+        LOGI(kTag, "recorder thread on CPUs%s: %s", list.c_str(), r == 0 ? "ok" : "refused");
+#endif
     }
     // Records `f(command buffer)`: on the recorder, or here when it is off.
     template <class F>
