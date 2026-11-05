@@ -305,8 +305,15 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "# (pressing both sticks in, L3 + R3, always saves one)\n"
                     "auto_capture = %d\n"
                     "# profile: 1 = log where the CPU time goes every 10 s (diagnostics, costs ~1%%)\n"
-                    "profile = %d\n",
-                    cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0);
+                    "profile = %d\n"
+                    "# gamma: extra display gamma on top of the in-game brightness (1.0 = as the game draws it;\n"
+                    "# 1.2 - 1.6 lifts dark areas)\n"
+                    "gamma = %.2f\n"
+                    "# exposure: scales the scene's exposure before tone mapping (1.0 = as the game draws it; 1.45\n"
+                    "# is what the game's own light adaptation computes in dark areas)\n"
+                    "exposure = %.2f\n",
+                    cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0,
+                    cfg->gamma, cfg->exposure);
             fclose(w);
             LOGI(kTag, "settings: wrote defaults to %s", path.c_str());
         }
@@ -320,11 +327,19 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "async_pipelines")) cfg->async_pipelines = v != 0;
             else if (!strcmp(key, "auto_capture")) cfg->auto_capture = v != 0;
             else if (!strcmp(key, "profile")) cfg->profile = v != 0;
+            else if (!strcmp(key, "gamma")) {
+                const float g = float(atof(value));
+                cfg->gamma = g >= 0.5f && g <= 3.0f ? g : 1.0f;
+            } else if (!strcmp(key, "exposure")) {
+                const float e = float(atof(value));
+                cfg->exposure = e >= 0.25f && e <= 4.0f ? e : 1.0f;
+            }
         }
         fclose(f);
     }
-    LOGI(kTag, "settings (%s): fps %d, async pipelines %s, auto capture %s, profile %s", path.c_str(), cfg->target_fps,
-         cfg->async_pipelines ? "on" : "off", cfg->auto_capture ? "on" : "off", cfg->profile ? "on" : "off");
+    LOGI(kTag, "settings (%s): fps %d, async pipelines %s, auto capture %s, profile %s, gamma %.2f, exposure %.2f",
+         path.c_str(), cfg->target_fps, cfg->async_pipelines ? "on" : "off", cfg->auto_capture ? "on" : "off",
+         cfg->profile ? "on" : "off", cfg->gamma, cfg->exposure);
     if (cfg->profile) dsr::profiler::Enable();
 }
 

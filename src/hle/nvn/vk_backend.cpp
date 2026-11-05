@@ -2088,6 +2088,9 @@ private:
             CopyBufferToTexture(c, true);
         }
     }
+    // The game's tone-mapping pixel shader (its code hash): its exposure constant is scaled by the `exposure`
+    // setting.
+    static constexpr uint64_t kToneMapShaderHash = 0x9ea3c1ced6b87f4cull;
     uint64_t readbacks_done_ = 0, readbacks_recorded_ = 0, rt_writebacks_ = 0, reports_done_ = 0;
     // Small render targets (luminance / exposure textures) are copied back to game memory after each list, in
     // the texture's own layout: on Switch the CPU can read what the GPU rendered straight from memory, and the
@@ -2223,6 +2226,16 @@ private:
         for (int z = 0; z < d; z++)
             for (size_t y = 0; y < rows; y++)
                 memcpy(stream_ptr_ + off + (size_t(z) * rows + y) * row, src + size_t(z) * image_stride + y * stride, row);
+        // The brightness ramp (256x1, 8-bit RGBA) the final pass reads: the `gamma` setting is applied on top.
+        const float gamma = dsr::GetRuntime().config.gamma;
+        if (gamma != 1.0f && w == 256 && h == 1 && d == 1 && row == 1024) {
+            uint8_t* p = stream_ptr_ + off;
+            for (int i = 0; i < 256; i++)
+                for (int ch = 0; ch < 3; ch++) {
+                    const float v = p[i * 4 + ch] / 255.0f;
+                    p[i * 4 + ch] = uint8_t(std::lround(255.0f * std::pow(v, 1.0f / gamma)));
+                }
+        }
         VkBufferImageCopy region{};
         region.bufferOffset = off;
         region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -2774,7 +2787,22 @@ private:
                     size_t padded = (size + 15) & ~size_t(15);
                     if (padded != size && n != kCompilerConstants && GuestRangeValid(uint64_t(uintptr_t(src)), padded)) size = padded;
                     VkDeviceSize off;
-                    if (size == padded) {
+                    // `exposure` setting: the tone-mapping pass's exposure constant (fs c3[56].z) is scaled. The
+                    // data gets its own copy (cached uploads are shared between draws).
+                    const float exposure = dsr::GetRuntime().config.exposure;
+                    const bool scale_exposure = exposure != 1.0f && stage == 1 && n == 3 &&
+                                                code.hash == kToneMapShaderHash && size >= 56 * 16 + 12;
+                    if (scale_exposure) {
+                        off = StreamAlloc(padded, ubo_align);
+                        if (off != VK_WHOLE_SIZE) {
+                            memset(stream_ptr_ + off, 0, padded);
+                            memcpy(stream_ptr_ + off, src, size);
+                            float e;
+                            memcpy(&e, stream_ptr_ + off + 56 * 16 + 8, 4);
+                            e *= exposure;
+                            memcpy(stream_ptr_ + off + 56 * 16 + 8, &e, 4);
+                        }
+                    } else if (size == padded) {
                         off = UploadCached(src, size, ubo_align);
                     } else {
                         off = StreamAlloc(padded, ubo_align);
