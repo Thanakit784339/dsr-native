@@ -342,6 +342,9 @@ struct Image {
     // A clear not done yet: done as the load of the next render pass that starts on this subresource (no
     // separate full-image write and read on a tiling GPU), or for real before any other use.
     bool clear_pending = false;
+    // Was an attachment of a render pass with no barrier on it since: a later pass that uses it again in the same
+    // layout needs a barrier first (see BeginRendering).
+    bool attach_unsynced = false;
     VkClearValue clear_value{};
     VkImageAspectFlags clear_aspect = 0;
     int clear_layer = 0, clear_level = 0;
@@ -2469,6 +2472,7 @@ private:
         if (img.layout == to) return;
         RawBarrier(img.image, img.aspect, img.layout, to, uint32_t(img.levels), uint32_t(img.layers));
         img.layout = to;
+        img.attach_unsynced = false;
     }
 
     // ======================================================================================================
@@ -2482,6 +2486,7 @@ private:
         if (img.layout != dst) {
             RawBarrier(img.image, img.aspect, img.layout, dst, uint32_t(img.levels), uint32_t(img.layers));
             img.layout = dst;
+            img.attach_unsynced = false;
         }
         VkImageSubresourceRange range{img.clear_aspect, SubLevel(img, img.clear_level), 1,
                                       img.type == VK_IMAGE_TYPE_3D ? 0 : SubLayer(img, img.clear_layer), 1};
@@ -2494,7 +2499,7 @@ private:
         });
         clears_flushed_++;
     }
-    uint64_t clears_deferred_ = 0, clears_flushed_ = 0, clears_in_pass_ = 0;
+    uint64_t clears_deferred_ = 0, clears_flushed_ = 0, clears_in_pass_ = 0, pass_barriers_ = 0;
     // The render pass currently open: its colour images (and subresources) and depth image.
     Image* pass_colors_[8] = {};
     std::pair<int, int> pass_color_sub_[8] = {};
@@ -2911,6 +2916,32 @@ private:
         *extent = {w, h};
         if (rendering_ && key == rendering_key_) return true;
         EndRendering();
+        // An image the previous pass rendered to, used again here in the same layout, gets no layout transition
+        // and so had no barrier: without one the GPU may run the passes overlapped. On tiled GPUs (Adreno) a
+        // bin of this pass then loads the image before the earlier pass stored that bin, and whatever it drew
+        // there is lost: rectangular, bin-sized holes (and LRZ-block squares) in smoke, dust and glow that
+        // flicker with timing. One memory barrier covers every attachment of the pass.
+        {
+            bool hazard = false;
+            for (Image* c : colors)
+                if (c && c->attach_unsynced && c->layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) hazard = true;
+            if (depth && depth->attach_unsynced && depth->layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                hazard = true;
+            if (hazard) {
+                pass_barriers_++;
+                Rec([](VkCommandBuffer cb) {
+                    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                    mb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                    const VkPipelineStageFlags st = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                                    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                                    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+                    vkCmdPipelineBarrier(cb, st, st, 0, 1, &mb, 0, nullptr, 0, nullptr);
+                });
+            }
+        }
         BeginPass bp;
         bp.area = {{0, 0}, {w, h}};
         for (size_t ci = 0; ci < colors.size() && ci < 8; ci++) {
@@ -2933,6 +2964,7 @@ private:
                     a.clearValue = c->clear_value;
                 }
                 a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                c->attach_unsynced = true;
                 NoteWritten(c);
                 c->written = true;
                 c->cpu_source = false;
@@ -2954,6 +2986,7 @@ private:
             da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
             da.loadOp = depth->written ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
             da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            depth->attach_unsynced = true;
             da.clearValue.depthStencil = {1.0f, 0};
             if (clear_on_load) {
                 da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -3757,15 +3790,16 @@ private:
             d.query = uint32_t(query_pass_.size());
             query_pass_.push_back(capture_pass_);
         }
-        if (capture_active_ && capture_draws_logged_ < 400) {
+        if (capture_active_ && capture_draws_logged_ < 1500) {
             capture_draws_logged_++;
             std::string desc;
-            char b[160];
+            char b[320];
             snprintf(b, sizeof(b), "capture draw q%d (pass %u): vs %016llx, %s count %d, %d instances (base %d), base vertex %d, "
-                     "first %d, viewport %g,%g %gx%g on %ux%u | streams:", d.query == UINT32_MAX ? -1 : int(d.query),
+                     "first %d, viewport %g,%g %gx%g scissor %d,%d %ux%u on %ux%u | streams:", d.query == UINT32_MAX ? -1 : int(d.query),
                      capture_pass_, (unsigned long long)st_.program[0]->hash, p.index_type >= 0 ? "indexed" : "arrays",
                      p.count, p.instances, p.base_instance, p.base_vertex, p.first, d.dyn.vp.x, d.dyn.vp.y, d.dyn.vp.width,
-                     d.dyn.vp.height, extent.width, extent.height);
+                     d.dyn.vp.height, d.dyn.sc.offset.x, d.dyn.sc.offset.y, d.dyn.sc.extent.width, d.dyn.sc.extent.height,
+                     extent.width, extent.height);
             desc = b;
             for (const VkVertexInputBindingDescription& vb_ : vin.bindings) {
                 const BufferRange& r = st_.vertex_buffers[vb_.binding];
@@ -3778,6 +3812,33 @@ private:
             for (const VkVertexInputAttributeDescription& a : vin.attributes) {
                 snprintf(b, sizeof(b), " %u:s%u fmt %d +%u", a.location, a.binding, st_.attribs[a.location].format, a.offset);
                 desc += b;
+            }
+            // Skinned draws: the highest bone index the drawn vertices use (RGBA8UI attribute), and what the bone
+            // palette (vs c3) holds there, as 4x4 and 3x4 matrices (vanishing body parts of a dying knight).
+            for (const VkVertexInputAttributeDescription& a : vin.attributes) {
+                if (st_.attribs[a.location].format != 39) continue;
+                const BufferRange& r = st_.vertex_buffers[a.binding];
+                const uint32_t stride = a.binding < st_.streams.size() ? uint32_t(st_.streams[a.binding].stride) : 0;
+                if (!stride || !r.address || !GuestRangeValid(r.address, size_t(r.size))) break;
+                uint32_t mx = 0;
+                for (uint64_t at = a.offset; at + 4 <= r.size; at += stride) {
+                    const uint8_t* v = reinterpret_cast<const uint8_t*>(r.address + at);
+                    mx = std::max({mx, uint32_t(v[0]), uint32_t(v[1]), uint32_t(v[2]), uint32_t(v[3])});
+                }
+                const BufferRange& pal = st_.uniforms[0][0];  // vs c3
+                snprintf(b, sizeof(b), " | bone indices up to %u (palette %llu bytes:", mx, (unsigned long long)pal.size);
+                desc += b;
+                for (uint32_t row : {mx * 4, mx * 3}) {
+                    const uint64_t off = uint64_t(row) * 16;
+                    if (pal.address && GuestRangeValid(pal.address + off, 16)) {
+                        float f[4];
+                        memcpy(f, reinterpret_cast<const void*>(pal.address + off), 16);
+                        snprintf(b, sizeof(b), " row %u: %g %g %g %g;", row, f[0], f[1], f[2], f[3]);
+                        desc += b;
+                    }
+                }
+                desc += ")";
+                break;
             }
             desc += " | uniforms:";
             for (int stage = 0; stage < 2; stage++)
@@ -4836,9 +4897,11 @@ private:
                  (unsigned long long)readbacks_done_);
             readbacks_recorded_ = readbacks_done_ = 0;
         }
-        LOGI(kTag, "clears: %llu done as render pass loads or deferred, %llu inside passes, %llu performed separately",
-             (unsigned long long)clears_deferred_, (unsigned long long)clears_in_pass_, (unsigned long long)clears_flushed_);
-        clears_deferred_ = clears_in_pass_ = clears_flushed_ = 0;
+        LOGI(kTag, "clears: %llu done as render pass loads or deferred, %llu inside passes, %llu performed separately; "
+             "%llu barriers between passes reusing an attachment",
+             (unsigned long long)clears_deferred_, (unsigned long long)clears_in_pass_, (unsigned long long)clears_flushed_,
+             (unsigned long long)pass_barriers_);
+        clears_deferred_ = clears_in_pass_ = clears_flushed_ = pass_barriers_ = 0;
         if (rt_writebacks_ || reports_done_) {
             LOGI(kTag, "small render targets written back to game memory: %llu; reports written: %llu",
                  (unsigned long long)rt_writebacks_, (unsigned long long)reports_done_);
