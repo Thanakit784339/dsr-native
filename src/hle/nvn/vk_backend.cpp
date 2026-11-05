@@ -311,6 +311,8 @@ struct Image {
     uint32_t check_interval = 1;
     std::map<std::vector<uint32_t>, VkImageView> views;
     std::unordered_map<uint64_t, VkImageView> fast_views;  // same views by hashed key
+    uint64_t addr = 0;     // storage in game memory
+    TextureState tex{};    // as the game described it (layout of that storage)
 };
 
 struct Shader {
@@ -513,6 +515,7 @@ public:
             }
         }
         if (capture_active_) CaptureEndOfPass();
+        if (recording_) WriteBackSmallTargets();
         if (recording_) {
             EndRendering();
             SubmitAndWait(VK_NULL_HANDLE, VK_NULL_HANDLE);
@@ -1443,6 +1446,8 @@ private:
         Image img;
         img.nvn_format = t.tex.format;
         img.target = t.tex.target;
+        img.addr = t.addr;
+        img.tex = t.tex;
         img.vk_format = vf;
         img.width = t.tex.width;
         img.height = t.tex.height;
@@ -1502,6 +1507,7 @@ private:
         persist_resets_++;
     }
     void DestroyImage(Image& img) {
+        small_rts_.erase(&img);
         // Called with the GPU idle: sets that may reference this image's views are dropped with it.
         ResetPersistentSets();
         for (auto& [k, v] : img.views) vkDestroyImageView(device_, v, nullptr);
@@ -1777,6 +1783,27 @@ private:
     // Writes the finished readbacks of a slot to game memory (its fence has signalled).
     void DeliverReadbacks(Slot& sl) {
         for (const Readback& rb : sl.readbacks) {
+            if (rb.texture) {
+                const TextureLayout layout = ComputeLayout(rb.tex);
+                if (layout.levels.empty() || !GuestRangeValid(rb.dst, layout.levels[0].offset + layout.levels[0].size))
+                    continue;
+                WriteLevelRegion(reinterpret_cast<uint8_t*>(rb.dst) + layout.levels[0].offset, layout.levels[0],
+                                 layout.linear, 0, 0, 0, uint32_t(rb.row), uint32_t(rb.rows), 1, sl.ptr + rb.off, rb.row,
+                                 rb.row * rb.rows);
+                rt_writebacks_++;
+                if (rb.tex.format == 10 && rb.row * rb.rows <= 4096) {  // R32F luminance / exposure (diagnostics)
+                    static std::chrono::steady_clock::time_point last;
+                    static std::set<uint64_t> seen;
+                    const auto now = std::chrono::steady_clock::now();
+                    if (seen.insert(rb.dst).second || now - last > std::chrono::seconds(10)) {
+                        last = now;
+                        const float* f = reinterpret_cast<const float*>(sl.ptr + rb.off);
+                        LOGI(kTag, "written back %zux%zu R32F @%llx: texel 0 = %.4f, texel 1 = %.4f",
+                             rb.row / 4, rb.rows, (unsigned long long)rb.dst, f[0], f[1]);
+                    }
+                }
+                continue;
+            }
             const size_t span = rb.dst_image_stride * (rb.depth - 1) + rb.dst_stride * (rb.rows - 1) + rb.row;
             if (!GuestRangeValid(rb.dst, span)) continue;
             uint8_t* dst = reinterpret_cast<uint8_t*>(rb.dst);
@@ -1978,7 +2005,43 @@ private:
             CopyBufferToTexture(c, true);
         }
     }
-    uint64_t readbacks_done_ = 0, readbacks_recorded_ = 0;
+    uint64_t readbacks_done_ = 0, readbacks_recorded_ = 0, rt_writebacks_ = 0;
+    // Small render targets (luminance / exposure textures) are copied back to game memory after each list, in
+    // the texture's own layout: on Switch the CPU can read what the GPU rendered straight from memory, and the
+    // game computes its auto exposure that way (it stayed at its default without it: too dark).
+    static constexpr size_t kWritebackTexels = 64 * 64;
+    std::unordered_set<Image*> small_rts_;
+    void WriteBackSmallTargets() {
+        if (small_rts_.empty()) return;
+        for (Image* img : small_rts_) {
+            const FormatInfo fi = GetFormatInfo(img->nvn_format);
+            if (IsDepthFormat(img->nvn_format) || fi.block_w != 1 || fi.block_h != 1 ||
+                VkTexelBytes(img->vk_format) != uint32_t(fi.bytes_per_block) || !img->addr)
+                continue;
+            const size_t row = size_t(img->width) * size_t(fi.bytes_per_block), rows = size_t(img->height);
+            Begin();
+            EndRendering();
+            if (StreamRemaining() < row * rows + 1024) Flush();
+            const VkDeviceSize off = StreamAlloc(row * rows, 16);
+            if (off == VK_WHOLE_SIZE) continue;
+            VkBufferImageCopy region{};
+            region.bufferOffset = off;
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageExtent = {uint32_t(img->width), uint32_t(img->height), 1};
+            Transition(*img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            vkCmdCopyImageToBuffer(cmd_, img->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stream_, 1, &region);
+            Readback rb{off, img->addr, row, rows, 1, row, row * rows};
+            rb.texture = true;
+            rb.tex = img->tex;
+            slots_[slot_].readbacks.push_back(rb);
+        }
+        small_rts_.clear();
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0,
+                             nullptr);
+    }
     static uint32_t VkTexelBytes(VkFormat f) {
         switch (f) {
             case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_UINT: return 1;
@@ -2159,6 +2222,8 @@ private:
                 NoteWritten(c);
                 c->written = true;
                 c->cpu_source = false;
+                if (size_t(c->width) * size_t(c->height) <= kWritebackTexels && c->type == VK_IMAGE_TYPE_2D)
+                    small_rts_.insert(c);
             }
             atts.push_back(a);
         }
@@ -3623,6 +3688,10 @@ private:
                  (unsigned long long)readbacks_done_);
             readbacks_recorded_ = readbacks_done_ = 0;
         }
+        if (rt_writebacks_) {
+            LOGI(kTag, "small render targets written back to game memory: %llu", (unsigned long long)rt_writebacks_);
+            rt_writebacks_ = 0;
+        }
         LOGI(kTag, "descriptor sets: %llu reused from earlier frames, %zu kept, %llu resets", (unsigned long long)persist_hits_,
              persist_cache_.size(), (unsigned long long)persist_resets_);
         persist_hits_ = 0;
@@ -3752,6 +3821,8 @@ private:
         VkDeviceSize off;
         uint64_t dst;
         size_t row, rows, depth, dst_stride, dst_image_stride;
+        bool texture = false;  // dst is a texture's storage: written in its own layout (level 0, layer 0)
+        TextureState tex{};
     };
     struct Slot {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
