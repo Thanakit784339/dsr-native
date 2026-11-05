@@ -56,6 +56,9 @@ public:
     // runs. The host function must have the guest function's exact AAPCS64 signature.
     bool HookFunction(uint64_t image_offset, void* host_fn, std::string* err);
 
+    // Replaces one instruction in .text, only if it currently is `expected`. Before guest code runs.
+    bool PatchInstruction(uint64_t image_offset, uint32_t expected, uint32_t replacement, std::string* err);
+
 private:
     bool MapAndCopy(std::string* err);
     bool Relocate(const ImportResolver& resolver, std::string* err);

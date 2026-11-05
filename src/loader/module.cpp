@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <unordered_map>
 
@@ -63,6 +64,34 @@ bool Module::HookFunction(uint64_t off, void* host_fn, std::string* err) {
         return false;
     }
     arch::FlushICache(reinterpret_cast<void*>(addr), sizeof(patch));
+    return true;
+}
+
+bool Module::PatchInstruction(uint64_t off, uint32_t expected, uint32_t replacement, std::string* err) {
+    if (off % 4 || off + 4 > nso_->text.size) {
+        *err = "patch offset outside .text";
+        return false;
+    }
+    const uintptr_t addr = base_ + off;
+    uint32_t current;
+    memcpy(&current, reinterpret_cast<const void*>(addr), 4);
+    if (current != expected) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "instruction is %08x, expected %08x", current, expected);
+        *err = buf;
+        return false;
+    }
+    const uintptr_t page_lo = addr & ~(host_page_ - 1);
+    if (mprotect(reinterpret_cast<void*>(page_lo), host_page_, PROT_READ | PROT_WRITE) != 0) {
+        *err = "mprotect(RW) for patch failed";
+        return false;
+    }
+    memcpy(reinterpret_cast<void*>(addr), &replacement, 4);
+    if (mprotect(reinterpret_cast<void*>(page_lo), host_page_, PROT_READ | PROT_EXEC) != 0) {
+        *err = "mprotect(RX) after patch failed";
+        return false;
+    }
+    arch::FlushICache(reinterpret_cast<void*>(addr), 4);
     return true;
 }
 

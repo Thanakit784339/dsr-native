@@ -75,6 +75,17 @@ void InstallGameHooks() {
         LOGW("hooks", "unknown game build %.32s: engine hooks disabled", rt.main_nso.build_id_hex.c_str());
         return;
     }
+    // Frame rate: the render thread's frame limiter (main+0x70bd90, "sleep until 1000/fps ms have passed") is
+    // called with a hard-coded 30. With fps = 60 in the settings it gets 60.
+    if (rt.config.target_fps == 60) {
+        std::string err;
+        constexpr uint64_t kLimiterArg = 0x70bcb0;                     // orr w1, wzr, #30
+        constexpr uint32_t kOrig = 0x321F0FE1, kMov60 = 0x52800781;  // -> movz w1, #60
+        if (rt.main.PatchInstruction(kLimiterArg, kOrig, kMov60, &err))
+            LOGI("hooks", "frame limiter at main+0x70bd90 set to 60 fps");
+        else
+            LOGW("hooks", "could not set the frame limiter to 60 fps: %s", err.c_str());
+    }
     for (const Hook& h : kHooks) {
         std::string err;
         if (rt.main.HookFunction(h.offset, h.fn, &err))
