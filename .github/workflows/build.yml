@@ -42,6 +42,15 @@ jobs:
           path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
+      # Function addresses of this build's native library, in the job log (the profiler logs dsr+0x... offsets).
+      - name: Symbol table
+        run: |
+          NM=$(ls $ANDROID_HOME/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm | head -1)
+          LIB=$(ls android/app/build/intermediates/cxx/*/*/obj/arm64-v8a/libdsr.so | head -1)
+          echo "DSR-SYMBOLS-BEGIN $LIB"
+          $NM -n -C --defined-only "$LIB" | grep -iE ' [tw] ' | sed 's/^0*//'
+          echo "DSR-SYMBOLS-END"
+
       # Unstripped native library: symbolizes the profiler's dsr+0x... addresses.
       - uses: actions/upload-artifact@v4
         with:

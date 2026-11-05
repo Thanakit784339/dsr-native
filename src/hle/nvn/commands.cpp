@@ -64,27 +64,62 @@ std::shared_ptr<const CmdList> FindHandle(uint64_t h) {
     return it == g_handles.end() ? nullptr : it->second;
 }
 
+// Command list storage is recycled: a list that is no longer referenced gives its (cleared) vector back, and
+// the next recording starts with that capacity (allocating and freeing several MB of commands per frame,
+// page faults included, showed up in profiles).
+std::mutex g_list_pool_mutex;
+std::vector<CmdList> g_list_pool;
+CmdList TakePooledList() {
+    std::lock_guard<std::mutex> lk(g_list_pool_mutex);
+    if (g_list_pool.empty()) return {};
+    CmdList v = std::move(g_list_pool.back());
+    g_list_pool.pop_back();
+    return v;
+}
+void ReturnPooledList(CmdList&& v) {
+    v.clear();
+    std::lock_guard<std::mutex> lk(g_list_pool_mutex);
+    if (g_list_pool.size() < 96) g_list_pool.push_back(std::move(v));
+}
+
+// The recorder of the command buffer last appended to by this thread (one lookup per command was a locked
+// map lookup). Recorders are never erased, so the pointer stays valid.
+thread_local const void* t_last_cb = nullptr;
+thread_local Recorder* t_last_recorder = nullptr;
+Recorder& RecorderOf(void* cb) {
+    if (cb != t_last_cb) {
+        t_last_recorder = &g_recorders.Get(cb);
+        t_last_cb = cb;
+    }
+    return *t_last_recorder;
+}
+
 void Append(void* cb, Cmd&& c) {
-    Recorder& r = g_recorders.Get(cb);
+    Recorder& r = RecorderOf(cb);
     r.cmds.push_back(std::move(c));
     r.command_used += kBytesPerCommand;
 }
 
 // ---- recording ------------------------------------------------------------------------------------------
 void BeginRecording(void* cb) {
-    Recorder& r = g_recorders.Get(cb);
+    Recorder& r = RecorderOf(cb);
     r.recording = true;
     r.cmds.clear();
+    if (r.cmds.capacity() == 0) r.cmds = TakePooledList();
     r.control_used += kControlBytesPerRecording;
     g_begin_count++;
 }
-void AddCommandMemory(void* cb, const void*, int64_t, size_t) { g_recorders.Get(cb).command_used = 0; }
-void AddControlMemory(void* cb, void*, size_t) { g_recorders.Get(cb).control_used = 0; }
-size_t GetCommandMemoryUsed(const void* cb) { return g_recorders.Copy(cb).command_used; }
-size_t GetControlMemoryUsed(const void* cb) { return g_recorders.Copy(cb).control_used; }
+void AddCommandMemory(void* cb, const void*, int64_t, size_t) { RecorderOf(cb).command_used = 0; }
+void AddControlMemory(void* cb, void*, size_t) { RecorderOf(cb).control_used = 0; }
+// Field reads only: Table::Copy would copy the whole recorder, every command recorded so far included.
+size_t GetCommandMemoryUsed(const void* cb) { return RecorderOf(const_cast<void*>(cb)).command_used; }
+size_t GetControlMemoryUsed(const void* cb) { return RecorderOf(const_cast<void*>(cb)).control_used; }
 uint64_t EndRecording(void* cb) {
-    Recorder& r = g_recorders.Get(cb);
-    auto list = std::make_shared<const CmdList>(std::move(r.cmds));
+    Recorder& r = RecorderOf(cb);
+    std::shared_ptr<const CmdList> list(new CmdList(std::move(r.cmds)), [](const CmdList* l) {
+        ReturnPooledList(std::move(*const_cast<CmdList*>(l)));
+        delete l;
+    });
     r.cmds = CmdList{};
     r.recording = false;
     g_end_count++;
@@ -110,7 +145,7 @@ uint64_t EndRecording(void* cb) {
     }
     return h;
 }
-bool IsRecording(const void* cb) { return g_recorders.Copy(cb).recording; }
+bool IsRecording(const void* cb) { return RecorderOf(const_cast<void*>(cb)).recording; }
 
 // Inline previously recorded command lists (CallCommands / CopyCommands behave the same for us).
 void CallCommands(void* cb, int n, const uint64_t* handles) {

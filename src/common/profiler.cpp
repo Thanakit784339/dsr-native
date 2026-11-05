@@ -173,6 +173,26 @@ void Report() {
             }
         }
         if (total < 50) continue;
+        // Current name (game threads are named after they start) and exact CPU time since the last report.
+        const int tid = g_slots[slot].tid.load();
+        char path[64], name[32] = {};
+        snprintf(path, sizeof(path), "/proc/self/task/%d/comm", tid);
+        if (FILE* f = fopen(path, "r")) {
+            if (fgets(name, sizeof(name), f)) name[strcspn(name, "\n")] = 0;
+            fclose(f);
+        }
+        if (name[0]) snprintf(g_slots[slot].name, sizeof(g_slots[slot].name), "%s", name);
+        double cpu_s = -1;
+        snprintf(path, sizeof(path), "/proc/self/task/%d/schedstat", tid);
+        if (FILE* f = fopen(path, "r")) {
+            unsigned long long ns = 0;
+            if (fscanf(f, "%llu", &ns) == 1) {
+                static unsigned long long last_ns[kMaxThreads] = {};
+                if (last_ns[slot]) cpu_s = (ns - last_ns[slot]) / 1e9;
+                last_ns[slot] = ns;
+            }
+            fclose(f);
+        }
         auto top = [&](const char* what, const std::map<std::string, int>& m) {
             std::vector<std::pair<int, std::string>> v;
             for (auto& [k, c] : m) v.push_back({c, k});
@@ -185,7 +205,8 @@ void Report() {
             }
             LOGI(kTag, "  %s: %s", what, line.c_str());
         };
-        LOGI(kTag, "thread '%s': %d samples (%.1f s of CPU in 10 s)", g_slots[slot].name, total, total * 0.002);
+        LOGI(kTag, "thread '%s' (tid %d): %d samples, %.1f s of CPU in the last 10 s", g_slots[slot].name, tid, total,
+             cpu_s);
         top("self", self);
         top("in our code", ours);
         top("in game code", game);

@@ -146,6 +146,7 @@ void PoolBuilderSetStorage(void* b, void* mem, size_t size) {
 }
 std::mutex g_pool_range_mutex;
 std::map<uintptr_t, size_t> g_pool_ranges;  // storage base -> size
+std::atomic<uint64_t> g_pool_ranges_version{1};  // bumped on every change (GuestRangeValid's per-thread cache)
 
 bool PoolInitialize(void* pool, const void* b) {
     MemoryPoolState s = g_pool_builders.Copy(b);
@@ -153,6 +154,7 @@ bool PoolInitialize(void* pool, const void* b) {
     if (s.storage) {
         std::lock_guard<std::mutex> lk(g_pool_range_mutex);
         g_pool_ranges[reinterpret_cast<uintptr_t>(s.storage)] = s.size;
+        g_pool_ranges_version++;
     }
     return true;
 }
@@ -161,6 +163,7 @@ void PoolFinalize(void* pool) {
     if (s.storage) {
         std::lock_guard<std::mutex> lk(g_pool_range_mutex);
         g_pool_ranges.erase(reinterpret_cast<uintptr_t>(s.storage));
+        g_pool_ranges_version++;
     }
     g_pools.Erase(pool);
 }
@@ -563,11 +566,22 @@ bool SubmitTextureFrame(uint64_t addr, std::shared_ptr<const std::vector<uint8_t
     return true;
 }
 bool GuestRangeValid(uint64_t addr, size_t size) {
+    // Called many times per draw: the pool last matched on this thread is checked first, without the lock.
+    thread_local uint64_t cached_version = 0;
+    thread_local uintptr_t cached_lo = 0, cached_hi = 0;
+    const uint64_t version = g_pool_ranges_version.load(std::memory_order_acquire);
+    if (version == cached_version && addr >= cached_lo && addr + size <= cached_hi && addr + size >= addr) return true;
     std::lock_guard<std::mutex> lk(g_pool_range_mutex);
     auto it = g_pool_ranges.upper_bound(uintptr_t(addr));
     if (it == g_pool_ranges.begin()) return false;
     --it;
-    return addr >= it->first && addr + size <= it->first + it->second && addr + size >= addr;
+    const bool ok = addr >= it->first && addr + size <= it->first + it->second && addr + size >= addr;
+    if (ok) {
+        cached_version = version;
+        cached_lo = it->first;
+        cached_hi = it->first + it->second;
+    }
+    return ok;
 }
 
 TexRef MakeTexRef(const void* nvn_texture) {

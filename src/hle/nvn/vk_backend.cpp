@@ -1363,7 +1363,8 @@ private:
         if (upload && !img->written && !img->uploaded) {
             Upload(*img, t);
         } else if (upload && img->cpu_source && img->checked_in_list != list_counter_ &&
-                   (list_counter_ >= img->next_check_list || TakeDirty(t.addr))) {
+                   (list_counter_ >= img->next_check_list || TakeDirty(t.addr) ||
+                    size_t(img->width) * img->height <= 4096)) {  // small (lookup tables): every list
             // Most game textures never change after loading; hashing every one every frame cost ~15 ms a
             // frame (a 1 MB texture is thousands of cache misses). So checks back off while nothing changes.
             img->checked_in_list = list_counter_;
@@ -1533,6 +1534,15 @@ private:
                                regions.data());
         img.written = true;
         uploads_++;
+        if (img.width == 256 && img.height == 1 && fi.bytes_per_block == 16 && GuestRangeValid(t.addr, 4096)) {
+            // Diagnostics (brightness): the final pass's colour lookup table.
+            const float* lut = reinterpret_cast<const float*>(t.addr);
+            static int logged = 0;
+            if (logged++ < 40)
+                LOGI(kTag, "lookup table 256x1 @%llx uploaded: [0] %.4f %.4f %.4f | [64] %.4f | [128] %.4f | [255] %.4f %.4f %.4f",
+                     (unsigned long long)t.addr, lut[0], lut[1], lut[2], lut[64 * 4], lut[128 * 4], lut[255 * 4],
+                     lut[255 * 4 + 1], lut[255 * 4 + 2]);
+        }
         if (uploads_ <= 24)
             LOGI(kTag, "uploaded texture %dx%d format %d (%d levels, %d layers, %zu bytes)", img.width, img.height,
                  img.nvn_format, img.levels, img.layers, needed);
@@ -3162,6 +3172,8 @@ private:
         uint64_t hash;
         VkDeviceSize off;
         uint32_t changes;  // content changes seen; from 2 on the range is streamed instead (volatile)
+        uint64_t next_check_list;  // unchanged ranges are re-hashed less and less often (up to every 8 lists)
+        uint32_t interval;
     };
     std::unordered_map<uint64_t, GeoEntry> geo_;
     uint64_t geo_hits_ = 0, geo_misses_ = 0, geo_bytes_ = 0, geo_resets_ = 0, geo_volatile_ = 0;
@@ -3230,9 +3242,15 @@ private:
             geo_volatile_++;
             return VK_WHOLE_SIZE;  // rewritten every frame or so: streamed with the list
         }
+        if (it != geo_.end() && list_counter_ < it->second.next_check_list) {
+            geo_hits_++;
+            return it->second.off;
+        }
         const uint64_t h = GeoHash(src, size);
         if (it != geo_.end() && it->second.hash == h) {
             geo_hits_++;
+            it->second.interval = std::min<uint32_t>(it->second.interval * 2, 8);
+            it->second.next_check_list = list_counter_ + it->second.interval;
             return it->second.off;
         }
         const uint32_t changes = it != geo_.end() ? it->second.changes + 1 : 0;
@@ -3258,7 +3276,7 @@ private:
         geo_misses_++;
         geo_bytes_ += size;
         // A changed range gets new space (the old copy may still be read by frames in flight).
-        geo_[key] = {h, off, changes};
+        geo_[key] = {h, off, changes, list_counter_ + 1, 1};
         return off;
     }
 

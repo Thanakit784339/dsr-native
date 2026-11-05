@@ -1,4 +1,5 @@
 // nn::os memory heap, ticks and randomness.
+#include <time.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -135,7 +136,25 @@ HLE_FUNC(_ZN2nn2os15QueryMemoryInfoEPNS0_10MemoryInfoE, void, nn_os_QueryMemoryI
 }
 
 // ---- ticks ---------------------------------------------------------------------------------------
-HLE_FUNC(_ZN2nn2os13GetSystemTickEv, int64_t, nn_os_GetSystemTick, ()) { return NowTicks(); }
+// Some game threads poll the clock in a tight loop (a timer/job thread was seen spending most of a core in
+// clock_gettime). Such a thread gets a 50 us nap every 512 back-to-back reads, so it stops hogging a fast core
+// the frame and render threads need; anything that reads the clock at a normal rate is unaffected.
+HLE_FUNC(_ZN2nn2os13GetSystemTickEv, int64_t, nn_os_GetSystemTick, ()) {
+    const int64_t t = NowTicks();
+    thread_local int64_t last = 0;
+    thread_local int dense = 0;
+    if (t - last < 96) {  // under 5 us (19.2 MHz ticks) since the previous read
+        if (++dense >= 512) {
+            dense = 0;
+            timespec ts{0, 50'000};
+            nanosleep(&ts, nullptr);
+        }
+    } else {
+        dense = 0;
+    }
+    last = t;
+    return t;
+}
 HLE_ALIAS(nnosGetSystemTick, nn_os_GetSystemTick);
 HLE_FUNC(_ZN2nn2os22GetSystemTickFrequencyEv, int64_t, nn_os_GetSystemTickFrequency, ()) { return kTickFrequency; }
 HLE_ALIAS(nnosGetSystemTickFrequency, nn_os_GetSystemTickFrequency);
