@@ -321,9 +321,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "# fast_cores: 1 = keep the game's main, recording and submit threads on the performance cores\n"
                     "fast_cores = 1\n"
                     "# audio_smooth: 1 = release audio buffers to the game at a smoothed pace (experimental)\n"
-                    "audio_smooth = 0\n"
-                    "# flip_winding: 1 = corrected face culling (0 = as before, if surfaces look inside out)\n"
-                    "flip_winding = 1\n",
+                    "audio_smooth = 0\n",
                     cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0,
                     cfg->gamma, cfg->exposure);
             fclose(w);
@@ -343,7 +341,6 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "record_thread")) cfg->record_thread = v != 0;
             else if (!strcmp(key, "fast_cores")) cfg->fast_cores = v != 0;
             else if (!strcmp(key, "audio_smooth")) cfg->audio_smooth = v != 0;
-            else if (!strcmp(key, "flip_winding")) cfg->flip_winding = v != 0;
             else if (!strcmp(key, "gamma")) {
                 const float g = float(atof(value));
                 cfg->gamma = g >= 0.5f && g <= 3.0f ? g : 1.0f;

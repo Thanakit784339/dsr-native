@@ -2499,8 +2499,7 @@ private:
         });
         clears_flushed_++;
     }
-    uint64_t clears_deferred_ = 0, clears_flushed_ = 0, clears_in_pass_ = 0, pass_barriers_ = 0, aliased_rts_ = 0;
-    int aliased_rts_logged_ = 0;
+    uint64_t clears_deferred_ = 0, clears_flushed_ = 0, clears_in_pass_ = 0, pass_barriers_ = 0;
     // The render pass currently open: its colour images (and subresources) and depth image.
     Image* pass_colors_[8] = {};
     std::pair<int, int> pass_color_sub_[8] = {};
@@ -3332,29 +3331,6 @@ private:
         }
         Image* depth = st_.rts.size() > size_t(st_.num_rt) ? GetImage(st_.rts[size_t(st_.num_rt)], false) : nullptr;
         if (depth && !IsDepthFormat(depth->nvn_format)) depth = nullptr;
-        // The same image bound to several colour targets (the game parks unused, write-masked targets on the one
-        // it draws to). The hardware just doesn't write the masked ones; in Vulkan each attachment gets its own
-        // tile memory on Adreno and every copy is stored back, so per screen tile the untouched copy could land
-        // last and wipe what was drawn: tile-sized see-through squares in fog, smoke and glow. Only one stays
-        // attached: the one with the most channels enabled (the first on a tie).
-        for (size_t i = 0; i < colors.size(); i++) {
-            if (!colors[i]) continue;
-            for (size_t j = i + 1; j < colors.size(); j++) {
-                if (colors[j] != colors[i]) continue;
-                const auto sub = [&](size_t k) { return std::make_pair(st_.rts[k].layer, st_.rts[k].level); };
-                if (sub(i) != sub(j)) continue;
-                const auto bits = [&](size_t k) { return __builtin_popcount((st_.channel.mask >> (4 * k)) & 0xF); };
-                const size_t drop = bits(j) > bits(i) ? i : j;
-                if (aliased_rts_logged_ < 8) {
-                    aliased_rts_logged_++;
-                    LOGI(kTag, "colour targets %zu and %zu are the same %dx%d image (channel mask 0x%08x): target %zu detached",
-                         i, j, colors[i]->width, colors[i]->height, st_.channel.mask, drop);
-                }
-                aliased_rts_++;
-                colors[drop] = nullptr;
-                if (drop == i) break;
-            }
-        }
 
         Begin();
         // Keep enough streaming space for this draw so nothing allocated below is lost to a flush.
@@ -4127,9 +4103,9 @@ private:
     void DynamicState(VkExtent2D extent, const DeviceModes& modes, DynState* out) {
         // Y direction. In NVN's upper-left origin mode (Direct3D style), clip-space +Y is the top of the target
         // (row 0); in Vulkan it is the bottom. A negative-height viewport makes the two agree, so images land in
-        // memory the way the game expects. Without it, every rasterised image is mirrored and every full-screen
-        // pass mirrors it again (the parity decides what ends up upside down). Facing: see the pipeline's
-        // frontFace (NVN's winding in this mode is the opposite of what Vulkan sees on screen).
+        // memory the way the game expects, and front faces keep their winding as seen on screen. Without it,
+        // every rasterised image is mirrored and every full-screen pass mirrors it again (the parity decides
+        // what ends up upside down), and back-face culling is inverted.
         // In the OpenGL-style lower-left mode, row 0 is the bottom and clip +Y the highest row: as in Vulkan.
         const bool flip = modes.origin_mode == 1;
         float vx = 0, vy = 0, vw = float(extent.width), vh = float(extent.height);
@@ -4397,12 +4373,7 @@ private:
                       : st_.polygon.cull == 2 ? VK_CULL_MODE_BACK_BIT
                       : st_.polygon.cull == 3 ? VK_CULL_MODE_FRONT_AND_BACK
                                               : VK_CULL_MODE_NONE;
-        // Winding in NVN's upper-left origin mode is the opposite of what Vulkan sees through our flipped viewport.
-        // Shown by frame captures: draws culling NVN "front" (CW) faces drew nothing in the colour pass where
-        // their own depth prepass (no culling) had covered pixels - the visible faces were the ones culled (the
-        // dying knight's legs vanished; they failed the depth test with only their far sides left).
-        const bool cw = (st_.polygon.front_face == 0) != (GetDeviceModes().origin_mode == 1 && dsr::GetRuntime().config.flip_winding);
-        rs.frontFace = cw ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rs.frontFace = st_.polygon.front_face == 0 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
         rs.lineWidth = 1.0f;
         VkPipelineDepthStencilStateCreateInfo& ds = j.ds;
         const bool has_depth = depth_format != VK_FORMAT_UNDEFINED && HasDepth(depth_nvn_format);
@@ -4927,10 +4898,10 @@ private:
             readbacks_recorded_ = readbacks_done_ = 0;
         }
         LOGI(kTag, "clears: %llu done as render pass loads or deferred, %llu inside passes, %llu performed separately; "
-             "%llu barriers between passes reusing an attachment; %llu duplicate colour targets detached",
+             "%llu barriers between passes reusing an attachment",
              (unsigned long long)clears_deferred_, (unsigned long long)clears_in_pass_, (unsigned long long)clears_flushed_,
-             (unsigned long long)pass_barriers_, (unsigned long long)aliased_rts_);
-        clears_deferred_ = clears_in_pass_ = clears_flushed_ = pass_barriers_ = aliased_rts_ = 0;
+             (unsigned long long)pass_barriers_);
+        clears_deferred_ = clears_in_pass_ = clears_flushed_ = pass_barriers_ = 0;
         if (rt_writebacks_ || reports_done_) {
             LOGI(kTag, "small render targets written back to game memory: %llu; reports written: %llu",
                  (unsigned long long)rt_writebacks_, (unsigned long long)reports_done_);

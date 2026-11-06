@@ -24,7 +24,6 @@ struct RuntimeConfig {
     bool auto_capture = false;    // diagnostics: save a few frame captures automatically during play
     bool profile = true;          // diagnostics: sampling CPU profile of the busy threads, logged every 10 s
     float gamma = 1.0f;           // extra display gamma applied through the game's brightness ramp (> 1 lifts shadows)
-    bool flip_winding = true;   // NVN upper-left origin: invert front-face winding for Vulkan (0 = old behaviour)
     bool audio_smooth = false;  // release audio buffers at a smoothed pace (experiment; movies were not timed by it)
     bool fast_cores = true;  // keep the game's frame-critical threads off the efficiency cores
     bool record_thread = true;  // record Vulkan commands on a second thread (draw preparation stays on the render thread)
