@@ -290,6 +290,11 @@ void LogDeviceInfo() {
     LOGI(kTag, "ram: %ld MiB", pages > 0 ? long((int64_t(pages) * sysconf(_SC_PAGESIZE)) >> 20) : -1L);
 }
 
+#define PRESENT_MODE_HELP                                                                                    \
+    "# present_mode: how finished frames reach the screen: mailbox (newest frame shown at each refresh,\n"   \
+    "# lower latency), fifo (classic vsync queue), fifo_relaxed (vsync, tears when a frame is late),\n"      \
+    "# immediate (no vsync, can tear). Falls back to fifo if the device does not offer the mode.\n"
+
 // settings.txt beside the game folder: "key = value" lines, '#' comments. Written with defaults if missing.
 void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
     FILE* f = fopen(path.c_str(), "r");
@@ -321,13 +326,16 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "# fast_cores: 1 = keep the game's main, recording and submit threads on the performance cores\n"
                     "fast_cores = 1\n"
                     "# audio_smooth: 1 = release audio buffers to the game at a smoothed pace (experimental)\n"
-                    "audio_smooth = 0\n",
+                    "audio_smooth = 0\n"
+                    PRESENT_MODE_HELP
+                    "present_mode = mailbox\n",
                     cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0,
                     cfg->gamma, cfg->exposure);
             fclose(w);
             LOGI(kTag, "settings: wrote defaults to %s", path.c_str());
         }
     } else {
+        bool have_present_mode = false;
         char line[256];
         while (fgets(line, sizeof(line), f)) {
             char key[64], value[64];
@@ -341,6 +349,10 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "record_thread")) cfg->record_thread = v != 0;
             else if (!strcmp(key, "fast_cores")) cfg->fast_cores = v != 0;
             else if (!strcmp(key, "audio_smooth")) cfg->audio_smooth = v != 0;
+            else if (!strcmp(key, "present_mode")) {
+                cfg->present_mode = value;
+                have_present_mode = true;
+            }
             else if (!strcmp(key, "gamma")) {
                 const float g = float(atof(value));
                 cfg->gamma = g >= 0.5f && g <= 3.0f ? g : 1.0f;
@@ -350,10 +362,18 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             }
         }
         fclose(f);
+        // Settings added since the file was written are appended with their defaults, so they can be found.
+        if (!have_present_mode)
+            if (FILE* w = fopen(path.c_str(), "a")) {
+                fputs("\n" PRESENT_MODE_HELP "present_mode = mailbox\n", w);
+                fclose(w);
+                LOGI(kTag, "settings: added present_mode to %s", path.c_str());
+            }
     }
-    LOGI(kTag, "settings (%s): fps %d, async pipelines %s, auto capture %s, profile %s, gamma %.2f, exposure %.2f",
+    LOGI(kTag, "settings (%s): fps %d, async pipelines %s, auto capture %s, profile %s, gamma %.2f, exposure %.2f, "
+         "present mode %s",
          path.c_str(), cfg->target_fps, cfg->async_pipelines ? "on" : "off", cfg->auto_capture ? "on" : "off",
-         cfg->profile ? "on" : "off", cfg->gamma, cfg->exposure);
+         cfg->profile ? "on" : "off", cfg->gamma, cfg->exposure, cfg->present_mode.c_str());
     if (cfg->profile) dsr::profiler::Enable();
 }
 

@@ -1510,6 +1510,38 @@ private:
         const int32_t r = fn(static_cast<ANativeWindow*>(window_), fps, 1 /* FIXED_SOURCE */);
         LOGI(kTag, "window frame rate set to %.0f fps (fixed source): %s", fps, r == 0 ? "ok" : "refused");
     }
+    // `present_mode` setting. FIFO is the only mode every device must offer, so it is the fallback.
+    VkPresentModeKHR ChoosePresentMode() {
+        const std::string& want = dsr::GetRuntime().config.present_mode;
+        VkPresentModeKHR m = VK_PRESENT_MODE_FIFO_KHR;
+        if (want == "mailbox") m = VK_PRESENT_MODE_MAILBOX_KHR;
+        else if (want == "immediate") m = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        else if (want == "fifo_relaxed") m = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+        else if (want != "fifo") LOGW(kTag, "present_mode '%s' not recognised: using fifo", want.c_str());
+        uint32_t n = 0;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(phys_, surface_, &n, nullptr);
+        std::vector<VkPresentModeKHR> modes(n);
+        if (n) vkGetPhysicalDeviceSurfacePresentModesKHR(phys_, surface_, &n, modes.data());
+        std::string offered;
+        for (VkPresentModeKHR x : modes) {
+            static const char* kNames[] = {"immediate", "mailbox", "fifo", "fifo_relaxed"};
+            offered += x <= 3 ? kNames[x] : std::to_string(int(x)).c_str();
+            offered += ' ';
+        }
+        const bool ok = std::find(modes.begin(), modes.end(), m) != modes.end();
+        if (!ok) m = VK_PRESENT_MODE_FIFO_KHR;
+        if (!present_mode_logged_) {
+            present_mode_logged_ = true;
+            LOGI(kTag, "present mode: %s requested, %s used (device offers: %s)", want.c_str(),
+                 m == VK_PRESENT_MODE_MAILBOX_KHR     ? "mailbox"
+                 : m == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate"
+                 : m == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? "fifo_relaxed"
+                                                         : "fifo",
+                 offered.c_str());
+        }
+        return m;
+    }
+    bool present_mode_logged_ = false;
     bool EnsureSwapchain() {
         void* w = dsr::video::GetNativeWindow();
         if (w != window_) {
@@ -1576,11 +1608,16 @@ private:
         ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ci.preTransform = transform;
         ci.compositeAlpha = alpha;
-        ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        ci.presentMode = ChoosePresentMode();
         ci.clipped = VK_TRUE;
         ci.oldSwapchain = swapchain_;
         VkSwapchainKHR sc = VK_NULL_HANDLE;
         VkResult r = vkCreateSwapchainKHR(device_, &ci, nullptr, &sc);
+        if (r != VK_SUCCESS && ci.presentMode != VK_PRESENT_MODE_FIFO_KHR) {
+            LOGW(kTag, "swapchain with present mode %d failed (%d): retrying with fifo", int(ci.presentMode), r);
+            ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+            r = vkCreateSwapchainKHR(device_, &ci, nullptr, &sc);
+        }
         DestroySwapchain(false);
         if (r != VK_SUCCESS) {
             LogOnce("swapchain", "vkCreateSwapchainKHR failed: %d", r);
