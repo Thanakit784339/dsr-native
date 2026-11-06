@@ -295,6 +295,12 @@ void LogDeviceInfo() {
     "# lower latency), fifo (classic vsync queue), fifo_relaxed (vsync, tears when a frame is late),\n"      \
     "# immediate (no vsync, can tear). Falls back to fifo if the device does not offer the mode.\n"
 
+bool g_face_by_position = false;  // `face_buttons` setting (see KeyToButton)
+
+#define FACE_BUTTONS_HELP                                                                                    \
+    "# face_buttons: label = each button does what its label says on Switch (A is A); position = by\n"      \
+    "# position, as on a Switch pad (for Xbox-style controllers whose A sits where the Switch's B is)\n"
+
 // settings.txt beside the game folder: "key = value" lines, '#' comments. Written with defaults if missing.
 void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
     FILE* f = fopen(path.c_str(), "r");
@@ -328,14 +334,16 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "# audio_smooth: 1 = release audio buffers to the game at a smoothed pace (experimental)\n"
                     "audio_smooth = 0\n"
                     PRESENT_MODE_HELP
-                    "present_mode = mailbox\n",
+                    "present_mode = mailbox\n"
+                    FACE_BUTTONS_HELP
+                    "face_buttons = label\n",
                     cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0,
                     cfg->gamma, cfg->exposure);
             fclose(w);
             LOGI(kTag, "settings: wrote defaults to %s", path.c_str());
         }
     } else {
-        bool have_present_mode = false;
+        bool have_present_mode = false, have_face_buttons = false;
         char line[256];
         while (fgets(line, sizeof(line), f)) {
             char key[64], value[64];
@@ -349,7 +357,10 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "record_thread")) cfg->record_thread = v != 0;
             else if (!strcmp(key, "fast_cores")) cfg->fast_cores = v != 0;
             else if (!strcmp(key, "audio_smooth")) cfg->audio_smooth = v != 0;
-            else if (!strcmp(key, "present_mode")) {
+            else if (!strcmp(key, "face_buttons")) {
+                g_face_by_position = !strcmp(value, "position");
+                have_face_buttons = true;
+            } else if (!strcmp(key, "present_mode")) {
                 cfg->present_mode = value;
                 have_present_mode = true;
             }
@@ -369,11 +380,18 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                 fclose(w);
                 LOGI(kTag, "settings: added present_mode to %s", path.c_str());
             }
+        if (!have_face_buttons)
+            if (FILE* w = fopen(path.c_str(), "a")) {
+                fputs("\n" FACE_BUTTONS_HELP "face_buttons = label\n", w);
+                fclose(w);
+                LOGI(kTag, "settings: added face_buttons to %s", path.c_str());
+            }
     }
     LOGI(kTag, "settings (%s): fps %d, async pipelines %s, auto capture %s, profile %s, gamma %.2f, exposure %.2f, "
-         "present mode %s",
+         "present mode %s, face buttons by %s",
          path.c_str(), cfg->target_fps, cfg->async_pipelines ? "on" : "off", cfg->auto_capture ? "on" : "off",
-         cfg->profile ? "on" : "off", cfg->gamma, cfg->exposure, cfg->present_mode.c_str());
+         cfg->profile ? "on" : "off", cfg->gamma, cfg->exposure, cfg->present_mode.c_str(),
+         g_face_by_position ? "position" : "label");
     if (cfg->profile) dsr::profiler::Enable();
 }
 
@@ -414,11 +432,13 @@ int32_t AxisToStick(float v) {
 uint64_t KeyToButton(int32_t key) {
     using namespace dsr::input;
     switch (key) {
-        // Android gamepads use Xbox-style positions; Switch A/B and X/Y are swapped by position.
-        case AKEYCODE_BUTTON_A: return kB;
-        case AKEYCODE_BUTTON_B: return kA;
-        case AKEYCODE_BUTTON_X: return kY;
-        case AKEYCODE_BUTTON_Y: return kX;
+        // By label (default): the button Android reports as A is the Switch's A, and so on.
+        // `face_buttons = position` maps by position instead (Xbox-style pads, whose A sits where the Switch's
+        // B is; this was the only behaviour before).
+        case AKEYCODE_BUTTON_A: return g_face_by_position ? kB : kA;
+        case AKEYCODE_BUTTON_B: return g_face_by_position ? kA : kB;
+        case AKEYCODE_BUTTON_X: return g_face_by_position ? kY : kX;
+        case AKEYCODE_BUTTON_Y: return g_face_by_position ? kX : kY;
         case AKEYCODE_BUTTON_L1: return kL;
         case AKEYCODE_BUTTON_R1: return kR;
         case AKEYCODE_BUTTON_L2: return kZL;

@@ -1525,7 +1525,10 @@ private:
         std::string offered;
         for (VkPresentModeKHR x : modes) {
             static const char* kNames[] = {"immediate", "mailbox", "fifo", "fifo_relaxed"};
-            offered += x <= 3 ? kNames[x] : std::to_string(int(x)).c_str();
+            offered += x <= 3                                                ? kNames[x]
+                       : x == VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR     ? "shared_demand_refresh"
+                       : x == VK_PRESENT_MODE_SHARED_CONTINUOUS_REFRESH_KHR ? "shared_continuous_refresh"
+                                                                            : std::to_string(int(x)).c_str();
             offered += ' ';
         }
         const bool ok = std::find(modes.begin(), modes.end(), m) != modes.end();
