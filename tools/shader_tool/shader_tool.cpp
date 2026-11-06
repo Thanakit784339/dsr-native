@@ -54,6 +54,10 @@ int main(int argc, char** argv) {
             continue;
         }
         ok++;
+        if (getenv("DSR_LIST"))
+            printf("index %u %s inputs 0x%x outputs 0x%x code %u @%llx\n", h.index,
+                   r.info.stage == Stage::Vertex ? "vs" : "fs", r.info.input_mask, r.info.output_mask, h.code_size,
+                   (unsigned long long)h.address);
         char path[512];
         snprintf(path, sizeof(path), "%s/%u_%s.spv", argv[2], h.index, r.info.stage == Stage::Vertex ? "vs" : "fs");
         FILE* o = fopen(path, "wb");
