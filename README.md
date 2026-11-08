@@ -10,13 +10,20 @@ Runs the game's original ARM64 code (`exefs/main`) directly on an ARM64 Android 
 
 ## Status
 
+**Must use v1.0.0 version of Dark Souls: Remastered for Nintendo Switch.**
+
 Very early development. Expect many visual bugs and minor performance issues. No touch controls for now.
 
-The only test device so far has been an AYN Thor Base model, so I cannot guarantee that this will work on any other device.
+The only test device so far has been an AYN Thor Base model, so I cannot guarantee that this will work on any other device. I also haven't tested the v1.0.3 update for the game yet.
+
+
 
 ## How does it run?
 
 Tested areas have been the Undead Burg, Firelink Shrine, and the Undead Asylum.
+
+> [!IMPORTANT]
+> Expect texture flickering and stuttering upon rendering in new areas. This will most likely happen the first time you load the game. Once loaded there should be no more glitching.
 
 Runs at the Switch's default resolution of 720p.
 
@@ -58,10 +65,15 @@ file is complete even after a crash. The same output also goes to logcat (`adb l
 
 
 
+
+
 ## Installing game files on the device
+> [!NOTE]
+> Upon first time launch a settings.txt file will also be created with a few changeable settings and their explanations.
+
 
 > [!IMPORTANT]
-> You must extract the games **romfs** and **exefs** files to play the game. You can use Ryujinx on Windows to obtain this from your own game dump.
+> You must extract the games **romfs** and **exefs** files to play the game. You can use Ryujinx (Ryubing) on Windows to obtain this from your own game dump.
 
 
 Install the APK and launch it once to create the necessary folders, then place the game files inside:
