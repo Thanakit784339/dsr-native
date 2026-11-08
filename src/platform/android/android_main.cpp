@@ -328,8 +328,8 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "# gamma: extra display gamma on top of the in-game brightness (1.0 = as the game draws it;\n"
                     "# 1.2 - 1.6 lifts dark areas)\n"
                     "gamma = %.2f\n"
-                    "# exposure: scales the scene's exposure before tone mapping (1.0 = as the game draws it; 1.45\n"
-                    "# is what the game's own light adaptation computes in dark areas)\n"
+                    "# exposure: scales the scene's exposure before tone mapping (default 1.37; 1.0 = exactly as the\n"
+                    "# game draws it; higher is brighter)\n"
                     "exposure = %.2f\n"
                     "# pin_render_thread: 1 = keep the render thread on the fastest CPU core (was slower on an\n"
                     "# 8 Gen 2: the GPU then waited; 0 = let Android choose)\n"
@@ -378,7 +378,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                 cfg->gamma = g >= 0.5f && g <= 3.0f ? g : 1.0f;
             } else if (!strcmp(key, "exposure")) {
                 const float e = float(atof(value));
-                cfg->exposure = e >= 0.25f && e <= 4.0f ? e : 1.0f;
+                cfg->exposure = e >= 0.25f && e <= 4.0f ? e : dsr::RuntimeConfig{}.exposure;
             }
         }
         fclose(f);

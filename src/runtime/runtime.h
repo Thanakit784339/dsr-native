@@ -29,7 +29,7 @@ struct RuntimeConfig {
     bool fast_cores = true;  // keep the game's frame-critical threads off the efficiency cores
     bool record_thread = true;  // record Vulkan commands on a second thread (draw preparation stays on the render thread)
     bool pin_render_thread = false;  // keep the render thread on the fastest CPU core(s) (slower on 8 Gen 2: off)
-    float exposure = 1.0f;        // scales the tone-mapping exposure (1.45: what the game's own adaptation computes)
+    float exposure = 1.37f;       // scales the tone-mapping exposure (1.0 = as the game draws it)
 };
 
 struct Runtime {
