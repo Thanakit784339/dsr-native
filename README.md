@@ -90,6 +90,11 @@ Inside the **game** folder must be the extracted **romfs** files, along with the
 
 
 ## Known issues
+
+>[!NOTE]
+>If your A and B inputs seem to be swapped, you must edit the "face_buttons" setting found in /Download/DSRNative/settings.txt from "label" to "position"
+
+
 - [ ] Buggy fogwalls
 - [ ] NPC or player models sometimes disappearing during death animation
 - [ ] Resting at a bonfire screen effect can be glitched
