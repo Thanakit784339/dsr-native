@@ -24,12 +24,12 @@ I also haven't tested the v1.0.3 update for the game yet.
 
 ## How does it run?
 
-Tested areas have been the Undead Burg, Firelink Shrine, and the Undead Asylum.
+Tested areas have been the Undead Burg, Firelink Shrine, and the Undead Asylum. **>6GB of RAM Recommended**
 
 > [!IMPORTANT]
 > Expect texture flickering and stuttering upon rendering in new areas. This will most likely happen the first time you load the game. Once loaded there should be no more glitching.
 
-Runs at the Switch's default resolution of 720p.
+Runs at the Switch's default resolution of 720p. 
 
 The game is mostly playable with a very stable **60FPS** in all of my testing. Temps average around the **60c~** mark, and RAM usage is low. There are however, many minor graphical glitches that will be hopefully ironed out on later releases.
 
