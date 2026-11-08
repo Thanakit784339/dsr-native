@@ -16,6 +16,8 @@ Very early development. Expect many visual bugs and minor performance issues. No
 
 The only test device so far has been an AYN Thor Base model, so I cannot guarantee that this will work on any other device. Should hopefully work however with Snapdragon + Adreno chips.
 
+Highly doubt this works on Mali GPUs.
+
 I also haven't tested the v1.0.3 update for the game yet.
 
 
@@ -75,7 +77,7 @@ file is complete even after a crash. The same output also goes to logcat (`adb l
 
 
 > [!IMPORTANT]
-> You must extract the games **romfs** and **exefs** files to play the game. You can use Ryujinx (Ryubing) on Windows to obtain this from your own game dump.
+> You must extract the games **romfs** and **exefs** files to play the game. There many ways to do this, but i recommend using Ryujinx (Ryubing) on Windows to obtain this from your own game dump.
 
 
 Install the APK, launch it and give it permission to access files to create the necessary folders, then place the game files inside:
