@@ -341,6 +341,8 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     cfg->gamma, cfg->exposure);
             fclose(w);
             LOGI(kTag, "settings: wrote defaults to %s", path.c_str());
+        } else {
+            LOGW(kTag, "settings: cannot create %s (%s): using defaults", path.c_str(), strerror(errno));
         }
     } else {
         bool have_present_mode = false, have_face_buttons = false;
@@ -395,6 +397,12 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
     if (cfg->profile) dsr::profiler::Enable();
 }
 
+// mkdir -p.
+void MakeDirs(const std::string& path) {
+    for (size_t i = 1; i <= path.size(); i++)
+        if (i == path.size() || path[i] == '/') mkdir(path.substr(0, i).c_str(), 0775);
+}
+
 void StartGame(android_app* app) {
     if (g_game_started.exchange(true)) return;
     std::string base = app->activity->externalDataPath ? app->activity->externalDataPath : "/sdcard";
@@ -402,11 +410,25 @@ void StartGame(android_app* app) {
     cfg.game_dir = base + "/game";
     cfg.save_dir = base + "/save";
     cfg.cache_dir = base + "/cache";
+    // On a first launch the app's own folder may not exist yet (Android creates it lazily), and then nothing
+    // below could be written. Create it and everything the user is expected to find in it.
+    MakeDirs(base);
+    mkdir(cfg.game_dir.c_str(), 0775);
     mkdir(cfg.save_dir.c_str(), 0775);
     mkdir(cfg.cache_dir.c_str(), 0775);
     LoadSettings(base + "/settings.txt", &cfg);
     LOGI(kTag, "game dir: %s", cfg.game_dir.c_str());
     if (!FileExists(cfg.game_dir + "/exefs/main")) {
+        const std::string note = cfg.game_dir + "/PUT_GAME_FILES_HERE.txt";
+        if (!FileExists(note))
+            if (FILE* w = fopen(note.c_str(), "w")) {
+                fputs("Copy the contents of the extracted Dark Souls Remastered (Switch) folder here: the folder\n"
+                      "that contains exefs/, dvdbnd0.bdt, dvdbnd0.bhd5 and so on, so that this folder holds\n"
+                      "exefs/main directly. Then start the app again.\n"
+                      "Settings are in settings.txt next to this folder.\n",
+                      w);
+                fclose(w);
+            }
         LOGE(kTag, "game files not found: expected %s/exefs/main", cfg.game_dir.c_str());
         LOGE(kTag, "copy the extracted game folder (the one containing exefs/ and dvdbnd0.bdt) there, e.g.:");
         LOGE(kTag, "  adb push DarkSoulsR/. %s/", cfg.game_dir.c_str());
