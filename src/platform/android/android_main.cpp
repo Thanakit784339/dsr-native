@@ -1,15 +1,16 @@
 // Android entry point (NativeActivity + native_app_glue).
 //
-// Game files: copy the extracted game (the folder containing exefs/, dvdbnd0.bdt, ...) to
-//   /sdcard/Android/data/com.dsrnative.app/files/game/
-// Save data goes to .../files/save, caches to .../files/cache.
-//
-// Logs: every run writes Download/DSRNative/dsr_<date>_<time>.txt on the phone's shared storage
-// (visible to file managers and over USB), plus logcat (`adb logcat -s 'DSR/*'`).
+// Files: everything lives in Download/DSRNative on the phone's shared storage (needs "All files access", asked
+// for on first launch; refused -> the app's private folder Android/data/com.dsrnative.app/files instead):
+//   game/          the extracted game (the folder containing exefs/, dvdbnd0.bdt, ...)
+//   save/ cache/   save data, GPU pipeline cache
+//   settings.txt
+//   logs/          dsr_<date>_<time>.txt run logs, frame captures, shader dumps (also logcat: adb logcat -s 'DSR/*')
 #include <android/input.h>
 #include <android/log.h>
 #include <android_native_app_glue.h>
 #include <spawn.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <time.h>
@@ -48,6 +49,12 @@ bool FileExists(const std::string& p) {
     return stat(p.c_str(), &st) == 0;
 }
 
+// mkdir -p.
+void MakeDirs(const std::string& path) {
+    for (size_t i = 1; i <= path.size(); i++)
+        if (i == path.size() || path[i] == '/') mkdir(path.substr(0, i).c_str(), 0775);
+}
+
 std::string Prop(const char* name) {
     char v[PROP_VALUE_MAX] = "";
     __system_property_get(name, v);
@@ -67,7 +74,7 @@ bool JniFailed(JNIEnv* env, std::string* why, const char* step) {
     return true;
 }
 
-// Creates Download/DSRNative/<name> through MediaStore and returns a writable fd, or -1.
+// Creates Download/DSRNative/logs/<name> through MediaStore and returns a writable fd, or -1.
 int CreateDownloadViaMediaStore(android_app* app, const char* name, std::string* why,
                                 const char* mime_type = "text/plain") {
     JavaVM* vm = app->activity->vm;
@@ -91,7 +98,7 @@ int CreateDownloadViaMediaStore(android_app* app, const char* name, std::string*
         if (JniFailed(env, why, "ContentValues methods")) break;
         jobject values = env->NewObject(cv_cls, cv_ctor);
         if (JniFailed(env, why, "new ContentValues")) break;
-        const char* kv[][2] = {{"_display_name", name}, {"mime_type", mime_type}, {"relative_path", "Download/DSRNative"}};
+        const char* kv[][2] = {{"_display_name", name}, {"mime_type", mime_type}, {"relative_path", "Download/DSRNative/logs"}};
         for (auto& p : kv) {
             jstring k = env->NewStringUTF(p[0]);
             jstring v = env->NewStringUTF(p[1]);
@@ -241,31 +248,31 @@ void SetupLogFile(android_app* app) {
     int fd = CreateDownloadViaMediaStore(app, name, &why);
     if (fd >= 0) {
         dsr::SetLogFileFd(fd);
-        LOGI(kTag, "log file: Download/DSRNative/%s (via MediaStore)", name);
+        LOGI(kTag, "log file: Download/DSRNative/logs/%s (via MediaStore)", name);
         char logcat_name[80];
         strftime(logcat_name, sizeof(logcat_name), "dsr_%Y%m%d_%H%M%S_logcat.txt", &t);
         std::string why2;
         int lfd = CreateDownloadViaMediaStore(app, logcat_name, &why2);
         if (lfd >= 0) {
-            LOGI(kTag, "logcat file: Download/DSRNative/%s", logcat_name);
+            LOGI(kTag, "logcat file: Download/DSRNative/logs/%s", logcat_name);
             StartLogcatMirror(lfd);
         } else {
             LOGW(kTag, "logcat file not created: %s", why2.c_str());
         }
         return;
     }
-    failures.push_back("MediaStore Download/DSRNative: " + why);
+    failures.push_back("MediaStore Download/DSRNative/logs: " + why);
 
     std::string app_dir = app->activity->externalDataPath ? app->activity->externalDataPath : "";
     const std::string package = "com.dsrnative.app";
     const std::string paths[] = {
-        "/storage/emulated/0/Download/DSRNative",
+        "/storage/emulated/0/Download/DSRNative/logs",
         "/storage/emulated/0/Android/media/" + package,
         app_dir,
     };
     for (const std::string& dir : paths) {
         if (dir.empty()) continue;
-        mkdir(dir.c_str(), 0775);
+        MakeDirs(dir);
         std::string path = dir + "/" + name;
         if (dsr::OpenLogFile(path.c_str())) {
             LOGI(kTag, "log file: %s", path.c_str());
@@ -397,15 +404,113 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
     if (cfg->profile) dsr::profiler::Enable();
 }
 
-// mkdir -p.
-void MakeDirs(const std::string& path) {
-    for (size_t i = 1; i <= path.size(); i++)
-        if (i == path.size() || path[i] == '/') mkdir(path.substr(0, i).c_str(), 0775);
+// The app's folder for everything the player handles: game/, save/, cache/, settings.txt (logs, frame captures
+// and shader dumps go to logs/ inside it, through MediaStore).
+constexpr const char* kSharedDir = "/storage/emulated/0/Download/DSRNative";
+
+// GameActivity.storageAccess(): 0 = still waiting for the player's answer, 1 = granted, 2 = refused.
+int StorageAccess(android_app* app) {
+    JavaVM* vm = app->activity->vm;
+    JNIEnv* env = nullptr;
+    bool attached_here = false;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK || !env) {
+        if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) return 2;
+        attached_here = true;
+    }
+    int r = 2;
+    jclass cls = env->GetObjectClass(app->activity->clazz);
+    jmethodID m = cls ? env->GetStaticMethodID(cls, "storageAccess", "()I") : nullptr;
+    if (m && !env->ExceptionCheck()) r = env->CallStaticIntMethod(cls, m);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        r = 2;
+    }
+    if (attached_here) vm->DetachCurrentThread();
+    return r;
+}
+
+bool CopyFile(const std::string& from, const std::string& to) {
+    FILE* in = fopen(from.c_str(), "rb");
+    if (!in) return false;
+    FILE* out = fopen(to.c_str(), "wb");
+    if (!out) {
+        fclose(in);
+        return false;
+    }
+    std::vector<char> buf(1 << 16);
+    size_t n;
+    bool ok = true;
+    while ((n = fread(buf.data(), 1, buf.size(), in)) > 0)
+        if (fwrite(buf.data(), 1, n, out) != n) ok = false;
+    fclose(in);
+    if (fclose(out) != 0) ok = false;
+    return ok;
+}
+
+// Copies a folder tree; files already present at the destination are kept. Returns the number of files copied.
+int CopyTree(const std::string& from, const std::string& to) {
+    DIR* d = opendir(from.c_str());
+    if (!d) return 0;
+    mkdir(to.c_str(), 0775);
+    int copied = 0;
+    while (dirent* e = readdir(d)) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        const std::string a = from + "/" + e->d_name, b = to + "/" + e->d_name;
+        struct stat st;
+        if (stat(a.c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode))
+            copied += CopyTree(a, b);
+        else if (!FileExists(b) && CopyFile(a, b))
+            copied++;
+    }
+    closedir(d);
+    return copied;
+}
+
+// Brings saves, settings and caches over from the folder used before (Android/data/<package>/files). The game
+// files are not copied (several GB): if they are only there, they are used from there until moved.
+void MigrateFromAppFolder(const std::string& old_dir, const std::string& base) {
+    if (old_dir.empty() || old_dir == base || !FileExists(old_dir)) return;
+    if (!FileExists(base + "/settings.txt") && FileExists(old_dir + "/settings.txt") &&
+        CopyFile(old_dir + "/settings.txt", base + "/settings.txt"))
+        LOGI(kTag, "moved over: settings.txt from %s", old_dir.c_str());
+    if (int n = CopyTree(old_dir + "/save", base + "/save"))
+        LOGI(kTag, "moved over: %d save file(s) from %s/save (the originals are kept)", n, old_dir.c_str());
+    if (int n = CopyTree(old_dir + "/cache", base + "/cache"))
+        LOGI(kTag, "moved over: %d cache file(s) from %s/cache", n, old_dir.c_str());
+}
+
+bool CanWriteIn(const std::string& dir) {
+    const std::string probe = dir + "/.write_test";
+    FILE* f = fopen(probe.c_str(), "w");
+    if (!f) return false;
+    fclose(f);
+    unlink(probe.c_str());
+    return true;
 }
 
 void StartGame(android_app* app) {
+    if (g_game_started) return;
+    // Wait for the answer to the storage access request (the settings screen is up on a first launch).
+    const int access = StorageAccess(app);
+    if (access == 0) {
+        static bool logged = false;
+        if (!logged) LOGI(kTag, "waiting for storage access (\"All files access\" for Download/DSRNative)");
+        logged = true;
+        return;
+    }
     if (g_game_started.exchange(true)) return;
-    std::string base = app->activity->externalDataPath ? app->activity->externalDataPath : "/sdcard";
+    const std::string old_dir = app->activity->externalDataPath ? app->activity->externalDataPath : "";
+    std::string base = kSharedDir;
+    if (access == 1) MakeDirs(base);
+    if (access != 1 || !CanWriteIn(base)) {
+        LOGW(kTag, "no access to %s (%s): using the app's private folder %s instead", kSharedDir,
+             access == 1 ? strerror(errno) : "storage access refused", old_dir.c_str());
+        base = old_dir.empty() ? "/sdcard" : old_dir;
+    } else {
+        LOGI(kTag, "app folder: %s", base.c_str());
+        MigrateFromAppFolder(old_dir, base);
+    }
     dsr::RuntimeConfig cfg;
     cfg.game_dir = base + "/game";
     cfg.save_dir = base + "/save";
@@ -417,6 +522,11 @@ void StartGame(android_app* app) {
     mkdir(cfg.save_dir.c_str(), 0775);
     mkdir(cfg.cache_dir.c_str(), 0775);
     LoadSettings(base + "/settings.txt", &cfg);
+    if (!FileExists(cfg.game_dir + "/exefs/main") && base != old_dir && FileExists(old_dir + "/game/exefs/main")) {
+        LOGW(kTag, "game files are still in %s/game: using them from there; move them to %s/game", old_dir.c_str(),
+             base.c_str());
+        cfg.game_dir = old_dir + "/game";
+    }
     LOGI(kTag, "game dir: %s", cfg.game_dir.c_str());
     if (!FileExists(cfg.game_dir + "/exefs/main")) {
         const std::string note = cfg.game_dir + "/PUT_GAME_FILES_HERE.txt";
@@ -559,6 +669,10 @@ void OnCmd(android_app* app, int32_t cmd) {
             LOGI(kTag, "window ready %p", app->window);
             dsr::video::SetNativeWindow(app->window);
             StartGame(app);
+            break;
+        case APP_CMD_RESUME:
+        case APP_CMD_GAINED_FOCUS:
+            if (app->window) StartGame(app);  // back from the storage access screen
             break;
         case APP_CMD_TERM_WINDOW:
             LOGI(kTag, "window lost");

@@ -1072,7 +1072,7 @@ public:
             if (it.image_memory) vkFreeMemory(device_, it.image_memory, nullptr);
         }
         if (fd >= 0) close(fd);
-        LOGI(kTag, "frame capture %d: %zu images, %zu bytes -> Download/DSRNative/%s", captures_done_,
+        LOGI(kTag, "frame capture %d: %zu images, %zu bytes -> Download/DSRNative/logs/%s", captures_done_,
              capture_items_.size(), bytes, fd >= 0 ? name : "(could not create file)");
         capture_items_.clear();
     }

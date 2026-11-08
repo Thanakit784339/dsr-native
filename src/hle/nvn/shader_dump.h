@@ -4,7 +4,7 @@
 
 namespace dsr::hle::nvn {
 // Records each distinct shader the game hands to nvnProgramSetShaders into
-// Download/DSRNative/dsr_shaders_<time>.bin, for building and testing the shader translator offline.
+// Download/DSRNative/logs/dsr_shaders_<time>.bin, for building and testing the shader translator offline.
 //
 // File format (little endian): per shader
 //   char magic[4] = "DSHD"; u32 version = 1; u32 index; u32 code_size; u32 control_size; u32 reserved;

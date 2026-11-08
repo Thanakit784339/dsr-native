@@ -51,7 +51,7 @@ void DumpShader(uint64_t code_address, const void* code, size_t code_size, const
         strftime(name, sizeof(name), "dsr_shaders_%Y%m%d_%H%M%S.bin", &t);
         g_fd = dsr::platform::CreateUserFile(name, "application/octet-stream");
         if (g_fd >= 0)
-            LOGI(kTag, "dumping shaders to Download/DSRNative/%s", name);
+            LOGI(kTag, "dumping shaders to Download/DSRNative/logs/%s", name);
         else
             LOGW(kTag, "could not create the shader dump file");
     }
