@@ -14,7 +14,9 @@ Runs the game's original ARM64 code (`exefs/main`) directly on an ARM64 Android 
 
 Very early development. Expect many visual bugs and minor performance issues. No touch controls for now.
 
-The only test device so far has been an AYN Thor Base model, so I cannot guarantee that this will work on any other device. I also haven't tested the v1.0.3 update for the game yet.
+The only test device so far has been an AYN Thor Base model, so I cannot guarantee that this will work on any other device. Should hopefully work however with Snapdragon + Adreno chips.
+
+I also haven't tested the v1.0.3 update for the game yet.
 
 
 
@@ -33,7 +35,7 @@ I have yet to test later areas in the game so don't expect performance to be ent
 
 ## Working features
 
-- [x] Fully working cutscenes and in-game rendering
+- [x] Working cutscenes and in-game rendering
 - [x] Full controller support
 - [x] Working lighting
 - [x] Fully working audio, including NPC voice lines and sound effects
@@ -76,10 +78,10 @@ file is complete even after a crash. The same output also goes to logcat (`adb l
 > You must extract the games **romfs** and **exefs** files to play the game. You can use Ryujinx (Ryubing) on Windows to obtain this from your own game dump.
 
 
-Install the APK and launch it once to create the necessary folders, then place the game files inside:
+Install the APK, launch it and give it permission to access files to create the necessary folders, then place the game files inside:
 
 ```
-/Android/data/com.dsrnative.app/files/game/
+/Downloads/DSRNative/files/game/
 ```
 
 If the **game** folder does not exist, you must create it.
@@ -93,6 +95,7 @@ Inside the **game** folder must be the extracted **romfs** files, along with the
 - [ ] Resting at a bonfire screen effect can be glitched
 - [ ] Heavy effects, such as during boss fights, can cause big empty squares on screen
 - [ ] Sometimes NPC's faces can appear buggy
+- [ ] Cutscenes can sometimes still appear glitched
 
 
 
