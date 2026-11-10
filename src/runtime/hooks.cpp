@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 #include <string>
 #include <mutex>
 #include <map>
@@ -108,32 +109,47 @@ void PadSetAxis(uint8_t* self, int axis, float value) {
     *slot = value;
 }
 
-// main+0x81a5dc: the pad device's GetAxis(this, axis), virtual. Diagnostics for the touch camera: which code
-// reads the right stick (axes 3, 4), logged every 10 s with the call counts, to find where the camera turns.
+// main+0x81a5dc: the pad device's GetAxis(this, axis), virtual. Diagnostics for the touch camera: the call
+// chains (frame-pointer walk, 8 levels) that read the right stick (axes 3, 4), logged every 10 s with counts,
+// to find where the camera turns.
 std::mutex g_axis_mutex;
-std::map<std::pair<uintptr_t, int>, uint64_t> g_axis_callers;
+std::map<std::vector<uintptr_t>, uint64_t> g_axis_chains;
 std::chrono::steady_clock::time_point g_axis_report;
 float PadGetAxis(uint8_t* self, int axis) {
     const unsigned i = unsigned(axis - 3);
     if (i > 5) return 0.0f;
     const float v = reinterpret_cast<const float*>(self + 0x468)[i];
-    if (i <= 1) {
-        const uintptr_t ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+    if (i == 0) {
         const loader::Module& m = GetRuntime().main;
+        std::vector<uintptr_t> chain;
+        chain.push_back(reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+        // Our frame record: [0] = the guest caller's frame pointer, then each record {fp, lr}.
+        const uintptr_t* fp = static_cast<const uintptr_t*>(__builtin_frame_address(0));
+        if (fp) fp = reinterpret_cast<const uintptr_t*>(fp[0]);
+        for (int d = 0; d < 8 && fp && (reinterpret_cast<uintptr_t>(fp) & 7) == 0; d++) {
+            const uintptr_t lr = fp[1];
+            if (!m.Contains(lr)) break;
+            chain.push_back(lr);
+            const uintptr_t* next = reinterpret_cast<const uintptr_t*>(fp[0]);
+            if (next <= fp) break;
+            fp = next;
+        }
+        for (uintptr_t& a : chain) a = m.Contains(a) ? a - m.base() : 0;
         std::lock_guard<std::mutex> lk(g_axis_mutex);
-        g_axis_callers[{m.Contains(ra) ? ra - m.base() : ra, axis}]++;
+        g_axis_chains[chain]++;
         const auto now = std::chrono::steady_clock::now();
         if (now - g_axis_report > std::chrono::seconds(10)) {
             g_axis_report = now;
-            std::string line;
-            for (const auto& [k, n] : g_axis_callers) {
-                char buf[64];
-                snprintf(buf, sizeof(buf), " main+0x%lx(axis %d)x%llu", (unsigned long)k.first, k.second,
-                         (unsigned long long)n);
-                line += buf;
+            for (const auto& [c, n] : g_axis_chains) {
+                std::string line;
+                for (uintptr_t a : c) {
+                    char buf[24];
+                    snprintf(buf, sizeof(buf), " %lx", (unsigned long)a);
+                    line += buf;
+                }
+                LOGI("hooks", "right stick x read %llu times by:%s", (unsigned long long)n, line.c_str());
             }
-            LOGI("hooks", "right stick read by:%s", line.c_str());
-            g_axis_callers.clear();
+            g_axis_chains.clear();
         }
     }
     return v;
