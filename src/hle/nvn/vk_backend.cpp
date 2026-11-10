@@ -136,7 +136,9 @@ std::vector<VkFormat> ImageCandidates(int f) {
         case 51: return {VK_FORMAT_X8_D24_UNORM_PACK32, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT};
         case 52: return {VK_FORMAT_D32_SFLOAT};
         case 53: return {VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT};
-        case 54: return {VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT};
+        case 54:  // `hole_test` 64: D24S8 first (square-hole diagnostic)
+            if (dsr::GetRuntime().config.hole_test & 64) return {VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT};
+            return {VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT};
         case 55:
         case 56: return {VK_FORMAT_R8G8B8A8_SRGB};
         case 57: return {VK_FORMAT_R4G4B4A4_UNORM_PACK16};
@@ -347,6 +349,7 @@ struct Image {
     bool attach_unsynced = false;
     // Depth written by a fragment shader (gl_FragDepth) since the image was last attached: see LrzTouch.
     bool depth_exported = false;
+    uint64_t attach_gen = 0;  // times attached to a render pass (`hole_test` 16 copies)
     VkClearValue clear_value{};
     VkImageAspectFlags clear_aspect = 0;
     int clear_layer = 0, clear_level = 0;
@@ -3013,6 +3016,7 @@ private:
                 }
                 a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
                 c->attach_unsynced = true;
+                c->attach_gen++;
                 NoteWritten(c);
                 c->written = true;
                 c->cpu_source = false;
@@ -3035,6 +3039,7 @@ private:
             da.loadOp = depth->written ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
             da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             depth->attach_unsynced = true;
+            depth->attach_gen++;
             da.clearValue.depthStencil = {1.0f, 0};
             if (clear_on_load) {
                 da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -3213,6 +3218,32 @@ private:
         Transition(depth, back == VK_IMAGE_LAYOUT_UNDEFINED ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : back);
         lrz_touches_++;
     }
+
+    Image* SampledCopy(Image& src, const TexRef& ref) {
+        TexRef copy_ref = ref;
+        copy_ref.addr = ref.addr ^ (3ull << 61);
+        auto it = images_.find(copy_ref.addr);
+        Image* copy = nullptr;
+        if (it != images_.end() && it->second.width == src.width && it->second.height == src.height &&
+            it->second.vk_format == src.vk_format)
+            copy = &it->second;
+        else
+            copy = CreateImage(copy_ref);
+        if (!copy) return nullptr;
+        uint64_t& gen = sampled_copy_gen_[copy_ref.addr];
+        if (gen != src.attach_gen + 1) {
+            EndRendering();
+            CopyImage(src, CopyRegion{}, *copy, CopyRegion{}, 0);
+            copy->written = true;
+            gen = src.attach_gen + 1;
+        }
+        if (copy->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+            EndRendering();
+            Transition(*copy, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
+        return copy;
+    }
+    std::unordered_map<uint64_t, uint64_t> sampled_copy_gen_;
 
     Image* DepthSnapshot(Image& depth, const TexRef& ref) {
         TexRef snap_ref = ref;
@@ -3443,6 +3474,12 @@ private:
                 }
                 for (Image* c : colors)
                     if (c == img) return Skip("texture is also a render target");
+                if (img != depth && IsDepthFormat(img->nvn_format) && (dsr::GetRuntime().config.hole_test & 16)) {
+                    // `hole_test` 16 (square holes): depth textures are read from a copy made after their last
+                    // render pass, instead of directly.
+                    Image* copy = SampledCopy(*img, bt.texture);
+                    if (copy) img = copy;
+                }
                 if (depth == img) {
                     // Sampling the bound depth buffer (soft particles, fog): read a snapshot copy instead.
                     img = DepthSnapshot(*depth, st_.rts[size_t(st_.num_rt)]);
