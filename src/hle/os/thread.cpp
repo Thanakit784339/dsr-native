@@ -14,6 +14,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "common/platform.h"
 #include "arch/arch.h"
 #include "common/log.h"
 #include "common/profiler.h"
@@ -318,6 +319,9 @@ void RecordSleep(uintptr_t ret, uintptr_t frame, int64_t ns) {
 HLE_FUNC(_ZN2nn2os11SleepThreadENS_8TimeSpanE, void, nn_os_SleepThread, (int64_t ns)) {
     dsr::hle::os::RecordSleep(reinterpret_cast<uintptr_t>(__builtin_return_address(0)),
                 *static_cast<const uintptr_t*>(__builtin_frame_address(0)), ns);  // saved x29: the caller's frame
+    // In the background the game's polling threads (network, streaming) are held at their next sleep, after a
+    // grace period so a save being written finishes first.
+    dsr::platform::WaitWhilePaused(3000);
     if (ns <= 0) {
         sched_yield();
         return;

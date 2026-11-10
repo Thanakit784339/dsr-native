@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <thread>
 
+#include "common/platform.h"
 #include "common/log.h"
 #include "hle/nvn.h"
 #include "hle/nvn/backend.h"
@@ -478,11 +479,17 @@ void QueuePresentTexture(void* queue, void* window, int index) {
     static std::atomic<uint64_t> frames{0};
     static clock::time_point report = clock::now();
     static GpuStats last{};
+    // In the background the game's render thread waits here, which holds the whole frame loop.
+    const bool was_paused = dsr::platform::WaitWhilePaused() > 0;
     const int fps = dsr::FrameRateNow();  // 30 while a movie plays
     const auto frame = std::chrono::microseconds(1000000 / fps);
     auto now = clock::now();
     // Frame times (present to present): average, worst, and how many took over twice the target (hitches).
     static clock::time_point last_present = now;
+    if (was_paused) {  // the pause is not a slow frame
+        last_present = now;
+        next = now;
+    }
     static double ft_sum = 0, ft_max = 0;
     static uint64_t ft_n = 0, ft_hitches = 0;
     static double step_sum = 0;

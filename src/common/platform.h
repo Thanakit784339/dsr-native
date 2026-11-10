@@ -25,4 +25,12 @@ bool TakeText(bool* ok, std::u16string* text);
 // threads that sleep between bursts of work every frame). Once per thread; logs `who`. No-op elsewhere.
 void PreferFastCores(const char* who);
 
+// The app is in the background (Android: between onPause and onResume): the game is held still. Presents,
+// the audio output and the game's sleeping threads wait in WaitWhilePaused until it comes back.
+void SetPaused(bool paused);
+bool IsPaused();
+// Blocks while paused; returns the milliseconds waited (0 if not paused). `grace_ms`: only block once the
+// pause has lasted that long (threads mid-way through something short, like writing the save, finish it).
+double WaitWhilePaused(int grace_ms = 0);
+
 }  // namespace dsr::platform

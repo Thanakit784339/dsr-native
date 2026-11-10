@@ -901,8 +901,15 @@ void OnCmd(android_app* app, int32_t cmd) {
             StartGame(app);
             break;
         case APP_CMD_RESUME:
+            dsr::platform::SetPaused(false);
+            if (app->window) StartGame(app);  // back from the storage access screen
+            break;
         case APP_CMD_GAINED_FOCUS:
             if (app->window) StartGame(app);  // back from the storage access screen
+            break;
+        case APP_CMD_PAUSE:
+            // Home, app switcher, screen off: the game is held (no frames, sound or busy threads) until RESUME.
+            if (g_game_started) dsr::platform::SetPaused(true);
             break;
         case APP_CMD_TERM_WINDOW:
             LOGI(kTag, "window lost");

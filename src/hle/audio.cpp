@@ -14,6 +14,7 @@
 #include <thread>
 
 #include "common/log.h"
+#include "common/platform.h"
 #include "hle/os/os.h"
 #include "hle/registry.h"
 #include "runtime/runtime.h"
@@ -138,6 +139,17 @@ private:
                 cv_.wait(lk, [&] { return !running_ || !queued_.empty(); });
                 if (!running_) return;
                 b = queued_.front();
+            }
+            if (dsr::platform::IsPaused()) {
+                // In the background: the stream is paused (silence, no audio focus held) and nothing more is
+                // played or released, so the game's audio thread waits too.
+#if defined(__ANDROID__)
+                if (stream_) AAudioStream_requestPause(stream_);
+#endif
+                dsr::platform::WaitWhilePaused();
+#if defined(__ANDROID__)
+                if (stream_) AAudioStream_requestStart(stream_);
+#endif
             }
             const size_t frames = b->data_size / (sizeof(int16_t) * size_t(channels_));
             const int16_t* pcm = ToStereo(static_cast<const int16_t*>(b->data), frames);

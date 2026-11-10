@@ -1,6 +1,8 @@
 #include "common/platform.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 
@@ -166,6 +168,7 @@ void WatchAffinity() {
     auto summary_at = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        WaitWhilePaused();  // in the background the system moves threads as it likes: nothing to restore
         std::lock_guard<std::mutex> lk(g_watch_mutex);
         pid_t refused_tid = 0;
         for (size_t i = 0; i < g_watched.size();) {
@@ -223,6 +226,33 @@ void PreferFastCores(const char* who) {
 #else
     (void)who;
 #endif
+}
+namespace {
+std::mutex g_pause_mutex;
+std::condition_variable g_pause_cv;
+std::atomic<bool> g_paused{false};
+std::chrono::steady_clock::time_point g_paused_at;
+}  // namespace
+void SetPaused(bool paused) {
+    {
+        std::lock_guard<std::mutex> lk(g_pause_mutex);
+        if (g_paused.load() == paused) return;
+        g_paused.store(paused);
+        if (paused) g_paused_at = std::chrono::steady_clock::now();
+    }
+    g_pause_cv.notify_all();
+    LOGI("platform", "%s", paused ? "paused: the game is held until the app is back in the foreground"
+                                  : "resumed");
+}
+bool IsPaused() { return g_paused.load(std::memory_order_relaxed); }
+double WaitWhilePaused(int grace_ms) {
+    if (!g_paused.load(std::memory_order_acquire)) return 0;
+    const auto start = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lk(g_pause_mutex);
+    if (!g_paused) return 0;
+    if (grace_ms > 0 && start - g_paused_at < std::chrono::milliseconds(grace_ms)) return 0;
+    g_pause_cv.wait(lk, [] { return !g_paused.load(); });
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 void SetCreateUserFile(CreateUserFileFn fn) { g_create.store(fn); }
 int CreateUserFile(const char* name, const char* mime_type) {
