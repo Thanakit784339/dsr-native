@@ -3908,7 +3908,7 @@ private:
                 const uint64_t fs_hash = st_.program[1] ? st_.program[1]->hash : 0;
                 const bool effect = fs_hash == 0x6f634579337b2b69ull || fs_hash == 0x3fc1b1baa8114318ull;
                 const int isz = p.index_type == 0 ? 1 : p.index_type == 1 ? 2 : p.index_type == 2 ? 4 : 0;
-                if (effect && geo_dumps_ < 4 && isz && p.count > 0 && p.count <= 16384 && p.index_address &&
+                if (effect && extent.width <= 640 && geo_dumps_ < 40 && isz && p.count > 0 && p.count <= 16384 && p.index_address &&
                     GuestRangeValid(p.index_address, size_t(p.count) * isz) && !vin.bindings.empty()) {
                     geo_dumps_++;
                     const VkVertexInputBindingDescription& vb0 = vin.bindings[0];
@@ -3967,6 +3967,8 @@ private:
         for (const VkVertexInputBindingDescription& b : vin.bindings)
             vb[d.n_vb++] = {b.binding, vb_bufs[b.binding], vb_offsets[b.binding]};
         QueueDraw(d, vb, tex_writes, ubo_writes);
+        // `hole_test` 8 (square holes): every draw into a reduced-size target gets a render pass of its own.
+        if ((dsr::GetRuntime().config.hole_test & 8) && extent.width <= 640) EndRendering();
         if (capture_active_) {
             char d[320];
             snprintf(d, sizeof(d),
