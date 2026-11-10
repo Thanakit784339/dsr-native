@@ -26,6 +26,7 @@
 #include <memory>
 #include <chrono>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -391,9 +392,15 @@ struct Decoder {
 #if defined(__ANDROID__)
     AMediaCodec* codec = nullptr;
 #endif
+    // Output buffers are read (converted) on the game's render thread while its movie thread may stop, flush
+    // or delete the codec, which unmaps them (a crash at the end of the title movie on a slower phone, where
+    // a conversion takes long enough to overlap). Readers hold this shared; stop / flush / delete exclusive.
+    std::shared_mutex codec_use;
+    bool stopped = false;  // under codec_use: output buffers are gone until the next start
     ~Decoder() {
         if (counted_playing) dsr::SetMoviePlaying(false);
 #if defined(__ANDROID__)
+        std::unique_lock<std::shared_mutex> use(codec_use);
         if (codec) {
             AMediaCodec_stop(codec);
             AMediaCodec_delete(codec);
@@ -584,7 +591,10 @@ int DecStart(void* self) {
 #if defined(__ANDROID__)
     Decoder* d = Dec(self);
     if (!d->codec) return kFail;
+    std::unique_lock<std::shared_mutex> use(d->codec_use);
     const bool ok = AMediaCodec_start(d->codec) == AMEDIA_OK;
+    d->stopped = false;
+    use.unlock();
     if (ok && d->type == 1 && !d->counted_playing) {
         d->counted_playing = true;
         dsr::SetMoviePlaying(true);
@@ -597,7 +607,11 @@ int DecStart(void* self) {
 int DecStop(void* self) {
 #if defined(__ANDROID__)
     Decoder* d = Dec(self);
-    if (d->codec) AMediaCodec_stop(d->codec);
+    {
+        std::unique_lock<std::shared_mutex> use(d->codec_use);
+        if (d->codec) AMediaCodec_stop(d->codec);
+        d->stopped = true;
+    }
     if (d->counted_playing) {
         d->counted_playing = false;
         dsr::SetMoviePlaying(false);
@@ -612,6 +626,7 @@ int DecStop(void* self) {
 int DecFlush(void* self) {
 #if defined(__ANDROID__)
     Decoder* d = Dec(self);
+    std::unique_lock<std::shared_mutex> use(d->codec_use);
     if (d->codec) AMediaCodec_flush(d->codec);
     {
         std::lock_guard<std::mutex> lk(d->m);
@@ -719,6 +734,8 @@ int DecGetOutputBuffer(void* self, int index, void* buffer) {
     Decoder* d = Dec(self);
     size_t cap = 0;
     if (index < 0) return kFail;
+    std::shared_lock<std::shared_mutex> use(d->codec_use);  // the buffer stays mapped while it is read
+    if (d->stopped) return kFail;
     uint8_t* p = d->codec ? AMediaCodec_getOutputBuffer(d->codec, size_t(index), &cap) : nullptr;
     if (!p) return kFail;
     OutputItem o{};
@@ -829,7 +846,8 @@ int DecReleaseOutputBufferIndex(void* self, int index) {
         d->held.erase(index);
         d->released++;
     }
-    if (d->codec && index >= 0) AMediaCodec_releaseOutputBuffer(d->codec, size_t(index), false);
+    std::shared_lock<std::shared_mutex> use(d->codec_use);
+    if (d->codec && index >= 0 && !d->stopped) AMediaCodec_releaseOutputBuffer(d->codec, size_t(index), false);
 #endif
     return kOk;
 }
