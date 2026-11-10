@@ -14,8 +14,11 @@
 #if defined(__ANDROID__)
 
 #define VK_USE_PLATFORM_ANDROID_KHR
+#define VK_NO_PROTOTYPES
 #include <android/native_window.h>
 #include <vulkan/vulkan.h>
+#include <adrenotools/bcenabler.h>
+#include <adrenotools/driver.h>
 
 #include <algorithm>
 #include <atomic>
@@ -51,8 +54,59 @@
 #include "hle/video.h"
 
 namespace dsr::hle::nvn {
+#include "hle/nvn/vk_dispatch.h"
 namespace {
 constexpr const char* kTag = "vulkan";
+
+// Opens the Vulkan driver: a custom one (settings.txt `gpu_driver`, prepared by the Android front end into the
+// app's private folder) through libadrenotools, or the system's libvulkan. Loads the global entry points.
+bool LoadVulkanLibrary() {
+    static int state = 0;  // 0 = not tried, 1 = loaded, 2 = failed
+    if (state) return state == 1;
+    state = 2;
+    const RuntimeConfig& cfg = GetRuntime().config;
+    void* lib = nullptr;
+    if (!cfg.gpu_driver_lib.empty()) {
+        lib = adrenotools_open_libvulkan(RTLD_NOW | RTLD_LOCAL, ADRENOTOOLS_DRIVER_CUSTOM, nullptr,
+                                         (cfg.native_lib_dir + "/").c_str(), cfg.gpu_driver_dir.c_str(),
+                                         cfg.gpu_driver_lib.c_str(), nullptr, nullptr);
+        if (lib)
+            LOGI(kTag, "custom GPU driver: %s (%s) loaded through libadrenotools", cfg.gpu_driver.c_str(),
+                 cfg.gpu_driver_lib.c_str());
+        else
+            LOGW(kTag, "custom GPU driver %s (%s) could not be loaded: using the system driver", cfg.gpu_driver.c_str(),
+                 cfg.gpu_driver_lib.c_str());
+    }
+    if (!lib) lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) {
+        LOGE(kTag, "libvulkan.so could not be opened: %s", dlerror());
+        return false;
+    }
+    vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(lib, "vkGetInstanceProcAddr"));
+    if (!vkGetInstanceProcAddr) {
+        LOGE(kTag, "the Vulkan driver has no vkGetInstanceProcAddr");
+        return false;
+    }
+#define DSR_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(vkGetInstanceProcAddr(VK_NULL_HANDLE, #name));
+    DSR_VK_GLOBAL_FUNCS(DSR_VK_LOAD)
+#undef DSR_VK_LOAD
+    state = vkCreateInstance ? 1 : 2;
+    return state == 1;
+}
+void LoadInstanceFunctions(VkInstance instance) {
+#define DSR_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(vkGetInstanceProcAddr(instance, #name));
+    DSR_VK_INSTANCE_FUNCS(DSR_VK_LOAD)
+    DSR_VK_DEVICE_FUNCS(DSR_VK_LOAD)
+#undef DSR_VK_LOAD
+}
+// Device functions straight from the driver (no loader trampoline); ones it does not return keep the
+// instance-level pointer.
+void LoadDeviceFunctions(VkDevice device) {
+#define DSR_VK_LOAD(name) \
+    if (auto f = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name))) name = f;
+    DSR_VK_DEVICE_FUNCS(DSR_VK_LOAD)
+#undef DSR_VK_LOAD
+}
 constexpr VkDeviceSize kStreamSize = 48ull << 20;  // per slot (four slots)
 constexpr VkDeviceSize kMaxUniformRange = 65536;
 constexpr uint32_t kCbufBase = 3;      // NVN uniform-buffer binding b is read by shaders as c[b + 3]
@@ -1243,6 +1297,10 @@ private:
         if (device_) return true;
         if (init_failed_) return false;
         init_failed_ = true;  // cleared on success
+        if (!LoadVulkanLibrary()) {
+            LOGE(kTag, "no Vulkan driver — continuing without graphics");
+            return false;
+        }
         uint32_t inst_version = VK_API_VERSION_1_1;
         auto enum_version = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
             vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceVersion"));
@@ -1260,6 +1318,7 @@ private:
             LOGE(kTag, "vkCreateInstance failed: %d — continuing without graphics", r);
             return false;
         }
+        LoadInstanceFunctions(instance_);
         uint32_t n = 0;
         vkEnumeratePhysicalDevices(instance_, &n, nullptr);
         if (!n) {
@@ -1270,8 +1329,20 @@ private:
         vkEnumeratePhysicalDevices(instance_, &n, pds.data());
         phys_ = pds[0];
         vkGetPhysicalDeviceProperties(phys_, &props_);
-        LOGI(kTag, "GPU: %s, Vulkan %u.%u.%u, driver 0x%x", props_.deviceName, VK_VERSION_MAJOR(props_.apiVersion),
-             VK_VERSION_MINOR(props_.apiVersion), VK_VERSION_PATCH(props_.apiVersion), props_.driverVersion);
+        LOGI(kTag, "GPU: %s, Vulkan %u.%u.%u, driver 0x%x (%u.%u)", props_.deviceName, VK_VERSION_MAJOR(props_.apiVersion),
+             VK_VERSION_MINOR(props_.apiVersion), VK_VERSION_PATCH(props_.apiVersion), props_.driverVersion,
+             VK_VERSION_MAJOR(props_.driverVersion), VK_VERSION_MINOR(props_.driverVersion));
+        // Qualcomm's Adreno 6xx drivers (512.x before 512.514) do not expose the BC texture formats the GPU
+        // supports; BCeNabler (libadrenotools) patches the driver in memory to expose them, which saves the
+        // software decoding (and BC6H/BC7 then look right).
+        if (GetRuntime().config.bc_enabler) {
+            const adrenotools_bcn_type bcn = adrenotools_get_bcn_type(
+                VK_VERSION_MAJOR(props_.driverVersion), VK_VERSION_MINOR(props_.driverVersion), props_.vendorID);
+            if (bcn == ADRENOTOOLS_BCN_PATCH) {
+                const bool ok = adrenotools_patch_bcn(reinterpret_cast<void*>(vkGetPhysicalDeviceFormatProperties));
+                LOGI(kTag, "BC textures: driver patched by BCeNabler: %s", ok ? "ok" : "FAILED");
+            }
+        }
         vkGetPhysicalDeviceMemoryProperties(phys_, &mem_props_);
 
         uint32_t qn = 0;
@@ -1350,6 +1421,7 @@ private:
             device_ = VK_NULL_HANDLE;
             return false;
         }
+        LoadDeviceFunctions(device_);
         if (en13.dynamicRendering) {
             begin_rendering_ = reinterpret_cast<PFN_vkCmdBeginRendering>(vkGetDeviceProcAddr(device_, "vkCmdBeginRendering"));
             end_rendering_ = reinterpret_cast<PFN_vkCmdEndRendering>(vkGetDeviceProcAddr(device_, "vkCmdEndRendering"));

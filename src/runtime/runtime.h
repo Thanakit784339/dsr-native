@@ -32,6 +32,13 @@ struct RuntimeConfig {
     // Older Adreno GPUs: storage usage and mutable format only where needed, so images keep their bandwidth
     // compression. Off by default: purple streaks on the OnePlus 6T (Adreno 630) for ~5% less GPU time.
     bool gpu_compression = false;
+    // GPU driver: settings.txt `gpu_driver` (a file in DSRNative/drivers, or "system"). The Android front end
+    // copies (or unzips) it into the app's private folder: gpu_driver_dir (ends in '/') holds gpu_driver_lib.
+    // Empty gpu_driver_lib: the system driver.
+    std::string gpu_driver = "system";
+    std::string gpu_driver_dir, gpu_driver_lib;
+    std::string native_lib_dir;  // the app's native library folder (libadrenotools loads its hooks from there)
+    bool bc_enabler = true;      // Adreno 6xx system drivers: patch in the BC texture formats (BCeNabler)
     bool fast_cores = true;  // keep the game's frame-critical threads off the efficiency cores
     bool record_thread = true;  // record Vulkan commands on a second thread (draw preparation stays on the render thread)
     bool pin_render_thread = false;  // keep the render thread on the fastest CPU core(s) (slower on 8 Gen 2: off)

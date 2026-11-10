@@ -54,11 +54,16 @@ if(DSR_ARM64 AND NOT ANDROID)
 endif()
 
 if(ANDROID)
+    # libadrenotools (BSD-2-Clause): loads custom Vulkan drivers (settings.txt gpu_driver) and BCeNabler. Its hook
+    # libraries (libhook_impl.so, libmain_hook.so, ...) are packaged in the APK and loaded from the app's native
+    # library folder (hence useLegacyPackaging in android/app/build.gradle).
+    add_subdirectory(third_party/libadrenotools)
+    target_include_directories(dsrcore PRIVATE third_party/libadrenotools/include)
     add_library(dsr SHARED
         src/platform/android/android_main.cpp
         ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c)
     target_include_directories(dsr PRIVATE ${ANDROID_NDK}/sources/android/native_app_glue)
-    target_link_libraries(dsr PRIVATE dsrcore android log aaudio mediandk vulkan)
+    target_link_libraries(dsr PRIVATE dsrcore adrenotools android log aaudio mediandk z)
     # Keep ANativeActivity_onCreate exported from the glue.
     target_link_options(dsr PRIVATE -u ANativeActivity_onCreate -Wl,-z,max-page-size=16384)
 else()

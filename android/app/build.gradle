@@ -51,6 +51,14 @@ android {
         }
     }
 
+    // Native libraries extracted to the app's native library folder: libadrenotools loads its hook libraries
+    // from there by path (custom GPU drivers).
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
+
     externalNativeBuild {
         cmake {
             path file('../../CMakeLists.txt')

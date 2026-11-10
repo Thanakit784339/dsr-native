@@ -5,18 +5,21 @@
 //   game/          the extracted game (the folder containing exefs/, dvdbnd0.bdt, ...)
 //   save/ cache/   save data, GPU pipeline cache
 //   settings.txt
+//   drivers/       custom Vulkan drivers (.zip as for AdrenoTools, or a bare .so), chosen with gpu_driver
 //   logs/          dsr_<date>_<time>.txt run logs, frame captures, shader dumps (also logcat: adb logcat -s 'DSR/*')
 #include <android/input.h>
 #include <android/log.h>
 #include <android_native_app_glue.h>
 #include <spawn.h>
 #include <dirent.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <jni.h>
+#include <zlib.h>
 
 #include <algorithm>
 #include <atomic>
@@ -304,6 +307,14 @@ void LogDeviceInfo() {
 
 bool g_face_by_position = false;  // `face_buttons` setting (see KeyToButton)
 
+#define GPU_DRIVER_HELP                                                                                      \
+    "# gpu_driver: system = the phone's own Vulkan driver; or the name of a file in the drivers folder next\n" \
+    "# to this file: a driver .zip as made for AdrenoTools (e.g. Mesa Turnip) or a bare .so\n"                 \
+    "# (e.g. gpu_driver = turnip.zip). If it cannot be loaded, the system driver is used.\n"
+#define BC_ENABLER_HELP                                                                                      \
+    "# bc_enabler: 1 = on Adreno 6xx system drivers, patch in the compressed (BC) texture formats the GPU\n"   \
+    "# supports but the driver hides (faster, and some textures look right); 0 = decode them on the CPU\n"
+
 #define FACE_BUTTONS_HELP                                                                                    \
     "# face_buttons: label = each button does what its label says on Switch (A is A); position = by\n"      \
     "# position, as on a Switch pad (for Xbox-style controllers whose A sits where the Switch's B is)\n"
@@ -347,7 +358,11 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "# lrz_workaround: 1 = refresh depth buffers written by shaders before reuse (experiment, off)\n"
                     "lrz_workaround = 0\n"
                     "# shader_depth_test: 1 = fix for see-through squares in smoke, fog and glow (0 = off, for testing)\n"
-                    "shader_depth_test = 1\n",
+                    "shader_depth_test = 1\n"
+                    GPU_DRIVER_HELP
+                    "gpu_driver = system\n"
+                    BC_ENABLER_HELP
+                    "bc_enabler = 1\n",
                     cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0,
                     cfg->gamma, cfg->exposure);
             fclose(w);
@@ -356,7 +371,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             LOGW(kTag, "settings: cannot create %s (%s): using defaults", path.c_str(), strerror(errno));
         }
     } else {
-        bool have_present_mode = false, have_face_buttons = false;
+        bool have_present_mode = false, have_face_buttons = false, have_gpu_driver = false, have_bc_enabler = false;
         char line[256];
         while (fgets(line, sizeof(line), f)) {
             char key[64], value[64];
@@ -374,6 +389,18 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "lrz_workaround")) cfg->lrz_workaround = v != 0;
             else if (!strcmp(key, "shader_depth_test")) cfg->shader_depth_test = v != 0;
             else if (!strcmp(key, "hole_test")) cfg->hole_test = v;
+            else if (!strcmp(key, "bc_enabler")) {
+                cfg->bc_enabler = v != 0;
+                have_bc_enabler = true;
+            } else if (!strcmp(key, "gpu_driver")) {
+                // The whole rest of the line (file names may contain spaces).
+                std::string val = strchr(line, '=') + 1;
+                while (!val.empty() && (val.back() == '\n' || val.back() == '\r' || val.back() == ' ' || val.back() == '\t'))
+                    val.pop_back();
+                size_t b = val.find_first_not_of(" \t");
+                cfg->gpu_driver = b == std::string::npos ? "system" : val.substr(b);
+                have_gpu_driver = true;
+            }
             else if (!strcmp(key, "face_buttons")) {
                 g_face_by_position = !strcmp(value, "position");
                 have_face_buttons = true;
@@ -403,12 +430,25 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                 fclose(w);
                 LOGI(kTag, "settings: added face_buttons to %s", path.c_str());
             }
+        if (!have_gpu_driver)
+            if (FILE* w = fopen(path.c_str(), "a")) {
+                fputs("\n" GPU_DRIVER_HELP "gpu_driver = system\n", w);
+                fclose(w);
+                LOGI(kTag, "settings: added gpu_driver to %s", path.c_str());
+            }
+        if (!have_bc_enabler)
+            if (FILE* w = fopen(path.c_str(), "a")) {
+                fputs("\n" BC_ENABLER_HELP "bc_enabler = 1\n", w);
+                fclose(w);
+                LOGI(kTag, "settings: added bc_enabler to %s", path.c_str());
+            }
     }
     LOGI(kTag, "settings (%s): fps %d, async pipelines %s, auto capture %s, profile %s, gamma %.2f, exposure %.2f, "
          "present mode %s, face buttons by %s",
          path.c_str(), cfg->target_fps, cfg->async_pipelines ? "on" : "off", cfg->auto_capture ? "on" : "off",
          cfg->profile ? "on" : "off", cfg->gamma, cfg->exposure, cfg->present_mode.c_str(),
          g_face_by_position ? "position" : "label");
+    LOGI(kTag, "settings: gpu_driver %s, bc_enabler %d", cfg->gpu_driver.c_str(), int(cfg->bc_enabler));
     if (!cfg->shader_depth_test) LOGI(kTag, "settings: shader_depth_test off");
     if (cfg->hole_test || cfg->lrz_workaround)
         LOGI(kTag, "settings: hole_test %d, lrz_workaround %d", cfg->hole_test, int(cfg->lrz_workaround));
@@ -500,6 +540,184 @@ bool CanWriteIn(const std::string& dir) {
     return true;
 }
 
+// The app's native library folder (getApplicationInfo().nativeLibraryDir): libadrenotools loads its hook
+// libraries from there.
+std::string NativeLibraryDir(android_app* app) {
+    JavaVM* vm = app->activity->vm;
+    JNIEnv* env = nullptr;
+    bool attached_here = false;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK || !env) {
+        if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) return "";
+        attached_here = true;
+    }
+    std::string dir;
+    jobject act = app->activity->clazz;
+    jclass cls = env->GetObjectClass(act);
+    jmethodID get_info = env->GetMethodID(cls, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
+    jobject info = get_info ? env->CallObjectMethod(act, get_info) : nullptr;
+    if (info && !env->ExceptionCheck()) {
+        jclass icls = env->GetObjectClass(info);
+        jfieldID fid = env->GetFieldID(icls, "nativeLibraryDir", "Ljava/lang/String;");
+        auto js = fid ? static_cast<jstring>(env->GetObjectField(info, fid)) : nullptr;
+        if (js) {
+            const char* c = env->GetStringUTFChars(js, nullptr);
+            if (c) dir = c;
+            env->ReleaseStringUTFChars(js, c);
+        }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (attached_here) vm->DetachCurrentThread();
+    return dir;
+}
+
+// Minimal zip reader (stored and deflated entries): extracts the files of `zip` whose names end in one of
+// `suffixes` into `dir` (flattened: the base name only). Returns the names extracted.
+std::vector<std::string> Unzip(const std::string& zip, const std::string& dir, const std::vector<std::string>& suffixes,
+                               std::string* err) {
+    std::vector<std::string> out;
+    FILE* f = fopen(zip.c_str(), "rb");
+    if (!f) {
+        *err = strerror(errno);
+        return out;
+    }
+    std::vector<uint8_t> data;
+    {
+        fseek(f, 0, SEEK_END);
+        const long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (n > 0 && n < (512l << 20)) {
+            data.resize(size_t(n));
+            if (fread(data.data(), 1, data.size(), f) != data.size()) data.clear();
+        }
+        fclose(f);
+    }
+    auto u16 = [&](size_t o) { return uint32_t(data[o] | data[o + 1] << 8); };
+    auto u32 = [&](size_t o) { return uint32_t(data[o] | data[o + 1] << 8 | data[o + 2] << 16 | uint32_t(data[o + 3]) << 24); };
+    size_t eocd = std::string::npos;
+    for (size_t i = data.size() >= 22 ? data.size() - 22 : 0; data.size() >= 22; i--) {
+        if (u32(i) == 0x06054b50) {
+            eocd = i;
+            break;
+        }
+        if (i == 0 || data.size() - i > 66000) break;
+    }
+    if (eocd == std::string::npos) {
+        *err = "not a zip file";
+        return out;
+    }
+    const uint32_t count = u16(eocd + 10);
+    size_t cd = u32(eocd + 16);
+    for (uint32_t e = 0; e < count && cd + 46 <= data.size() && u32(cd) == 0x02014b50; e++) {
+        const uint32_t method = u16(cd + 10), csize = u32(cd + 20), usize = u32(cd + 24);
+        const uint32_t nlen = u16(cd + 28), xlen = u16(cd + 30), clen = u16(cd + 32), lho = u32(cd + 42);
+        std::string name(reinterpret_cast<const char*>(&data[cd + 46]), nlen);
+        cd += 46 + nlen + xlen + clen;
+        if (name.empty() || name.back() == '/') continue;
+        bool wanted = false;
+        for (const std::string& suf : suffixes)
+            if (name.size() >= suf.size() && name.compare(name.size() - suf.size(), suf.size(), suf) == 0) wanted = true;
+        if (!wanted || lho + 30 > data.size() || u32(lho) != 0x04034b50) continue;
+        const size_t src = lho + 30 + u16(lho + 26) + u16(lho + 28);
+        if (src + csize > data.size()) continue;
+        std::vector<uint8_t> buf(usize);
+        if (method == 0 && csize == usize) {
+            memcpy(buf.data(), &data[src], usize);
+        } else if (method == 8) {
+            z_stream z{};
+            if (inflateInit2(&z, -MAX_WBITS) != Z_OK) continue;
+            z.next_in = &data[src];
+            z.avail_in = csize;
+            z.next_out = buf.data();
+            z.avail_out = usize;
+            const int r = inflate(&z, Z_FINISH);
+            inflateEnd(&z);
+            if (r != Z_STREAM_END) continue;
+        } else {
+            continue;
+        }
+        const size_t slash = name.find_last_of('/');
+        const std::string base = slash == std::string::npos ? name : name.substr(slash + 1);
+        FILE* w = fopen((dir + base).c_str(), "wb");
+        if (!w) continue;
+        const bool ok = fwrite(buf.data(), 1, buf.size(), w) == buf.size();
+        fclose(w);
+        if (ok) out.push_back(base);
+    }
+    if (out.empty() && err->empty()) *err = "no matching files in the zip";
+    return out;
+}
+
+// settings.txt `gpu_driver`: the file in <base>/drivers is copied (a .so) or unpacked (a .zip) into the app's
+// private folder, since libraries cannot be loaded from shared storage. Sets cfg->gpu_driver_dir/_lib.
+void PrepareGpuDriver(android_app* app, const std::string& base, dsr::RuntimeConfig* cfg) {
+    const std::string drivers = base + "/drivers";
+    mkdir(drivers.c_str(), 0775);
+    cfg->native_lib_dir = NativeLibraryDir(app);
+    if (cfg->gpu_driver.empty() || cfg->gpu_driver == "system") return;
+    const std::string src = drivers + "/" + cfg->gpu_driver;
+    if (!FileExists(src)) {
+        LOGW(kTag, "gpu_driver: %s not found: using the system driver", src.c_str());
+        return;
+    }
+    const char* priv = app->activity->internalDataPath;
+    if (!priv || cfg->native_lib_dir.empty()) {
+        LOGW(kTag, "gpu_driver: no private folder or native library folder: using the system driver");
+        return;
+    }
+    const std::string dir = std::string(priv) + "/gpu_driver/";
+    MakeDirs(dir);
+    if (DIR* d = opendir(dir.c_str())) {  // remove the previous driver's files
+        while (dirent* e = readdir(d))
+            if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) unlink((dir + e->d_name).c_str());
+        closedir(d);
+    }
+    std::string lib;
+    const auto ends = [](const std::string& s, const char* suf) {
+        const size_t n = strlen(suf);
+        return s.size() >= n && strcasecmp(s.c_str() + s.size() - n, suf) == 0;
+    };
+    if (ends(src, ".zip")) {
+        std::string err;
+        const std::vector<std::string> files = Unzip(src, dir, {".so", "meta.json"}, &err);
+        // meta.json (AdrenoTools format) names the driver library: "libraryName": "vulkan.ad07xx.so"
+        if (FILE* m = fopen((dir + "meta.json").c_str(), "r")) {
+            char buf[4096] = {};
+            fread(buf, 1, sizeof(buf) - 1, m);
+            fclose(m);
+            if (const char* k = strstr(buf, "\"libraryName\"")) {
+                const char* q1 = strchr(k + 13, '"');
+                const char* q2 = q1 ? strchr(q1 + 1, '"') : nullptr;
+                if (q1 && q2) lib.assign(q1 + 1, q2);
+            }
+        }
+        if (lib.empty())
+            for (const std::string& f : files)
+                if (ends(f, ".so")) {
+                    lib = f;
+                    break;
+                }
+        if (lib.empty()) {
+            LOGW(kTag, "gpu_driver: %s: no driver library found (%s): using the system driver", src.c_str(),
+                 err.empty() ? "no .so in it" : err.c_str());
+            return;
+        }
+        LOGI(kTag, "gpu_driver: unpacked %zu file(s) from %s, driver library %s", files.size(), src.c_str(), lib.c_str());
+    } else {
+        const size_t slash = src.find_last_of('/');
+        lib = src.substr(slash + 1);
+        if (!CopyFile(src, dir + lib)) {
+            LOGW(kTag, "gpu_driver: could not copy %s: using the system driver", src.c_str());
+            return;
+        }
+    }
+    if (!FileExists(dir + lib)) {
+        LOGW(kTag, "gpu_driver: %s missing after unpacking: using the system driver", lib.c_str());
+        return;
+    }
+    cfg->gpu_driver_dir = dir;
+    cfg->gpu_driver_lib = lib;
+}
+
 void StartGame(android_app* app) {
     if (g_game_started) return;
     // Wait for the answer to the storage access request (the settings screen is up on a first launch).
@@ -533,6 +751,7 @@ void StartGame(android_app* app) {
     mkdir(cfg.save_dir.c_str(), 0775);
     mkdir(cfg.cache_dir.c_str(), 0775);
     LoadSettings(base + "/settings.txt", &cfg);
+    PrepareGpuDriver(app, base, &cfg);
     if (!FileExists(cfg.game_dir + "/exefs/main") && base != old_dir && FileExists(old_dir + "/game/exefs/main")) {
         LOGW(kTag, "game files are still in %s/game: using them from there; move them to %s/game", old_dir.c_str(),
              base.c_str());
