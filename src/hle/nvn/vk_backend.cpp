@@ -3393,7 +3393,8 @@ private:
     Shader* GetShader(const ShaderCode& code, const shader::TranslateOptions& opt) {
         const uint32_t parts[6] = {uint32_t(code.hash), uint32_t(code.hash >> 32), opt.int_attrib_mask,
                                    opt.signed_attrib_mask, uint32_t(opt.gl_depth_range),
-                                   uint32_t(opt.alpha_func) | (opt.debug_outputs ? 0x100u : 0u)};
+                                   uint32_t(opt.alpha_func) | (opt.debug_outputs ? 0x100u : 0u) |
+                                       (uint32_t(opt.depth_test_func) << 12)};  // the depth test variant is its own shader
         Key64 fk;
         fk.Add(parts, sizeof(parts));
         auto fast = shaders_fast_.find(fk.h);
@@ -4287,6 +4288,9 @@ private:
                      d.dyn.vp.height, d.dyn.sc.offset.x, d.dyn.sc.offset.y, d.dyn.sc.extent.width, d.dyn.sc.extent.height,
                      extent.width, extent.height);
             desc = b;
+            snprintf(b, sizeof(b), " | depth test %d write %d func %d%s", int(st_.depth.depth_test || shader_depth_test),
+                     int(st_.depth.depth_write), int(st_.depth.depth_func), shader_depth_test ? " (in the shader)" : "");
+            desc += b;
             for (const VkVertexInputBindingDescription& vb_ : vin.bindings) {
                 const BufferRange& r = st_.vertex_buffers[vb_.binding];
                 snprintf(b, sizeof(b), " s%u stride %u%s @%llx size %llu", vb_.binding, vb_.stride,

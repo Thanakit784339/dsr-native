@@ -90,16 +90,16 @@ public final class TouchControls extends View implements InputManager.InputDevic
     // Stick: fixed in place; a finger that comes down on it (or near it) drives it.
     private int mStickPointer = -1;
     private float mStickBaseX, mStickBaseY, mStickX, mStickY, mStickRadius;
-    // Camera stick: invisible until the right side is touched; appears under the finger and its base follows a
-    // finger that goes past its edge. Smaller than the left stick; `camera speed` = deflection per distance.
+    // Camera stick: invisible; it starts under a finger that touches the right side and its base follows a
+    // finger that goes past its edge. `camera speed` = deflection per distance.
     private int mRStickPointer = -1;
     private float mRBaseX, mRBaseY, mRX, mRY, mRRadius;
     // A thumb resting on it (not moving for a moment): the base slides under the thumb, so the camera eases to
     // a stop instead of turning on and on.
     private long mRLastMove;
     private long mRLastTick;
-    private static final long REST_DELAY_MS = 80;
-    private static final float RECENTER_TIME_S = 0.35f;  // time constant of the slide
+    private static final long REST_DELAY_MS = 50;
+    private static final float RECENTER_TIME_S = 0.15f;  // time constant of the slide
     private final Runnable mRecenter = new Runnable() {
         @Override
         public void run() {
@@ -287,7 +287,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
         place(L3, 4.7f * u, h - 0.9f * u, 1.0f * u, 1.0f * u);
         // Stick: resting spot, and the area where a finger grabs it.
         mStickRadius = 1.6f * u;
-        mRRadius = 1.05f * u;
+        mRRadius = 2.1f * u;
         mStickBaseX = 2.8f * u;
         mStickBaseY = h - 3.0f * u;
         mText.setTextSize(0.45f * u);
@@ -482,21 +482,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
         }
         mFill.setColor(mStickPointer >= 0 ? 0xA0FFFFFF : 0x60FFFFFF);
         c.drawCircle(kx, ky, mStickRadius * 0.45f, mFill);
-        // Camera stick, only while touched.
-        if (mRStickPointer >= 0) {  // half as opaque as the rest
-            mFill.setColor(0x20000000);
-            c.drawCircle(mRBaseX, mRBaseY, mRRadius, mFill);
-            mStroke.setAlpha(0x80);
-            c.drawCircle(mRBaseX, mRBaseY, mRRadius, mStroke);
-            mStroke.setAlpha(0xFF);
-            float dx = mRX - mRBaseX, dy = mRY - mRBaseY, len = (float) Math.sqrt(dx * dx + dy * dy);
-            if (len > mRRadius) {
-                dx = dx / len * mRRadius;
-                dy = dy / len * mRRadius;
-            }
-            mFill.setColor(0x50FFFFFF);
-            c.drawCircle(mRBaseX + dx, mRBaseY + dy, mRRadius * 0.45f, mFill);
-        }
+        // The camera stick is not drawn (invisible by design).
         // Buttons.
         for (Button b : mButtons) {
             boolean on = b.pressCount > 0;
