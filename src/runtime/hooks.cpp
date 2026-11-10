@@ -155,9 +155,14 @@ void InstallGameHooks() {
             rt.config.target_fps = 30;
         }
     }
-    // Aspect ratio (experimental). The game sets up its two display modes in main+0x716158: handheld
-    // 1280x720 (main+0x716170 mov w1, #1280) and docked 1920x1080; its frame buffers are allocated at
-    // 1920x1080 (main+0x70a20c), so the handheld width can go up to 1920. A wider handheld width is patched in.
+    // Aspect ratio. Two places set the game's resolution, both with built-in defaults:
+    // - the render resolution, read from the game's settings with defaults 1280 / 720 (main+0x6a16b0:
+    //   "Normal.Resolution.Width" main+0x6a170c mov w2, #1280; "...Height" main+0x6a1758 mov w2, #720). It
+    //   also becomes the screen size floats (main+0x1af4a7c / +0x1af4a84) the cameras take their aspect ratio
+    //   from (e.g. main+0xbca88), so the 3D view widens (or narrows) instead of stretching;
+    // - the handheld display mode (main+0x716158: main+0x716170 mov w1, #1280; +0x716178 mov w2, #720).
+    // Frame buffers are allocated at 1920x1080 (main+0x70a20c), the limit. Wider than 16:9: 720 high, wider;
+    // narrower: 1280 wide, taller.
     if (rt.config.aspect_ratio != "16:9" && !rt.config.docked) {
         float ar = 0;
         if (rt.config.aspect_ratio == "auto") {
@@ -167,12 +172,24 @@ void InstallGameHooks() {
             if (sscanf(rt.config.aspect_ratio.c_str(), "%f:%f", &w, &h) == 2 && h > 0) ar = w / h;
         }
         if (ar > 0) {
-            const int width = std::clamp(int(std::lround(720.0f * ar / 16.0f)) * 16, 960, 1920);
+            int width = 1280, height = 720;
+            if (ar >= 16.0f / 9.0f)
+                width = std::min(1920, int(std::lround(720.0f * ar / 8.0f)) * 8);
+            else
+                height = std::min(1080, int(std::lround(1280.0f / ar / 8.0f)) * 8);
             std::string err;
-            if (width != 1280 && rt.main.PatchInstruction(0x716170, 0x5280A001, 0x52800001u | (uint32_t(width) << 5), &err))
-                LOGI("hooks", "aspect ratio %s (%.3f): handheld display resolution %dx720 (was 1280x720)",
-                     rt.config.aspect_ratio.c_str(), ar, width);
-            else if (width != 1280)
+            auto mov = [](int rd, int v) { return 0x52800000u | (uint32_t(v) << 5) | uint32_t(rd); };
+            bool ok = true;
+            if (width != 1280)
+                ok = ok && rt.main.PatchInstruction(0x6a170c, 0x5280A002, mov(2, width), &err) &&
+                     rt.main.PatchInstruction(0x716170, 0x5280A001, mov(1, width), &err);
+            if (height != 720)
+                ok = ok && rt.main.PatchInstruction(0x6a1758, 0x52805A02, mov(2, height), &err) &&
+                     rt.main.PatchInstruction(0x716178, 0x52805A02, mov(2, height), &err);
+            if (ok)
+                LOGI("hooks", "aspect ratio %s (%.3f): the game renders at %dx%d (was 1280x720)",
+                     rt.config.aspect_ratio.c_str(), ar, width, height);
+            else
                 LOGW("hooks", "aspect ratio patch failed: %s", err.c_str());
         } else {
             LOGW("hooks", "aspect_ratio %s: not understood (or screen size unknown), staying at 16:9",
