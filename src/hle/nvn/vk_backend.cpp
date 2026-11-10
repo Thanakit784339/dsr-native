@@ -3089,7 +3089,8 @@ private:
     // ======================================================================================================
     Shader* GetShader(const ShaderCode& code, const shader::TranslateOptions& opt) {
         const uint32_t parts[6] = {uint32_t(code.hash), uint32_t(code.hash >> 32), opt.int_attrib_mask,
-                                   opt.signed_attrib_mask, uint32_t(opt.gl_depth_range), uint32_t(opt.alpha_func)};
+                                   opt.signed_attrib_mask, uint32_t(opt.gl_depth_range),
+                                   uint32_t(opt.alpha_func) | (opt.debug_outputs ? 0x100u : 0u)};
         Key64 fk;
         fk.Add(parts, sizeof(parts));
         auto fast = shaders_fast_.find(fk.h);
@@ -3404,6 +3405,11 @@ private:
             if (vf.is_signed) vopt.signed_attrib_mask |= 1u << i;
         }
         fopt.alpha_func = st_.color.alpha_func;
+        // `hole_test` 1024 (square holes): the smoke / fog / glow fragment shaders show what they computed (see
+        // TranslateOptions::debug_outputs), drawn without blending, depth test or the 3 empty targets.
+        const bool debug_fx = (dsr::GetRuntime().config.hole_test & 1024) && st_.program[1] &&
+                              (st_.program[1]->hash == 0x6f634579337b2b69ull || st_.program[1]->hash == 0x3fc1b1baa8114318ull);
+        fopt.debug_outputs = debug_fx;
         Shader* vs = GetShader(*st_.program[0], vopt);
         // No pixel program: a depth-only pass (shadow maps, depth prepass). Draw with the vertex stage only.
         Shader* fs = st_.program[1] ? GetShader(*st_.program[1], fopt) : &no_fragment_;
@@ -3889,12 +3895,21 @@ private:
         // `hole_test` 1/3 (diagnostic for the square holes): the smoke / fog / glow shaders draw without the depth
         // test, to tell a bad depth buffer from a bad depth texture.
         const bool saved_depth_test = st_.depth.depth_test;
+        const auto saved_blend_enable = st_.color.blend_enable;
+        const auto saved_mask = st_.channel.mask;
+        if (debug_fx) {
+            st_.depth.depth_test = false;
+            st_.color.blend_enable = 0;
+            st_.channel.mask = 0xffffffffu;
+        }
         if ((dsr::GetRuntime().config.hole_test & 1) && st_.program[1] &&
             (st_.program[1]->hash == 0x6f634579337b2b69ull || st_.program[1]->hash == 0x3fc1b1baa8114318ull))
             st_.depth.depth_test = false;
         VkPipeline pipeline = GetPipeline(vs, fs, vin, topology, color_formats, depth ? depth->nvn_format : 0,
                                           depth_format, layout);
         st_.depth.depth_test = saved_depth_test;
+        st_.color.blend_enable = saved_blend_enable;
+        st_.channel.mask = saved_mask;
         if (!pipeline) {
             if (pipeline_pending_) return;  // compiling in the background: drawn once it is ready
             return Skip("pipeline creation failed");

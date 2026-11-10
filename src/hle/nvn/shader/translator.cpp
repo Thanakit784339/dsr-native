@@ -592,7 +592,7 @@ private:
             memcpy(&omap, code_ + kSphOffset + 18 * 4, 4);
             memcpy(&omap2, code_ + kSphOffset + 19 * 4, 4);
             // Alpha test (no fixed-function equivalent in Vulkan): compare RT0 alpha with the reference.
-            if (opt_.alpha_func != 8 && (omap & 0x8)) {
+            if (opt_.alpha_func != 8 && (omap & 0x8) && !opt_.debug_outputs) {
                 uint32_t alpha_reg = uint32_t(__builtin_popcount(omap & 0x7));
                 Id alpha = GetF(alpha_reg);
                 Id ref = AlphaRef();
@@ -616,6 +616,19 @@ private:
                 info_.uses_discard = true;
             }
             uint32_t reg = 0;
+            if (opt_.debug_outputs && (omap & 0xF)) {
+                Id var = OutputVar(0);
+                const uint32_t m0 = omap & 0xF;
+                const Id red = (m0 & 1) ? GetF(0) : b_.ConstFloat(0.0f);
+                const Id alpha = (m0 & 8) ? GetF(uint32_t(__builtin_popcount(m0 & 7))) : b_.ConstFloat(1.0f);
+                const Id dbg = debug_tex_ ? b_.OpResult(SpvOpLoad, t_f32_, {debug_tex_}) : b_.ConstFloat(-1.0f);
+                StoreComponent(var, 0, dbg);
+                StoreComponent(var, 1, alpha);
+                StoreComponent(var, 2, red);
+                StoreComponent(var, 3, b_.ConstFloat(1.0f));
+                b_.Op(SpvOpReturn, {});
+                return;
+            }
             for (uint32_t t = 0; t < 8; t++) {
                 uint32_t mask = (omap >> (t * 4)) & 0xF;
                 if (!mask) continue;
@@ -836,6 +849,10 @@ private:
         SpvOp op = dc ? (implicit ? SpvOpImageSampleDrefImplicitLod : SpvOpImageSampleDrefExplicitLod)
                       : (implicit ? SpvOpImageSampleImplicitLod : SpvOpImageSampleExplicitLod);
         Id result = b_.OpResult(op, dc ? t_f32_ : t_v4f_, args);
+        if (opt_.debug_outputs && slot == opt_.debug_slot && stage_ == Stage::Fragment) {
+            if (!debug_tex_) debug_tex_ = b_.LocalVariable(b_.TypePointer(SpvStorageClassFunction, t_f32_), b_.ConstFloat(-2.0f));
+            b_.Op(SpvOpStore, {debug_tex_, dc ? result : b_.OpResult(SpvOpCompositeExtract, t_f32_, {result, 0u})});
+        }
         uint32_t d = dest;
         for (uint32_t c = 0; c < 4; c++) {
             if (!(mask >> c & 1)) continue;
@@ -1190,6 +1207,8 @@ private:
                 if (!predicated) {
                     if (d.op == Op::EXIT) {
                         EmitExit();
+                    } else if (opt_.debug_outputs) {
+                        break;  // diagnostics: no discards
                     } else {
                         info_.uses_discard = true;
                         b_.Op(SpvOpKill, {});
@@ -1250,7 +1269,12 @@ private:
         bool terminated = false;
         switch (d.op) {
             case Op::EXIT: EmitExit(); terminated = true; break;
-            case Op::KIL: info_.uses_discard = true; b_.Op(SpvOpKill, {}); terminated = true; break;
+            case Op::KIL:
+                if (opt_.debug_outputs) break;  // diagnostics: no discards
+                info_.uses_discard = true;
+                b_.Op(SpvOpKill, {});
+                terminated = true;
+                break;
             default: EmitOp(i, d); break;
         }
         if (predicated) {
@@ -1668,6 +1692,7 @@ private:
     Id image_[8] = {}, image_type_[8] = {};
     Id prim_id_ = 0;
     Id push_ = 0;
+    Id debug_tex_ = 0;  // TranslateOptions::debug_outputs: first sample of the debug texture slot
     Id position_ = 0, point_size_ = 0, frag_coord_ = 0, frag_depth_ = 0, point_coord_ = 0, vertex_index_ = 0,
        instance_index_ = 0;
     std::vector<Id> interface_;

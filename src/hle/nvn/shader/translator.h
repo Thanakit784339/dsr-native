@@ -32,6 +32,11 @@ struct TranslateOptions {
     uint32_t signed_attrib_mask = 0;  // ... of which signed
     bool gl_depth_range = true;       // NVN depth mode -1..1: remap clip z to Vulkan's 0..1
     int alpha_func = 8;               // NVN alpha test (1 NEVER .. 8 ALWAYS); reference in push constant
+    // Diagnostics (square holes): fragment shader without discards or alpha test, whose first output shows what
+    // it computed: R = first sample of texture slot `debug_slot` (x, as is), G = the real output's alpha,
+    // B = the real output's red, A = 1.
+    bool debug_outputs = false;
+    uint32_t debug_slot = 2;
 };                                    // block offset 0 (fragment stage)
 
 struct ShaderInfo {
