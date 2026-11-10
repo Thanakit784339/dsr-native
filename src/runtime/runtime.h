@@ -26,7 +26,7 @@ struct RuntimeConfig {
     float gamma = 1.0f;           // extra display gamma applied through the game's brightness ramp (> 1 lifts shadows)
     std::string present_mode = "mailbox";  // swapchain present mode: mailbox, fifo, fifo_relaxed, immediate (FIFO if unsupported)
     bool lrz_workaround = false;  // refresh depth buffers written by gl_FragDepth before reuse (square holes)
-    int hole_test = 0;  // diagnostics for the square holes: 1 = effects without depth test, 2 = uncompressed depth, 3 = both
+    int hole_test = 0;  // square-hole diagnostics (bits): 1 = effects without depth test, 2 = uncompressed depth, 4 = no write-masked colour targets
     bool audio_smooth = false;  // release audio buffers at a smoothed pace (experiment; movies were not timed by it)
     bool fast_cores = true;  // keep the game's frame-critical threads off the efficiency cores
     bool record_thread = true;  // record Vulkan commands on a second thread (draw preparation stays on the render thread)

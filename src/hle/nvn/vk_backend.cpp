@@ -3406,6 +3406,11 @@ private:
                 colors[size_t(i)] = img;
         }
         Image* depth = st_.rts.size() > size_t(st_.num_rt) ? GetImage(st_.rts[size_t(st_.num_rt)], false) : nullptr;
+        // `hole_test` 4 (square holes): colour targets this draw cannot write (channel mask 0) are left out of the
+        // render pass instead of being loaded and stored back untouched.
+        if (dsr::GetRuntime().config.hole_test & 4)
+            for (size_t i = 0; i < colors.size(); i++)
+                if (((st_.channel.mask >> (4 * i)) & 0xF) == 0) colors[i] = nullptr;
         if (depth && !IsDepthFormat(depth->nvn_format)) depth = nullptr;
 
         Begin();
@@ -3971,6 +3976,23 @@ private:
                      st_.alpha_ref, st_.color.blend_enable, st_.channel.mask, st_.polygon.cull, st_.polygon.front_face,
                      int(st_.depth.depth_test), int(st_.depth.depth_write), int(st_.depth.stencil_test));
             pass_state_desc_ = d;
+            pass_state_desc_ += " | targets:";
+            for (size_t i = 0; i < colors.size(); i++) {
+                if (!colors[i]) {
+                    pass_state_desc_ += " -";
+                    continue;
+                }
+                char t[96];
+                snprintf(t, sizeof(t), " %zu:%dx%d f%d @%llx", i, colors[i]->width, colors[i]->height,
+                         colors[i]->nvn_format, (unsigned long long)colors[i]->addr);
+                pass_state_desc_ += t;
+            }
+            if (depth) {
+                char t[96];
+                snprintf(t, sizeof(t), " depth:%dx%d f%d @%llx", depth->width, depth->height, depth->nvn_format,
+                         (unsigned long long)depth->addr);
+                pass_state_desc_ += t;
+            }
         }
         // Diagnostics (darkness): the first few lit world draws of a capture (shadow map + cube map sampled)
         // log their textures and constants, and their sampled textures are captured.
