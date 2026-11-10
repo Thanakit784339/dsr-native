@@ -1,6 +1,7 @@
 // Hooks on specific functions inside the game's main module (this build only, matched by build id).
 // They replace engine functions whose output is useful to us but goes nowhere in a retail build.
 #include <algorithm>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <thread>
@@ -90,6 +91,20 @@ void EnginePanic(const char* file, int line, const char* fmt, ...) {
           (unsigned long)GuestOffset(__builtin_return_address(0)));
 }
 
+// main+0x81ad14: the pad device's SetAxis(this, axis, value), virtual. Each frame the game reads the axes
+// (main+0x81a698: x / 32767, right stick at this+0x468/+0x46c), then the input mapping (main+0x834c1c and
+// +0x834dc4) applies dead zone and scale, clamps to its maximum (1) and writes them back through here. The touch
+// camera feeds the right stick past full deflection (dsr::input::AddLook) so fast swipes turn faster: for the
+// right stick, a value still past 1 at this point can only come from that, and is kept instead of the clamped
+// one. Controllers (|value| <= 1) behave as before.
+void PadSetAxis(uint8_t* self, int axis, float value) {
+    const unsigned i = unsigned(axis - 3);
+    if (i > 5) return;
+    float* slot = reinterpret_cast<float*>(self + 0x468) + i;
+    if (i <= 1 && std::fabs(*slot) > 1.001f) return;  // right stick overdriven by a swipe: keep it
+    *slot = value;
+}
+
 struct Hook {
     uint64_t offset;
     void* fn;
@@ -99,6 +114,7 @@ const Hook kHooks[] = {
     {0x7fea18, reinterpret_cast<void*>(&EngineLog), "engine log"},
     {0x7feb30, reinterpret_cast<void*>(&EngineLogV), "engine vlog"},
     {0x7892d8, reinterpret_cast<void*>(&EnginePanic), "DL_PANIC"},
+    {0x81ad14, reinterpret_cast<void*>(&PadSetAxis), "pad axis (touch camera speed)"},
 };
 
 }  // namespace
