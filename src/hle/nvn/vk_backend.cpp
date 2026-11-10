@@ -3451,6 +3451,10 @@ private:
         if (dsr::GetRuntime().config.hole_test & 4)
             for (size_t i = 0; i < colors.size(); i++)
                 if (((st_.channel.mask >> (4 * i)) & 0xF) == 0) colors[i] = nullptr;
+        // `hole_test` 512 (square holes): trailing colour targets with no image (the game binds 4, only the first is
+        // usable) are dropped from the render pass and the pipeline, instead of being null attachments.
+        if (dsr::GetRuntime().config.hole_test & 512)
+            while (!colors.empty() && !colors.back()) colors.pop_back();
         if (depth && !IsDepthFormat(depth->nvn_format)) depth = nullptr;
 
         Begin();
