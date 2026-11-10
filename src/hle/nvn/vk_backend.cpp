@@ -1311,7 +1311,7 @@ private:
         uint32_t ndev_ext = 1;
         // Image format lists (core in 1.2): with them, sRGB/linear-viewable images keep their compression.
         format_list_ = VK_API_VERSION_MINOR(props_.apiVersion) >= 2;
-        if (!format_list_) {
+        if (!format_list_ && dsr::GetRuntime().config.gpu_compression) {
             uint32_t n = 0;
             vkEnumerateDeviceExtensionProperties(phys_, nullptr, &n, nullptr);
             std::vector<VkExtensionProperties> exts(n);
@@ -1344,9 +1344,9 @@ private:
             begin_rendering_ = nullptr;
             end_rendering_ = nullptr;
             rp_fallback_ = true;
-            lean_images_ = true;
-            LOGI(kTag, "no dynamic rendering: using render pass objects instead; storage usage only on images "
-                       "written as storage images");
+            lean_images_ = dsr::GetRuntime().config.gpu_compression;
+            LOGI(kTag, "no dynamic rendering: using render pass objects instead%s",
+                 lean_images_ ? "; storage usage only on images written as storage images" : "");
         }
 
         vkGetDeviceQueue(device_, family_, 0, &queue_);

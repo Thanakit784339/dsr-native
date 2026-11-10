@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 #include <vector>
 #endif
@@ -65,11 +66,32 @@ struct Watched {
 };
 std::mutex g_watch_mutex;
 std::vector<Watched> g_watched;
+// The cpuset a thread is in and that cpuset's CPUs, e.g. "/top-app (0-7)" (diagnostics).
+std::string CpusetOf(pid_t tid) {
+    char path[96], name[128] = {}, cpus[64] = {};
+    snprintf(path, sizeof(path), "/proc/self/task/%d/cpuset", int(tid));
+    if (FILE* f = fopen(path, "r")) {
+        if (!fgets(name, sizeof(name), f)) name[0] = 0;
+        fclose(f);
+    }
+    name[strcspn(name, "\n")] = 0;
+    snprintf(path, sizeof(path), "/dev/cpuset%s/cpus", name);
+    if (FILE* f = fopen(path, "r")) {
+        if (!fgets(cpus, sizeof(cpus), f)) cpus[0] = 0;
+        fclose(f);
+    }
+    cpus[strcspn(cpus, "\n")] = 0;
+    return std::string(name[0] ? name : "?") + " (" + (cpus[0] ? cpus : "?") + ")";
+}
 void WatchAffinity() {
     pthread_setname_np(pthread_self(), "dsr-affinity");
     const FastCores& fc = GetFastCores();
+    // Checked 10 times a second: on the OnePlus 6T the system reset the affinity about once a second, so with
+    // a one-second check the threads still spent much of their time on the efficiency cores.
+    int restored = 0, refused = 0;
+    auto summary_at = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     for (;;) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
         std::lock_guard<std::mutex> lk(g_watch_mutex);
         for (size_t i = 0; i < g_watched.size();) {
             Watched& w = g_watched[i];
@@ -81,11 +103,20 @@ void WatchAffinity() {
             }
             if (!CPU_EQUAL(&cur, &fc.set)) {
                 const int r = sched_setaffinity(w.tid, sizeof(fc.set), &fc.set);
-                if (++w.restores <= 3 || w.restores % 100 == 0)
-                    LOGI("platform", "%s (tid %d): CPU affinity reset by the system, restored to CPUs%s: %s (%d times)",
-                         w.who.c_str(), int(w.tid), fc.list.c_str(), r == 0 ? "ok" : "refused", w.restores);
+                (r == 0 ? restored : refused)++;
+                if (++w.restores <= 2)
+                    LOGI("platform", "%s (tid %d): CPU affinity reset by the system (%d CPUs allowed, cpuset %s), "
+                         "restored to CPUs%s: %s", w.who.c_str(), int(w.tid), CPU_COUNT(&cur),
+                         CpusetOf(w.tid).c_str(), fc.list.c_str(), r == 0 ? "ok" : "refused");
             }
             i++;
+        }
+        if (std::chrono::steady_clock::now() >= summary_at) {
+            summary_at += std::chrono::seconds(10);
+            if (restored || refused)
+                LOGI("platform", "CPU affinity of the busy threads reset by the system and restored %d times in the "
+                     "last 10 s (%d refused: app in the background?)", restored, refused);
+            restored = refused = 0;
         }
     }
 }
