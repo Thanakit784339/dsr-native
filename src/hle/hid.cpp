@@ -51,6 +51,10 @@ void SetLookSpeed(float speed, bool invert_y) {
     g_look_speed = speed > 0.05f ? speed : 0.05f;
     g_look_invert = invert_y;
 }
+bool LookActive() {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    return g_look_last_move && dsr::hle::os::NowNs() - g_look_last_move < 100'000'000;
+}
 PadState GetPad(int64_t* sampling) {
     const int64_t now = dsr::hle::os::NowNs();
     if (sampling) *sampling = now / 4'000'000;  // ~250 Hz sampling counter

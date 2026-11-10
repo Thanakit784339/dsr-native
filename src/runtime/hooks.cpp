@@ -10,15 +10,13 @@
 #include <cstring>
 #include <pthread.h>
 #include <unistd.h>
-#include <ucontext.h>
-#include <sys/mman.h>
-#include <csignal>
 #include <vector>
 #include <string>
 #include <mutex>
 #include <map>
 
 #include "common/log.h"
+#include "hle/input.h"
 #include "hle/os/os.h"
 #include <atomic>
 
@@ -114,135 +112,14 @@ void PadSetAxis(uint8_t* self, int axis, float value) {
     *slot = value;
 }
 
-// ---- camera probe (diagnostics) ------------------------------------------------------------------------------
-// main+0x8312d0: the input mapping's action writer (device, action, value): keeps the largest positive and
-// negative contribution of the frame (device+0xd0 / +0xf8) and stores their sum in the action values
-// (device+0x148). Reimplemented here to learn which action the right stick feeds: only a swipe's overdriven
-// stick gives |value| > 1. That action's value is then watched: a background thread write-protects its page
-// and the next access faults; the fault handler records who read
-// it (pc, lr and the frame-pointer chain), unprotects the page and lets the access go on; the thread protects it
-// again right away. The camera code that turns (and caps the turn speed) is among the readers. Logged every
-// 10 s for 30 s, once per run.
-namespace probe {
-std::atomic<uint8_t*> g_dev{nullptr};
-std::atomic<int> g_action{-1};
-std::atomic<uintptr_t> g_page{0}, g_target{0};
-std::atomic<bool> g_armed{false};
-struct Sample {
-    uintptr_t chain[8];
-};
-constexpr int kSamples = 4096;
-Sample g_samples[kSamples];
-std::atomic<int> g_nsamples{0};
-std::atomic<int> g_faults{0};  // all faults on the page (any address)
-struct sigaction g_old_segv;
-size_t g_pagesize = 4096;
+// ---- touch camera: fast swipes past the game's caps --------------------------------------------------------
+// The right stick reaches the camera as input "actions" (6 and 7 in this build): main+0x8312d0 stores each
+// action's value for the frame, then main+0x834978 applies the action's dead zone and scale and clamps it to
+// its maximum (1). A swipe faster than a full stick push gives values past 1 (dsr::input::AddLook); for those
+// actions, while the finger is moving, the clamp is skipped, so a fast flick turns the camera faster.
+std::atomic<uint64_t> g_look_actions{0};  // bit per action that has received an overdriven value
 
-void OnFault(int sig, siginfo_t* si, void* uc_v) {
-    const uintptr_t addr = reinterpret_cast<uintptr_t>(si->si_addr);
-    const uintptr_t page = g_page.load(std::memory_order_acquire);
-    if (page && addr >= page && addr < page + g_pagesize) {
-        mprotect(reinterpret_cast<void*>(page), g_pagesize, PROT_READ | PROT_WRITE);
-        g_armed.store(false, std::memory_order_release);
-        g_faults.fetch_add(1, std::memory_order_relaxed);
-        const uintptr_t target = g_target.load(std::memory_order_relaxed);
-        if (addr >= target && addr < target + 4) {
-            const int i = g_nsamples.fetch_add(1, std::memory_order_relaxed);
-            if (i < kSamples) {
-#if defined(__aarch64__)
-                auto* uc = static_cast<ucontext_t*>(uc_v);
-                const loader::Module& m = GetRuntime().main;
-                auto rel = [&](uintptr_t a) { return m.Contains(a) ? a - m.base() : 0; };
-                Sample& smp = g_samples[i];
-                memset(&smp, 0, sizeof(smp));
-                smp.chain[0] = rel(uc->uc_mcontext.pc);
-                smp.chain[1] = rel(uc->uc_mcontext.regs[30]);
-                const uintptr_t* fp = reinterpret_cast<const uintptr_t*>(uc->uc_mcontext.regs[29]);
-                for (int d = 2; d < 8 && fp && (reinterpret_cast<uintptr_t>(fp) & 7) == 0; d++) {
-                    const uintptr_t lr = fp[1];
-                    if (!m.Contains(lr)) break;
-                    smp.chain[d] = rel(lr);
-                    const uintptr_t* next = reinterpret_cast<const uintptr_t*>(fp[0]);
-                    if (next <= fp) break;
-                    fp = next;
-                }
-#endif
-            }
-        }
-        return;
-    }
-    // Not ours: the previous handler (crash report).
-    if (g_old_segv.sa_flags & SA_SIGINFO)
-        g_old_segv.sa_sigaction(sig, si, uc_v);
-    else if (g_old_segv.sa_handler != SIG_DFL && g_old_segv.sa_handler != SIG_IGN)
-        g_old_segv.sa_handler(sig);
-    else {
-        signal(sig, SIG_DFL);
-        raise(sig);
-    }
-}
-
-void Run() {
-    pthread_setname_np(pthread_self(), "dsr-camprobe");
-    g_pagesize = size_t(sysconf(_SC_PAGESIZE));
-    struct sigaction sa {};
-    sa.sa_sigaction = OnFault;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, &g_old_segv);
-    uint8_t* dev = g_dev.load();
-    const int action = g_action.load();
-    const uintptr_t target = reinterpret_cast<uintptr_t>(*reinterpret_cast<float**>(dev + 0x148) + action);
-    g_target = target;
-    LOGI("hooks", "camera probe: right stick feeds action %d (device %p, value at %p): watching its readers", action,
-         dev, reinterpret_cast<void*>(target));
-    // The value shares its page with the device object, which the input code touches all the time: the page
-    // is protected again right after every fault (a few tens of microseconds), so the reads that come later in
-    // the frame, outside the input code, still find it protected.
-    const uintptr_t page0 = target & ~(uintptr_t(g_pagesize) - 1);
-    (void)page0;
-    const auto start = std::chrono::steady_clock::now();
-    auto report = start + std::chrono::seconds(10);
-    for (;;) {
-        std::this_thread::sleep_for(std::chrono::microseconds(30));
-        if (!g_armed.load()) {
-            const uintptr_t page = target & ~(uintptr_t(g_pagesize) - 1);
-            g_page.store(page, std::memory_order_release);
-            g_armed = true;
-            mprotect(reinterpret_cast<void*>(page), g_pagesize, PROT_NONE);
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= report) {
-            report += std::chrono::seconds(10);
-            const int n = std::min(g_nsamples.exchange(0), kSamples);
-            std::map<std::vector<uintptr_t>, int> counts;
-            for (int i = 0; i < n; i++)
-                counts[std::vector<uintptr_t>(g_samples[i].chain, g_samples[i].chain + 8)]++;
-            LOGI("hooks", "camera probe: %d accesses to action %d caught in the last 10 s (%d page faults in all)", n,
-                 action, g_faults.exchange(0));
-            for (const auto& [c, k] : counts) {
-                if (!c[0] && !c[1]) continue;  // our own action writer
-                std::string line;
-                for (uintptr_t a : c) {
-                    if (!a) break;
-                    char buf[24];
-                    snprintf(buf, sizeof(buf), " %lx", (unsigned long)a);
-                    line += buf;
-                }
-                LOGI("hooks", "camera probe: action %d read %d times by:%s", action, k, line.c_str());
-            }
-            if (now - start > std::chrono::seconds(31)) {
-                // Done: stop watching (the page is left writable).
-                while (g_armed.load()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                g_page = 0;
-                LOGI("hooks", "camera probe: done");
-                return;
-            }
-        }
-    }
-}
-}  // namespace probe
-
+// main+0x8312d0 (device, action, value): the action writer, reimplemented; it also learns the camera actions.
 void ActionWrite(uint8_t* dev, int action, float v) {
     float* pos = *reinterpret_cast<float**>(dev + 0xd0);
     float* neg = *reinterpret_cast<float**>(dev + 0xf8);
@@ -253,13 +130,28 @@ void ActionWrite(uint8_t* dev, int action, float v) {
         neg[action] = n = v;
     }
     (*reinterpret_cast<float**>(dev + 0x148))[action] = p + n;
-    if (std::fabs(v) > 1.001f && probe::g_action.load(std::memory_order_relaxed) < 0) {
-        int expected = -1;
-        if (probe::g_action.compare_exchange_strong(expected, action)) {
-            probe::g_dev = dev;
-            std::thread(probe::Run).detach();
-        }
+    if (std::fabs(v) > 1.001f && action >= 0 && action < 64) {
+        const uint64_t bit = 1ull << action;
+        if (!(g_look_actions.fetch_or(bit) & bit)) LOGI("hooks", "touch camera: right stick feeds action %d", action);
     }
+}
+
+// main+0x821218 (list, i, &action, &pair, &a, &threshold, &dead_zone, &scale, [stack] &max): reads entry i
+// (0x1c bytes) of an action configuration list, reimplemented. For a camera action while a swipe is going on,
+// max reads as 0, which main+0x834978 takes as "no clamp".
+void ActionConfig(uint8_t* list, int i, int32_t* action, int32_t* pair, int32_t* a, int32_t* threshold,
+                  int32_t* dead_zone, int32_t* scale, int32_t* max) {
+    const auto* e = reinterpret_cast<const int32_t*>(*reinterpret_cast<uint8_t**>(list + 8) + int64_t(i) * 0x1c);
+    *action = e[0];
+    *pair = e[1];
+    *a = e[2];
+    *threshold = e[3];
+    *scale = e[4];
+    *max = e[5];
+    *dead_zone = e[6];
+    const int id = e[0];
+    if (id >= 0 && id < 64 && (g_look_actions.load(std::memory_order_relaxed) >> id & 1) && dsr::input::LookActive())
+        *max = 0;
 }
 
 struct Hook {
@@ -272,7 +164,8 @@ const Hook kHooks[] = {
     {0x7feb30, reinterpret_cast<void*>(&EngineLogV), "engine vlog"},
     {0x7892d8, reinterpret_cast<void*>(&EnginePanic), "DL_PANIC"},
     {0x81ad14, reinterpret_cast<void*>(&PadSetAxis), "pad axis (touch camera speed)"},
-    {0x8312d0, reinterpret_cast<void*>(&ActionWrite), "input action write (camera probe)"},
+    {0x8312d0, reinterpret_cast<void*>(&ActionWrite), "input action write (touch camera)"},
+    {0x821218, reinterpret_cast<void*>(&ActionConfig), "input action config (touch camera)"},
 };
 
 }  // namespace

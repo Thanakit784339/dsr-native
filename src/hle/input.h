@@ -26,6 +26,8 @@ void SetTouch(uint64_t buttons, float lx, float ly);
 // deflection from the swipe speed: `speed` 1 = full deflection at kLookFullSpeed dp/s.
 void AddLook(float dx, float dy);
 void SetLookSpeed(float speed, bool invert_y);
+// True while a swipe is turning the camera (moved in the last 100 ms).
+bool LookActive();
 // HLE side: snapshot plus a monotonically increasing sampling number.
 PadState GetPad(int64_t* sampling_number);
 
