@@ -94,6 +94,34 @@ public final class TouchControls extends View implements InputManager.InputDevic
     // finger that goes past its edge. Smaller than the left stick; `camera speed` = deflection per distance.
     private int mRStickPointer = -1;
     private float mRBaseX, mRBaseY, mRX, mRY, mRRadius;
+    // A thumb resting on it (not moving for a moment): the base slides under the thumb, so the camera eases to
+    // a stop instead of turning on and on.
+    private long mRLastMove;
+    private long mRLastTick;
+    private static final long REST_DELAY_MS = 80;
+    private static final float RECENTER_TIME_S = 0.35f;  // time constant of the slide
+    private final Runnable mRecenter = new Runnable() {
+        @Override
+        public void run() {
+            if (mRStickPointer < 0) return;
+            long now = android.os.SystemClock.uptimeMillis();
+            float dt = (now - mRLastTick) / 1000f;
+            mRLastTick = now;
+            if (now - mRLastMove >= REST_DELAY_MS && (mRX != mRBaseX || mRY != mRBaseY)) {
+                float k = 1f - (float) Math.exp(-dt / RECENTER_TIME_S);
+                mRBaseX += (mRX - mRBaseX) * k;
+                mRBaseY += (mRY - mRBaseY) * k;
+                float dx = mRX - mRBaseX, dy = mRY - mRBaseY;
+                if (dx * dx + dy * dy < 1f) {
+                    mRBaseX = mRX;
+                    mRBaseY = mRY;
+                }
+                sendState();
+                invalidate();
+            }
+            mHandler.postDelayed(this, 16);
+        }
+    };
     private final float mCameraSpeed;
 
     // Double tap (to show the controls again).
@@ -349,6 +377,9 @@ public final class TouchControls extends View implements InputManager.InputDevic
             mRStickPointer = id;
             mRBaseX = mRX = x;
             mRBaseY = mRY = y;
+            mRLastMove = mRLastTick = android.os.SystemClock.uptimeMillis();
+            mHandler.removeCallbacks(mRecenter);
+            mHandler.postDelayed(mRecenter, 16);
         } else {
             mKind[id] = K_NONE;
         }
@@ -376,6 +407,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
                 mStickY = y;
                 break;
             case K_RSTICK: {
+                if (x != mRX || y != mRY) mRLastMove = android.os.SystemClock.uptimeMillis();
                 mRX = x;
                 mRY = y;
                 float dx = x - mRBaseX, dy = y - mRBaseY, len = (float) Math.sqrt(dx * dx + dy * dy);
@@ -451,16 +483,18 @@ public final class TouchControls extends View implements InputManager.InputDevic
         mFill.setColor(mStickPointer >= 0 ? 0xA0FFFFFF : 0x60FFFFFF);
         c.drawCircle(kx, ky, mStickRadius * 0.45f, mFill);
         // Camera stick, only while touched.
-        if (mRStickPointer >= 0) {
-            mFill.setColor(0x40000000);
+        if (mRStickPointer >= 0) {  // half as opaque as the rest
+            mFill.setColor(0x20000000);
             c.drawCircle(mRBaseX, mRBaseY, mRRadius, mFill);
+            mStroke.setAlpha(0x80);
             c.drawCircle(mRBaseX, mRBaseY, mRRadius, mStroke);
+            mStroke.setAlpha(0xFF);
             float dx = mRX - mRBaseX, dy = mRY - mRBaseY, len = (float) Math.sqrt(dx * dx + dy * dy);
             if (len > mRRadius) {
                 dx = dx / len * mRRadius;
                 dy = dy / len * mRRadius;
             }
-            mFill.setColor(0xA0FFFFFF);
+            mFill.setColor(0x50FFFFFF);
             c.drawCircle(mRBaseX + dx, mRBaseY + dy, mRRadius * 0.45f, mFill);
         }
         // Buttons.
