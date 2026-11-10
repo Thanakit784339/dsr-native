@@ -8,6 +8,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <mutex>
+#include <map>
 
 #include "common/log.h"
 #include "hle/os/os.h"
@@ -105,6 +108,37 @@ void PadSetAxis(uint8_t* self, int axis, float value) {
     *slot = value;
 }
 
+// main+0x81a5dc: the pad device's GetAxis(this, axis), virtual. Diagnostics for the touch camera: which code
+// reads the right stick (axes 3, 4), logged every 10 s with the call counts, to find where the camera turns.
+std::mutex g_axis_mutex;
+std::map<std::pair<uintptr_t, int>, uint64_t> g_axis_callers;
+std::chrono::steady_clock::time_point g_axis_report;
+float PadGetAxis(uint8_t* self, int axis) {
+    const unsigned i = unsigned(axis - 3);
+    if (i > 5) return 0.0f;
+    const float v = reinterpret_cast<const float*>(self + 0x468)[i];
+    if (i <= 1) {
+        const uintptr_t ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        const loader::Module& m = GetRuntime().main;
+        std::lock_guard<std::mutex> lk(g_axis_mutex);
+        g_axis_callers[{m.Contains(ra) ? ra - m.base() : ra, axis}]++;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - g_axis_report > std::chrono::seconds(10)) {
+            g_axis_report = now;
+            std::string line;
+            for (const auto& [k, n] : g_axis_callers) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), " main+0x%lx(axis %d)x%llu", (unsigned long)k.first, k.second,
+                         (unsigned long long)n);
+                line += buf;
+            }
+            LOGI("hooks", "right stick read by:%s", line.c_str());
+            g_axis_callers.clear();
+        }
+    }
+    return v;
+}
+
 struct Hook {
     uint64_t offset;
     void* fn;
@@ -115,6 +149,7 @@ const Hook kHooks[] = {
     {0x7feb30, reinterpret_cast<void*>(&EngineLogV), "engine vlog"},
     {0x7892d8, reinterpret_cast<void*>(&EnginePanic), "DL_PANIC"},
     {0x81ad14, reinterpret_cast<void*>(&PadSetAxis), "pad axis (touch camera speed)"},
+    {0x81a5dc, reinterpret_cast<void*>(&PadGetAxis), "pad axis read (diagnostics)"},
 };
 
 }  // namespace
