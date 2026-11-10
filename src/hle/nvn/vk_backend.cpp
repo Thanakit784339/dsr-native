@@ -3902,6 +3902,9 @@ private:
             st_.color.blend_enable = 0;
             st_.channel.mask = 0xffffffffu;
         }
+        // `hole_test` 2048: no depth test for any draw into a reduced-size target that tests without writing.
+        if ((dsr::GetRuntime().config.hole_test & 2048) && depth && depth->width <= 640 && !st_.depth.depth_write)
+            st_.depth.depth_test = false;
         if ((dsr::GetRuntime().config.hole_test & 1) && st_.program[1] &&
             (st_.program[1]->hash == 0x6f634579337b2b69ull || st_.program[1]->hash == 0x3fc1b1baa8114318ull))
             st_.depth.depth_test = false;
