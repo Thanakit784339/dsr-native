@@ -411,6 +411,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "lrz_workaround")) cfg->lrz_workaround = v != 0;
             else if (!strcmp(key, "shader_depth_test")) cfg->shader_depth_test = v != 0;
             else if (!strcmp(key, "hole_test")) cfg->hole_test = v;
+            else if (!strcmp(key, "hud_box")) cfg->hud_box = v != 0;
             else if (!strcmp(key, "aspect_ratio")) {
                 cfg->aspect_ratio = value;
                 have_aspect = true;

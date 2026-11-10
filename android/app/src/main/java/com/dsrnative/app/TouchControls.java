@@ -95,32 +95,35 @@ public final class TouchControls extends View implements InputManager.InputDevic
     // per distance.
     private int mRStickPointer = -1;
     private float mRBaseX, mRBaseY, mRX, mRY, mRRadius;
-    // A thumb resting on it (not moving for a moment): the base slides under the thumb, so the camera eases to
-    // a stop instead of turning on and on.
+    // A thumb resting on it: the base slides under the thumb, so the camera eases to a stop instead of turning
+    // on and on. The slide fades in over the first moments of stillness (no jolt when it starts) and runs every
+    // display frame (Choreographer), with a short time constant.
     private long mRLastMove;
-    private long mRLastTick;
-    private static final long REST_DELAY_MS = 50;
-    private static final float RECENTER_TIME_S = 0.15f;  // time constant of the slide
-    private final Runnable mRecenter = new Runnable() {
+    private long mRLastFrameNs;
+    private static final float REST_START_S = 0.012f, REST_RAMP_S = 0.045f;  // stillness before / to full slide
+    private static final float RECENTER_TIME_S = 0.06f;  // time constant of the slide at full strength
+    private final android.view.Choreographer.FrameCallback mRecenter = new android.view.Choreographer.FrameCallback() {
         @Override
-        public void run() {
+        public void doFrame(long frameNs) {
             if (mRStickPointer < 0) return;
-            long now = android.os.SystemClock.uptimeMillis();
-            float dt = (now - mRLastTick) / 1000f;
-            mRLastTick = now;
-            if (now - mRLastMove >= REST_DELAY_MS && (mRX != mRBaseX || mRY != mRBaseY)) {
-                float k = 1f - (float) Math.exp(-dt / RECENTER_TIME_S);
+            float dt = mRLastFrameNs == 0 ? 0.016f : Math.min(0.05f, (frameNs - mRLastFrameNs) / 1e9f);
+            mRLastFrameNs = frameNs;
+            float still = (android.os.SystemClock.uptimeMillis() - mRLastMove) / 1000f;
+            float ramp = Math.max(0f, Math.min(1f, (still - REST_START_S) / REST_RAMP_S));
+            ramp = ramp * ramp * (3f - 2f * ramp);  // smoothstep
+            if (ramp > 0f && (mRX != mRBaseX || mRY != mRBaseY)) {
+                float k = 1f - (float) Math.exp(-dt * ramp / RECENTER_TIME_S);
                 mRBaseX += (mRX - mRBaseX) * k;
                 mRBaseY += (mRY - mRBaseY) * k;
                 float dx = mRX - mRBaseX, dy = mRY - mRBaseY;
-                if (dx * dx + dy * dy < 1f) {
+                if (dx * dx + dy * dy < 0.25f) {
                     mRBaseX = mRX;
                     mRBaseY = mRY;
                 }
                 sendState();
                 invalidate();
             }
-            mHandler.postDelayed(this, 16);
+            android.view.Choreographer.getInstance().postFrameCallback(this);
         }
     };
     private final float mCameraSpeed;
@@ -378,9 +381,10 @@ public final class TouchControls extends View implements InputManager.InputDevic
             mRStickPointer = id;
             mRBaseX = mRX = x;
             mRBaseY = mRY = y;
-            mRLastMove = mRLastTick = android.os.SystemClock.uptimeMillis();
-            mHandler.removeCallbacks(mRecenter);
-            mHandler.postDelayed(mRecenter, 16);
+            mRLastMove = android.os.SystemClock.uptimeMillis();
+            mRLastFrameNs = 0;
+            android.view.Choreographer.getInstance().removeFrameCallback(mRecenter);
+            android.view.Choreographer.getInstance().postFrameCallback(mRecenter);
         } else {
             mKind[id] = K_NONE;
         }

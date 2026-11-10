@@ -1422,7 +1422,7 @@ private:
             return false;
         }
         LoadDeviceFunctions(device_);
-        if (const int rw = dsr::GetRuntime().config.render_width; rw != 1280 && rw > 0) {
+        if (const int rw = dsr::GetRuntime().config.render_width; rw != 1280 && rw > 0 && dsr::GetRuntime().config.hud_box) {
             hud_box_w_ = std::min(rw, 1280);
             hud_box_h_ = hud_box_w_ * 9 / 16;
             LOGI(kTag, "aspect ratio: HUD and menus drawn in a centred %dx%d box of the %dx720 frame", hud_box_w_,
