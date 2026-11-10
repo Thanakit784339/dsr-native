@@ -4277,12 +4277,22 @@ private:
             d.dyn.vp.width *= sx;
             d.dyn.vp.y = y0 + d.dyn.vp.y * sy;
             d.dyn.vp.height *= sy;
+            // Clip rectangles (menu text windows) are in the game's 1280x720 layout units, like the vertices; one
+            // covering the whole frame (0,0 and the frame size) is the default and becomes the whole box.
             VkRect2D& sc = d.dyn.sc;
-            const int l = int(std::floor(x0 + float(sc.offset.x) * sx)), t = int(std::floor(y0 + float(sc.offset.y) * sy));
-            const int r = int(std::ceil(x0 + float(sc.offset.x + int(sc.extent.width)) * sx));
-            const int b = int(std::ceil(y0 + float(sc.offset.y + int(sc.extent.height)) * sy));
-            sc.offset = {l, t};
-            sc.extent = {uint32_t(std::max(0, r - l)), uint32_t(std::max(0, b - t))};
+            float l = x0, t = y0, r = x0 + float(hud_box_w_), b = y0 + float(hud_box_h_);
+            if (st_.scissor_set && st_.scissor[2] > 0 && st_.scissor[3] > 0 &&
+                !(st_.scissor[0] <= 0 && st_.scissor[1] <= 0 && st_.scissor[2] >= int(extent.width) &&
+                  st_.scissor[3] >= int(extent.height))) {
+                const float kx = float(hud_box_w_) / 1280.0f, ky = float(hud_box_h_) / 720.0f;
+                l = std::max(l, x0 + float(st_.scissor[0]) * kx);
+                t = std::max(t, y0 + float(st_.scissor[1]) * ky);
+                r = std::min(r, x0 + float(st_.scissor[0] + st_.scissor[2]) * kx);
+                b = std::min(b, y0 + float(st_.scissor[1] + st_.scissor[3]) * ky);
+            }
+            const int il = int(std::floor(l)), it = int(std::floor(t)), ir = int(std::ceil(r)), ib = int(std::ceil(b));
+            sc.offset = {il, it};
+            sc.extent = {uint32_t(std::max(0, ir - il)), uint32_t(std::max(0, ib - it))};
             hud_draws_boxed_++;
         }
         d.push[0] = st_.alpha_ref;
@@ -5778,10 +5788,10 @@ private:
             const uint8_t* src = reinterpret_cast<const uint8_t*>(vb.address + at);
             float x, y;
             if (fmt == 21) {
-                int16_t xy[2];
+                int16_t xy[2];  // 1/8-pixel units (0..10240 x 0..5760 for the whole screen)
                 memcpy(xy, src, 4);
-                x = xy[0];
-                y = xy[1];
+                x = xy[0] / 8.0f;
+                y = xy[1] / 8.0f;
             } else {
                 float xy[2];
                 memcpy(xy, src, 8);
