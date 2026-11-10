@@ -32,6 +32,10 @@ struct RuntimeConfig {
     // Older Adreno GPUs: storage usage and mutable format only where needed, so images keep their bandwidth
     // compression. Off by default: purple streaks on the OnePlus 6T (Adreno 630) for ~5% less GPU time.
     bool gpu_compression = false;
+    // Aspect ratio of the game's handheld (720p) output: "16:9" (the game's own), "auto" (the screen's, from
+    // screen_aspect) or "W:H". Experimental: widens the display resolution the game sets up (main+0x716170).
+    std::string aspect_ratio = "16:9";
+    float screen_aspect = 0;  // width / height of the screen (Android: the window), 0 = unknown
     // GPU driver: settings.txt `gpu_driver` (a file in DSRNative/drivers, or "system"). The Android front end
     // copies (or unzips) it into the app's private folder: gpu_driver_dir (ends in '/') holds gpu_driver_lib.
     // Empty gpu_driver_lib: the system driver.

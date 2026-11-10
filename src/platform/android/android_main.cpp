@@ -323,6 +323,9 @@ std::atomic<bool> g_touch_visible{false};  // the on-screen controls show (set b
     "# stick moves for a full turn (1 = to its edge, 2 = half that). touch_camera_invert: 1 = up looks down.\n"
 #define TOUCH_DEFAULTS "touch_controls = 1\ntouch_opacity = 0.7\ntouch_camera_speed = 1.0\ntouch_camera_invert = 0\n"
 
+#define ASPECT_HELP                                                                                          \
+    "# aspect_ratio (experimental): 16:9 = the game's own; auto = fill the screen; or width:height (e.g.\n"  \
+    "# 19.5:9, 21:9). Other ratios widen the image the game renders instead of stretching it.\n"
 #define GPU_DRIVER_HELP                                                                                      \
     "# gpu_driver: system = the phone's own Vulkan driver; or the name of a file in the drivers folder next\n" \
     "# to this file: a driver .zip as made for AdrenoTools (e.g. Mesa Turnip) or a bare .so\n"                 \
@@ -379,7 +382,8 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "gpu_driver = system\n"
                     BC_ENABLER_HELP
                     "bc_enabler = 1\n"
-                    TOUCH_HELP TOUCH_DEFAULTS,
+                    TOUCH_HELP TOUCH_DEFAULTS
+                    ASPECT_HELP "aspect_ratio = 16:9\n",
                     cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0,
                     cfg->gamma, cfg->exposure);
             fclose(w);
@@ -389,7 +393,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
         }
     } else {
         bool have_present_mode = false, have_face_buttons = false, have_gpu_driver = false, have_bc_enabler = false;
-        bool have_touch = false;
+        bool have_touch = false, have_aspect = false;
         char line[256];
         while (fgets(line, sizeof(line), f)) {
             char key[64], value[64];
@@ -407,7 +411,10 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "lrz_workaround")) cfg->lrz_workaround = v != 0;
             else if (!strcmp(key, "shader_depth_test")) cfg->shader_depth_test = v != 0;
             else if (!strcmp(key, "hole_test")) cfg->hole_test = v;
-            else if (!strcmp(key, "touch_controls")) {
+            else if (!strcmp(key, "aspect_ratio")) {
+                cfg->aspect_ratio = value;
+                have_aspect = true;
+            } else if (!strcmp(key, "touch_controls")) {
                 g_touch.enabled = v != 0;
                 have_touch = true;
             } else if (!strcmp(key, "touch_opacity")) {
@@ -458,6 +465,12 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                 fputs("\n" FACE_BUTTONS_HELP "face_buttons = label\n", w);
                 fclose(w);
                 LOGI(kTag, "settings: added face_buttons to %s", path.c_str());
+            }
+        if (!have_aspect)
+            if (FILE* w = fopen(path.c_str(), "a")) {
+                fputs("\n" ASPECT_HELP "aspect_ratio = 16:9\n", w);
+                fclose(w);
+                LOGI(kTag, "settings: added aspect_ratio to %s", path.c_str());
             }
         if (!have_touch)
             if (FILE* w = fopen(path.c_str(), "a")) {
@@ -857,6 +870,11 @@ void StartGame(android_app* app) {
     mkdir(cfg.save_dir.c_str(), 0775);
     mkdir(cfg.cache_dir.c_str(), 0775);
     LoadSettings(base + "/settings.txt", &cfg);
+    if (app->window) {
+        const int ww = ANativeWindow_getWidth(app->window), wh = ANativeWindow_getHeight(app->window);
+        if (ww > 0 && wh > 0) cfg.screen_aspect = float(std::max(ww, wh)) / float(std::min(ww, wh));
+        LOGI(kTag, "screen %dx%d, aspect_ratio %s", ww, wh, cfg.aspect_ratio.c_str());
+    }
     PrepareGpuDriver(app, base, &cfg);
     if (!FileExists(cfg.game_dir + "/exefs/main") && base != old_dir && FileExists(old_dir + "/game/exefs/main")) {
         LOGW(kTag, "game files are still in %s/game: using them from there; move them to %s/game", old_dir.c_str(),
