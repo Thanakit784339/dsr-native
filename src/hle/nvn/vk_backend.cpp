@@ -781,6 +781,7 @@ public:
             pass_draws_ = 0;
             query_pass_.clear();
             capture_draws_logged_ = 0;
+            geo_dumps_ = 0;
             if (!query_pool_) {  // requested captures had no pool: no per-draw sample counts
                 VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
                 qi.queryType = VK_QUERY_TYPE_OCCLUSION;
@@ -991,6 +992,7 @@ public:
     }
     void FinishCapture() {
         capture_draws_logged_ = 0;
+        geo_dumps_ = 0;
         WaitGpuIdle();  // the readback buffers are written by the submission that just went out
         capture_active_ = false;
         if (ts_pool_ && ts_count_ > 1) {
@@ -3853,32 +3855,56 @@ private:
                 snprintf(b, sizeof(b), " %u:s%u fmt %d +%u", a.location, a.binding, st_.attribs[a.location].format, a.offset);
                 desc += b;
             }
-            // Skinned draws: the highest bone index the drawn vertices use (RGBA8UI attribute), and what the bone
-            // palette (vs c3) holds there, as 4x4 and 3x4 matrices (vanishing body parts of a dying knight).
-            for (const VkVertexInputAttributeDescription& a : vin.attributes) {
-                if (st_.attribs[a.location].format != 39) continue;
-                const BufferRange& r = st_.vertex_buffers[a.binding];
-                const uint32_t stride = a.binding < st_.streams.size() ? uint32_t(st_.streams[a.binding].stride) : 0;
-                if (!stride || !r.address || !GuestRangeValid(r.address, size_t(r.size))) break;
-                uint32_t mx = 0;
-                for (uint64_t at = a.offset; at + 4 <= r.size; at += stride) {
-                    const uint8_t* v = reinterpret_cast<const uint8_t*>(r.address + at);
-                    mx = std::max({mx, uint32_t(v[0]), uint32_t(v[1]), uint32_t(v[2]), uint32_t(v[3])});
-                }
-                const BufferRange& pal = st_.uniforms[0][0];  // vs c3
-                snprintf(b, sizeof(b), " | bone indices up to %u (palette %llu bytes:", mx, (unsigned long long)pal.size);
-                desc += b;
-                for (uint32_t row : {mx * 4, mx * 3}) {
-                    const uint64_t off = uint64_t(row) * 16;
-                    if (pal.address && GuestRangeValid(pal.address + off, 16)) {
-                        float f[4];
-                        memcpy(f, reinterpret_cast<const void*>(pal.address + off), 16);
-                        snprintf(b, sizeof(b), " row %u: %g %g %g %g;", row, f[0], f[1], f[2], f[3]);
-                        desc += b;
+            // Geometry dump (square holes in fog / smoke / glow): for the effect fragment shaders, the draw's index
+            // data, the vertices it reads and the vertex shader's c3, so the vertex shader can be run offline on them.
+            {
+                const uint64_t fs_hash = st_.program[1] ? st_.program[1]->hash : 0;
+                const bool effect = fs_hash == 0x6f634579337b2b69ull || fs_hash == 0x3fc1b1baa8114318ull;
+                const int isz = p.index_type == 0 ? 1 : p.index_type == 1 ? 2 : p.index_type == 2 ? 4 : 0;
+                if (effect && geo_dumps_ < 4 && isz && p.count > 0 && p.count <= 16384 && p.index_address &&
+                    GuestRangeValid(p.index_address, size_t(p.count) * isz) && !vin.bindings.empty()) {
+                    geo_dumps_++;
+                    const VkVertexInputBindingDescription& vb0 = vin.bindings[0];
+                    const BufferRange& r = st_.vertex_buffers[vb0.binding];
+                    const uint8_t* ip = reinterpret_cast<const uint8_t*>(p.index_address);
+                    uint32_t lo = UINT32_MAX, hi = 0;
+                    for (int k = 0; k < p.count; k++) {
+                        uint32_t v = isz == 1 ? ip[k] : isz == 2 ? reinterpret_cast<const uint16_t*>(ip)[k]
+                                                                  : reinterpret_cast<const uint32_t*>(ip)[k];
+                        lo = std::min(lo, v);
+                        hi = std::max(hi, v);
                     }
+                    const uint64_t vstart = uint64_t(int64_t(lo) + p.base_vertex) * vb0.stride;
+                    const uint64_t vbytes = uint64_t(hi - lo + 1) * vb0.stride;
+                    const BufferRange& c3 = st_.uniforms[0][0];
+                    LOGI(kTag, "capture geo q%d: mode %d, index size %d, count %d, base vertex %d, vertices %u..%u stride %u, "
+                         "vs c3 %llu bytes", d.query == UINT32_MAX ? -1 : int(d.query), p.mode, isz, p.count, p.base_vertex,
+                         lo, hi, vb0.stride, (unsigned long long)c3.size);
+                    const auto dump = [&](const char* what, uint64_t addr, uint64_t bytes) {
+                        if (!addr || bytes > (1u << 20) || !GuestRangeValid(addr, size_t(bytes))) {
+                            LOGI(kTag, "capture geo q%d %s: unavailable", int(d.query), what);
+                            return;
+                        }
+                        static const char* kB64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                        const uint8_t* src = reinterpret_cast<const uint8_t*>(addr);
+                        std::string out;
+                        out.reserve(size_t(bytes) * 4 / 3 + 4);
+                        for (uint64_t k = 0; k < bytes; k += 3) {
+                            uint32_t v = uint32_t(src[k]) << 16;
+                            if (k + 1 < bytes) v |= uint32_t(src[k + 1]) << 8;
+                            if (k + 2 < bytes) v |= src[k + 2];
+                            out += kB64[v >> 18 & 63];
+                            out += kB64[v >> 12 & 63];
+                            out += k + 1 < bytes ? kB64[v >> 6 & 63] : '=';
+                            out += k + 2 < bytes ? kB64[v & 63] : '=';
+                        }
+                        for (size_t at = 0, part = 0; at < out.size(); at += 3000, part++)
+                            LOGI(kTag, "capture geo q%d %s %zu: %s", int(d.query), what, part, out.substr(at, 3000).c_str());
+                    };
+                    dump("indices", p.index_address, uint64_t(p.count) * isz);
+                    dump("vertices", r.address + vstart, vbytes);
+                    dump("c3", c3.address, c3.size);
                 }
-                desc += ")";
-                break;
             }
             desc += " | uniforms:";
             for (int stage = 0; stage < 2; stage++)
@@ -5081,6 +5107,7 @@ private:
     std::set<std::string> view_mismatch_logged_;
     uint64_t view_standins_ = 0;
     int capture_draws_logged_ = 0;
+    int geo_dumps_ = 0;
     std::unordered_map<uint64_t, uint64_t> snapshot_gen_;
     double exec_ms_ = 0, wait_ms_ = 0;
     VkDescriptorPool desc_pool_ = VK_NULL_HANDLE;
