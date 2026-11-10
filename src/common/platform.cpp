@@ -83,6 +83,37 @@ std::string CpusetOf(pid_t tid) {
     cpus[strcspn(cpus, "\n")] = 0;
     return std::string(name[0] ? name : "?") + " (" + (cpus[0] ? cpus : "?") + ")";
 }
+// Online CPUs and their current clocks, e.g. "0:1766 1:1766 2:- 3:- 4:2803 ..." (MHz; "-" = offline). Phones
+// take cores offline when hot (thermal) or idle: the affinity resets on the 6T came with that.
+std::string CpuState() {
+    std::string out;
+    for (int cpu = 0; cpu < 16; cpu++) {
+        char path[96];
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/online", cpu);
+        int online = 1;
+        if (FILE* f = fopen(path, "r")) {
+            if (fscanf(f, "%d", &online) != 1) online = 1;
+            fclose(f);
+        } else if (cpu > 0) {
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d", cpu);
+            if (FILE* d = fopen(path, "r")) fclose(d);
+            else break;  // no such CPU
+        }
+        long khz = 0;
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", cpu);
+        if (online)
+            if (FILE* f = fopen(path, "r")) {
+                if (fscanf(f, "%ld", &khz) != 1) khz = 0;
+                fclose(f);
+            }
+        char item[32];
+        if (!online) snprintf(item, sizeof(item), "%d:off ", cpu);
+        else if (khz) snprintf(item, sizeof(item), "%d:%ld ", cpu, khz / 1000);
+        else snprintf(item, sizeof(item), "%d:on ", cpu);
+        out += item;
+    }
+    return out;
+}
 void WatchAffinity() {
     pthread_setname_np(pthread_self(), "dsr-affinity");
     const FastCores& fc = GetFastCores();
@@ -115,7 +146,8 @@ void WatchAffinity() {
             summary_at += std::chrono::seconds(10);
             if (restored || refused)
                 LOGI("platform", "CPU affinity of the busy threads reset by the system and restored %d times in the "
-                     "last 10 s (%d refused: app in the background?)", restored, refused);
+                     "last 10 s (%d refused: none of CPUs%s online/allowed); CPUs now: %s", restored, refused,
+                     fc.list.c_str(), CpuState().c_str());
             restored = refused = 0;
         }
     }
