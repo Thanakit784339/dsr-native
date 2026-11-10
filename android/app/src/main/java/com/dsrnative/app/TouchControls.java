@@ -90,8 +90,9 @@ public final class TouchControls extends View implements InputManager.InputDevic
     // Stick: fixed in place; a finger that comes down on it (or near it) drives it.
     private int mStickPointer = -1;
     private float mStickBaseX, mStickBaseY, mStickX, mStickY, mStickRadius;
-    // Camera stick: invisible; it starts under a finger that touches the right side and its base follows a
-    // finger that goes past its edge. `camera speed` = deflection per distance.
+    // Camera stick: shown faintly only while touched; it appears under a finger that touches the right side and
+    // its base follows a finger that goes past its edge. Smaller than the left stick; `camera speed` = deflection
+    // per distance.
     private int mRStickPointer = -1;
     private float mRBaseX, mRBaseY, mRX, mRY, mRRadius;
     // A thumb resting on it (not moving for a moment): the base slides under the thumb, so the camera eases to
@@ -287,7 +288,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
         place(L3, 4.7f * u, h - 0.9f * u, 1.0f * u, 1.0f * u);
         // Stick: resting spot, and the area where a finger grabs it.
         mStickRadius = 1.6f * u;
-        mRRadius = 2.1f * u;
+        mRRadius = 1.05f * u;
         mStickBaseX = 2.8f * u;
         mStickBaseY = h - 3.0f * u;
         mText.setTextSize(0.45f * u);
@@ -482,7 +483,22 @@ public final class TouchControls extends View implements InputManager.InputDevic
         }
         mFill.setColor(mStickPointer >= 0 ? 0xA0FFFFFF : 0x60FFFFFF);
         c.drawCircle(kx, ky, mStickRadius * 0.45f, mFill);
-        // The camera stick is not drawn (invisible by design).
+        // Camera stick, only while touched, faint: 10% opaque on screen (whatever touch_opacity is).
+        if (mRStickPointer >= 0) {
+            final int a = Math.max(1, Math.min(255, Math.round(255 * 0.10f / Math.max(0.1f, getAlpha()))));
+            mFill.setColor(a << 24);
+            c.drawCircle(mRBaseX, mRBaseY, mRRadius, mFill);
+            mStroke.setAlpha(a);
+            c.drawCircle(mRBaseX, mRBaseY, mRRadius, mStroke);
+            mStroke.setAlpha(0xFF);
+            float dx = mRX - mRBaseX, dy = mRY - mRBaseY, len = (float) Math.sqrt(dx * dx + dy * dy);
+            if (len > mRRadius) {
+                dx = dx / len * mRRadius;
+                dy = dy / len * mRRadius;
+            }
+            mFill.setColor((a << 24) | 0xFFFFFF);
+            c.drawCircle(mRBaseX + dx, mRBaseY + dy, mRRadius * 0.45f, mFill);
+        }
         // Buttons.
         for (Button b : mButtons) {
             boolean on = b.pressCount > 0;

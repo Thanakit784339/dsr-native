@@ -16,6 +16,7 @@
 #include <map>
 
 #include "common/log.h"
+#include "hle/os/heap.h"
 #include "hle/os/os.h"
 #include <atomic>
 
@@ -95,6 +96,62 @@ void EnginePanic(const char* file, int line, const char* fmt, ...) {
     const char* base = file ? strrchr(file, '/') : nullptr;
     FATAL("engine", "DL_PANIC: %s  (%s:%d, called from main+0x%lx)", msg, base ? base + 1 : (file ? file : "?"), line,
           (unsigned long)GuestOffset(__builtin_return_address(0)));
+}
+
+// ---- aspect ratio: camera aspect (experimental) --------------------------------------------------------------
+// With a wider or narrower render resolution the 3D view still came out stretched: the camera that renders the
+// scene keeps a 16:9 aspect ratio. Cameras keep {fov, aspect, near, far} at +0x50..+0x5c (main+0xfa7f4 reads
+// fov and aspect for the view frustum). This scans the guest heap and the game's data for such blocks with a
+// 16:9 aspect, logs them (with the owner's vtable, to find the code that sets it) and writes the wanted aspect
+// into them, again every 250 ms (rescanning every 20 s).
+float g_aspect = 0;
+void CameraAspectThread() {
+    pthread_setname_np(pthread_self(), "dsr-aspect");
+    const loader::Module& m = GetRuntime().main;
+    std::vector<float*> found;
+    int scans = 0;
+    auto plausible = [](const float* a) {  // a = &aspect: fov before it, near and far after
+        const float fov = a[-1], nearz = a[1], farz = a[2];
+        return fov > 0.2f && fov < 2.5f && nearz > 0.001f && nearz < 50.0f && farz > nearz && farz < 1e6f;
+    };
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(scans == 0 ? 20 : 20));
+        // Scan: 16:9 exactly (0x3FE38E39) at a 4-byte boundary.
+        uintptr_t hb = 0;
+        size_t hs = 0;
+        hle::os::GuestHeapRange(&hb, &hs);
+        std::vector<std::pair<uintptr_t, size_t>> ranges;
+        if (hb && hs) ranges.push_back({hb, hs});
+        if (m.size() > 0x1ae2000)
+            ranges.push_back({m.base() + 0x1ae2000, std::min<size_t>(m.size() - 0x1ae2000, 0x7d65f8 + 0x3339a08)});  // .data + .bss
+        int new_found = 0;
+        for (const auto& [base, size] : ranges) {
+            const uint32_t* p = reinterpret_cast<const uint32_t*>(base + 4);
+            const uint32_t* end = reinterpret_cast<const uint32_t*>(base + size - 12);
+            for (; p < end; p++) {
+                if (*p != 0x3FE38E39u) continue;
+                float* a = reinterpret_cast<float*>(const_cast<uint32_t*>(p));
+                if (!plausible(a)) continue;
+                if (std::find(found.begin(), found.end(), a) != found.end()) continue;
+                found.push_back(a);
+                new_found++;
+                const uintptr_t obj = reinterpret_cast<uintptr_t>(a) - 0x54;
+                uintptr_t vt = 0;
+                if ((obj & 7) == 0) memcpy(&vt, reinterpret_cast<const void*>(obj), 8);
+                if (found.size() <= 40)
+                    LOGI("hooks", "camera aspect: 16:9 at %p (fov %.3f near %.3f far %.1f), object vtable %s0x%lx", a,
+                         a[-1], a[1], a[2], m.Contains(vt) ? "main+" : "", (unsigned long)(m.Contains(vt) ? vt - m.base() : vt));
+            }
+        }
+        scans++;
+        LOGI("hooks", "camera aspect: scan %d: %d new 16:9 cameras, %zu in all; setting them to %.3f", scans, new_found,
+             found.size(), g_aspect);
+        for (int k = 0; k < 80; k++) {  // 20 s of rewrites at 250 ms
+            for (float* a : found)
+                if (*a > 1.7777f && *a < 1.7779f && plausible(a)) *a = g_aspect;
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+    }
 }
 
 struct Hook {
@@ -182,9 +239,12 @@ void InstallGameHooks() {
             if (width != 1280)
                 ok = ok && rt.main.PatchInstruction(0x6a170c, 0x5280A002, mov(2, width), &err) &&
                      rt.main.PatchInstruction(0x716170, 0x5280A001, mov(1, width), &err);
-            if (ok)
+            if (ok) {
                 LOGI("hooks", "aspect ratio %s (%.3f): the game renders at %dx%d (was 1280x720)",
                      rt.config.aspect_ratio.c_str(), ar, width, height);
+                g_aspect = float(width) / float(height);
+                std::thread(CameraAspectThread).detach();
+            }
             else
                 LOGW("hooks", "aspect ratio patch failed: %s", err.c_str());
         } else {

@@ -47,6 +47,12 @@ void InsertFree(uintptr_t start, size_t size) {
 }
 }  // namespace
 
+void GuestHeapRange(uintptr_t* base, size_t* size) {
+    std::lock_guard<std::mutex> lk(g_heap_mutex);
+    *base = g_heap_base;
+    *size = g_heap_size;
+}
+
 bool GuestHeapContains(const void* p) {
     auto a = reinterpret_cast<uintptr_t>(p);
     return g_heap_base && a >= g_heap_base && a < g_heap_base + g_heap_size;
