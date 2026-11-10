@@ -36,7 +36,7 @@ struct RuntimeConfig {
     // screen_aspect) or "W:H". Experimental: widens the display resolution the game sets up (main+0x716170).
     std::string aspect_ratio = "16:9";
     float screen_aspect = 0;  // width / height of the screen (Android: the window), 0 = unknown
-    bool hud_box = false;     // other aspect ratios: draw the 2D shader's HUD/menu draws in a 16:9 box (test)
+    bool hud_box = true;      // other aspect ratios: keep the HUD and menus in a centred 16:9 box
     int render_width = 1280;  // the game's render width once aspect_ratio is applied (height 720)
     // GPU driver: settings.txt `gpu_driver` (a file in DSRNative/drivers, or "system"). The Android front end
     // copies (or unzips) it into the app's private folder: gpu_driver_dir (ends in '/') holds gpu_driver_lib.

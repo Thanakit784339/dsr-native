@@ -4264,12 +4264,13 @@ private:
         d.set_layouts[0] = vsl;
         d.set_layouts[1] = fsl;
         DynamicState(extent, modes, &d.dyn);
-        // Other aspect ratios (aspect_ratio): the game draws its HUD and menus for 1280x720, stretched over the
-        // whole (wider or narrower) frame. Their draws (the game's 2D vertex shader, on the full-size target) go
-        // into a centred 16:9 box instead: centred 1280x720 on wider frames, the full width and 9/16 of it high
-        // on narrower ones, so they keep their shape and usual places.
-        if (hud_box_w_ && st_.program[0]->hash == 0x874d9c49347a2695ull && extent.height == 720 &&
-            int(extent.width) == dsr::GetRuntime().config.render_width) {
+        // Other aspect ratios (aspect_ratio): the game lays its HUD and menus out for 1280x720 and stretches that
+        // over the whole (wider or narrower) frame. Every draw made with that 1280x720 2D projection (several
+        // shaders: quads, text, bars) goes into a centred 16:9 box instead: 1280x720 in the middle of wider frames,
+        // the full width and 9/16 of it high on narrower ones, so the HUD keeps its shape and layout. Full-screen
+        // quads (fades, dimming behind menus) still cover the whole frame.
+        if (hud_box_w_ && extent.height == 720 && int(extent.width) == dsr::GetRuntime().config.render_width &&
+            HudBoxed(p, vin)) {
             const float sx = float(hud_box_w_) / float(extent.width), sy = float(hud_box_h_) / 720.0f;
             const float x0 = float((int(extent.width) - hud_box_w_) / 2), y0 = float((720 - hud_box_h_) / 2);
             d.dyn.vp.x = x0 + d.dyn.vp.x * sx;
@@ -5734,7 +5735,72 @@ private:
     uint64_t upload_hits_ = 0, upload_bytes_ = 0;
     uint64_t depth_gen_ = 0;
     // HUD box for other aspect ratios (see Draw): size, 0 = off.
+    // Whether a draw on the final frame is one of the game's 2D HUD / menu draws to keep in a 16:9 box: its vertex
+    // shader's c3 is the 2D projection for a 1280x720 layout (x * 2/1280 - 1, y * -2/720 + 1), and its vertices do
+    // not cover the whole 1280x720 screen (full-screen fades and dimming are left to fill the frame).
+    bool HudBoxed(const DrawParams& p, const VertexInput& vin) {
+        const BufferRange& c3 = st_.uniforms[0][0];
+        if (!c3.address || c3.size < 64 || !GuestRangeValid(c3.address, 64)) return false;
+        float m[16];
+        memcpy(m, reinterpret_cast<const void*>(c3.address), sizeof(m));
+        if (std::fabs(m[0] - 2.0f / 1280.0f) > 1e-6f || std::fabs(m[5] + 2.0f / 720.0f) > 1e-6f || m[1] != 0.0f ||
+            m[4] != 0.0f || std::fabs(m[3] + 1.0f) > 1e-4f || std::fabs(m[7] - 1.0f) > 1e-4f)
+            return false;
+        const uint64_t hash = st_.program[0]->hash;
+        if (hud_box_logged_.insert(hash).second)
+            LOGI(kTag, "aspect ratio: HUD vertex shader %016llx drawn in the 16:9 box", (unsigned long long)hash);
+        // The position attribute (location 0): its stream, format and the vertices the draw reads.
+        const VkVertexInputAttributeDescription* pos = nullptr;
+        for (const VkVertexInputAttributeDescription& a : vin.attributes)
+            if (a.location == 0) pos = &a;
+        if (!pos || p.count <= 0 || p.count > 4096 || p.instances != 1) return true;
+        uint32_t stride = 0;
+        for (const VkVertexInputBindingDescription& b : vin.bindings)
+            if (b.binding == pos->binding) stride = b.stride;
+        const int fmt = st_.attribs[0].format;
+        if (fmt != 21 && fmt != 22 && fmt != 34 && fmt != 46) return true;
+        const BufferRange& vb = st_.vertex_buffers[pos->binding];
+        const int isz = p.index_type == 0 ? 1 : p.index_type == 1 ? 2 : p.index_type == 2 ? 4 : 0;
+        if (isz && (!p.index_address || !GuestRangeValid(p.index_address, size_t(p.count) * isz))) return true;
+        float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;
+        for (int k = 0; k < p.count; k++) {
+            int64_t v;
+            if (isz) {
+                const uint8_t* ip = reinterpret_cast<const uint8_t*>(p.index_address);
+                v = isz == 1 ? ip[k] : isz == 2 ? reinterpret_cast<const uint16_t*>(ip)[k]
+                                                : int64_t(reinterpret_cast<const uint32_t*>(ip)[k]);
+                v += p.base_vertex;
+            } else {
+                v = int64_t(p.first) + k;
+            }
+            if (v < 0) return true;
+            const uint64_t at = uint64_t(v) * stride + pos->offset;
+            if (!vb.address || at + 8 > vb.size || !GuestRangeValid(vb.address + at, 8)) return true;
+            const uint8_t* src = reinterpret_cast<const uint8_t*>(vb.address + at);
+            float x, y;
+            if (fmt == 21) {
+                int16_t xy[2];
+                memcpy(xy, src, 4);
+                x = xy[0];
+                y = xy[1];
+            } else {
+                float xy[2];
+                memcpy(xy, src, 8);
+                x = xy[0];
+                y = xy[1];
+            }
+            x0 = std::min(x0, x);
+            x1 = std::max(x1, x);
+            y0 = std::min(y0, y);
+            y1 = std::max(y1, y);
+        }
+        const bool full = x0 <= 2.0f && x1 >= 1278.0f && y0 <= 2.0f && y1 >= 718.0f;
+        if (full) hud_full_screen_++;
+        return !full;
+    }
     int hud_box_w_ = 0, hud_box_h_ = 0;
+    std::unordered_set<uint64_t> hud_box_logged_;
+    uint64_t hud_full_screen_ = 0;
     uint64_t hud_draws_boxed_ = 0;
     int viewports_logged_ = 0;
     int image_binds_logged_ = 0;
