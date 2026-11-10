@@ -306,6 +306,22 @@ void LogDeviceInfo() {
     "# immediate (no vsync, can tear). Falls back to fifo if the device does not offer the mode.\n"
 
 bool g_face_by_position = false;  // `face_buttons` setting (see KeyToButton)
+// Touch controls settings (see TOUCH_HELP).
+struct TouchSettings {
+    bool enabled = true;
+    float opacity = 0.7f;
+    float camera_speed = 1.0f;
+    bool camera_invert = false;
+} g_touch;
+std::atomic<bool> g_touch_visible{false};  // the on-screen controls show (set by TouchControls.java)
+
+#define TOUCH_HELP                                                                                            \
+    "# Touch controls: a floating stick on the left half, the Switch buttons around the edges (LOCK = lock-on,\n" \
+    "# the right stick press); swipe anywhere else to turn the camera. They hide when a controller is\n"        \
+    "# connected or used; double-tap the screen to bring them back.\n"                                         \
+    "# touch_controls: 1 = on, 0 = off. touch_opacity: 0.1 to 1. touch_camera_speed: camera turn speed for\n"   \
+    "# swipes (1 = normal, 2 = twice as fast). touch_camera_invert: 1 = swipe up to look down.\n"
+#define TOUCH_DEFAULTS "touch_controls = 1\ntouch_opacity = 0.7\ntouch_camera_speed = 1.0\ntouch_camera_invert = 0\n"
 
 #define GPU_DRIVER_HELP                                                                                      \
     "# gpu_driver: system = the phone's own Vulkan driver; or the name of a file in the drivers folder next\n" \
@@ -362,7 +378,8 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     GPU_DRIVER_HELP
                     "gpu_driver = system\n"
                     BC_ENABLER_HELP
-                    "bc_enabler = 1\n",
+                    "bc_enabler = 1\n"
+                    TOUCH_HELP TOUCH_DEFAULTS,
                     cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0,
                     cfg->gamma, cfg->exposure);
             fclose(w);
@@ -372,6 +389,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
         }
     } else {
         bool have_present_mode = false, have_face_buttons = false, have_gpu_driver = false, have_bc_enabler = false;
+        bool have_touch = false;
         char line[256];
         while (fgets(line, sizeof(line), f)) {
             char key[64], value[64];
@@ -389,7 +407,18 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "lrz_workaround")) cfg->lrz_workaround = v != 0;
             else if (!strcmp(key, "shader_depth_test")) cfg->shader_depth_test = v != 0;
             else if (!strcmp(key, "hole_test")) cfg->hole_test = v;
-            else if (!strcmp(key, "bc_enabler")) {
+            else if (!strcmp(key, "touch_controls")) {
+                g_touch.enabled = v != 0;
+                have_touch = true;
+            } else if (!strcmp(key, "touch_opacity")) {
+                const float o = float(atof(value));
+                g_touch.opacity = o >= 0.1f && o <= 1.0f ? o : 0.7f;
+            } else if (!strcmp(key, "touch_camera_speed")) {
+                const float sp = float(atof(value));
+                g_touch.camera_speed = sp >= 0.1f && sp <= 10.0f ? sp : 1.0f;
+            } else if (!strcmp(key, "touch_camera_invert")) {
+                g_touch.camera_invert = v != 0;
+            } else if (!strcmp(key, "bc_enabler")) {
                 cfg->bc_enabler = v != 0;
                 have_bc_enabler = true;
             } else if (!strcmp(key, "gpu_driver")) {
@@ -430,6 +459,12 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                 fclose(w);
                 LOGI(kTag, "settings: added face_buttons to %s", path.c_str());
             }
+        if (!have_touch)
+            if (FILE* w = fopen(path.c_str(), "a")) {
+                fputs("\n" TOUCH_HELP TOUCH_DEFAULTS, w);
+                fclose(w);
+                LOGI(kTag, "settings: added the touch controls settings to %s", path.c_str());
+            }
         if (!have_gpu_driver)
             if (FILE* w = fopen(path.c_str(), "a")) {
                 fputs("\n" GPU_DRIVER_HELP "gpu_driver = system\n", w);
@@ -449,6 +484,9 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
          cfg->profile ? "on" : "off", cfg->gamma, cfg->exposure, cfg->present_mode.c_str(),
          g_face_by_position ? "position" : "label");
     LOGI(kTag, "settings: gpu_driver %s, bc_enabler %d", cfg->gpu_driver.c_str(), int(cfg->bc_enabler));
+    LOGI(kTag, "settings: touch controls %s, opacity %.2f, camera speed %.2f%s", g_touch.enabled ? "on" : "off",
+         g_touch.opacity, g_touch.camera_speed, g_touch.camera_invert ? ", camera inverted" : "");
+    dsr::input::SetLookSpeed(g_touch.camera_speed, g_touch.camera_invert);
     if (!cfg->shader_depth_test) LOGI(kTag, "settings: shader_depth_test off");
     if (cfg->hole_test || cfg->lrz_workaround)
         LOGI(kTag, "settings: hole_test %d, lrz_workaround %d", cfg->hole_test, int(cfg->lrz_workaround));
@@ -718,6 +756,75 @@ void PrepareGpuDriver(android_app* app, const std::string& base, dsr::RuntimeCon
     cfg->gpu_driver_lib = lib;
 }
 
+// ---- touch controls (com.dsrnative.app.TouchControls) -------------------------------------------------------
+void JNICALL TouchNativeState(JNIEnv*, jclass, jint buttons, jfloat lx, jfloat ly) {
+    dsr::input::SetTouch(uint64_t(uint32_t(buttons)), lx, ly);
+}
+void JNICALL TouchNativeLook(JNIEnv*, jclass, jfloat dx, jfloat dy) { dsr::input::AddLook(dx, dy); }
+void JNICALL TouchNativeVisible(JNIEnv*, jclass, jboolean visible) {
+    g_touch_visible = visible != JNI_FALSE;
+    if (!visible) dsr::input::SetTouch(0, 0, 0);
+    LOGI(kTag, "touch controls %s", visible ? "shown" : "hidden");
+}
+jclass g_touch_cls = nullptr;  // global ref
+JNIEnv* g_glue_env = nullptr;  // the app glue thread's JNI environment (attached once, for the whole run)
+
+JNIEnv* GlueEnv(android_app* app) {
+    if (!g_glue_env) {
+        JavaVM* vm = app->activity->vm;
+        if (vm->GetEnv(reinterpret_cast<void**>(&g_glue_env), JNI_VERSION_1_6) != JNI_OK || !g_glue_env)
+            if (vm->AttachCurrentThread(&g_glue_env, nullptr) != JNI_OK) g_glue_env = nullptr;
+    }
+    return g_glue_env;
+}
+
+// Creates the overlay (TouchControls.attach) on the app glue thread, once the game starts.
+void StartTouchControls(android_app* app) {
+    JNIEnv* env = GlueEnv(app);
+    if (!env) return;
+    jobject activity = app->activity->clazz;
+    jclass act_cls = env->GetObjectClass(activity);
+    jmethodID get_loader = env->GetMethodID(act_cls, "getClassLoader", "()Ljava/lang/ClassLoader;");
+    jobject loader = env->CallObjectMethod(activity, get_loader);
+    jclass loader_cls = env->FindClass("java/lang/ClassLoader");
+    jmethodID load = env->GetMethodID(loader_cls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+    jstring name = env->NewStringUTF("com.dsrnative.app.TouchControls");
+    auto cls = static_cast<jclass>(env->CallObjectMethod(loader, load, name));
+    env->DeleteLocalRef(name);
+    if (env->ExceptionCheck() || !cls) {
+        env->ExceptionClear();
+        LOGW(kTag, "touch controls: class not found");
+        return;
+    }
+    const JNINativeMethod methods[] = {
+        {const_cast<char*>("nativeState"), const_cast<char*>("(IFF)V"), reinterpret_cast<void*>(&TouchNativeState)},
+        {const_cast<char*>("nativeLook"), const_cast<char*>("(FF)V"), reinterpret_cast<void*>(&TouchNativeLook)},
+        {const_cast<char*>("nativeVisible"), const_cast<char*>("(Z)V"), reinterpret_cast<void*>(&TouchNativeVisible)},
+    };
+    if (env->RegisterNatives(cls, methods, 3) != JNI_OK || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        LOGW(kTag, "touch controls: could not register natives");
+        return;
+    }
+    g_touch_cls = static_cast<jclass>(env->NewGlobalRef(cls));
+    jmethodID attach = env->GetStaticMethodID(cls, "attach", "(Landroid/app/Activity;FZ)V");
+    if (attach) env->CallStaticVoidMethod(cls, attach, activity, jfloat(g_touch.opacity), jboolean(g_touch.enabled));
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+}
+
+// A controller was used while the touch controls show: hide them.
+void HideTouchControlsForController(android_app* app) {
+    if (!g_touch_visible.exchange(false) || !g_touch_cls) return;
+    JNIEnv* env = GlueEnv(app);
+    if (!env) return;
+    static jmethodID used = env->GetStaticMethodID(g_touch_cls, "controllerUsed", "(Landroid/app/Activity;)V");
+    if (used) env->CallStaticVoidMethod(g_touch_cls, used, app->activity->clazz);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+}
+
 void StartGame(android_app* app) {
     if (g_game_started) return;
     // Wait for the answer to the storage access request (the settings screen is up on a first launch).
@@ -774,6 +881,7 @@ void StartGame(android_app* app) {
         LOGE(kTag, "  adb push DarkSoulsR/. %s/", cfg.game_dir.c_str());
         return;
     }
+    StartTouchControls(app);
     std::thread([cfg] {
         std::string err;
         if (!dsr::LoadGame(cfg, &err)) {
@@ -817,10 +925,15 @@ uint64_t KeyToButton(int32_t key) {
     }
 }
 
-int32_t OnInput(android_app*, AInputEvent* ev) {
+int32_t OnInput(android_app* app, AInputEvent* ev) {
     using namespace dsr::input;
     const int32_t type = AInputEvent_getType(ev);
     if (type == AINPUT_EVENT_TYPE_KEY) {
+        const int32_t src = AInputEvent_getSource(ev);
+        if (g_touch_visible && KeyToButton(AKeyEvent_getKeyCode(ev)) &&
+            ((src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD || (src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK ||
+             (src & AINPUT_SOURCE_DPAD) == AINPUT_SOURCE_DPAD))
+            HideTouchControlsForController(app);
         static int logged = 0;
         const int32_t code = AKeyEvent_getKeyCode(ev);
         uint64_t b = KeyToButton(code);
@@ -848,6 +961,12 @@ int32_t OnInput(android_app*, AInputEvent* ev) {
         return 1;
     }
     if (type == AINPUT_EVENT_TYPE_MOTION && (AInputEvent_getSource(ev) & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK) {
+        if (g_touch_visible) {
+            float m = 0;
+            for (int32_t axis : {AMOTION_EVENT_AXIS_X, AMOTION_EVENT_AXIS_Y, AMOTION_EVENT_AXIS_Z, AMOTION_EVENT_AXIS_RZ})
+                m = std::fmax(m, std::fabs(AMotionEvent_getAxisValue(ev, axis, 0)));
+            if (m > 0.5f) HideTouchControlsForController(app);  // a real push, not stick noise
+        }
         g_pad.lx = AxisToStick(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_X, 0));
         g_pad.ly = -AxisToStick(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_Y, 0));
         g_pad.rx = AxisToStick(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_Z, 0));
@@ -937,6 +1056,7 @@ void android_main(android_app* app) {
             if (app->destroyRequested) break;
         }
     }
+    if (g_glue_env) app->activity->vm->DetachCurrentThread();  // attached for the touch controls
     LOGI(kTag, "activity destroyed (android_main returning)");
 }
 
