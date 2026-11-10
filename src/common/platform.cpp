@@ -114,16 +114,60 @@ std::string CpuState() {
     }
     return out;
 }
+// First line of a small text file ("" if unreadable).
+std::string ReadLine(const char* path) {
+    char buf[256] = {};
+    if (FILE* f = fopen(path, "r")) {
+        if (!fgets(buf, sizeof(buf), f)) buf[0] = 0;
+        fclose(f);
+    }
+    buf[strcspn(buf, "\n")] = 0;
+    return buf;
+}
+// Why a thread may not use the performance cores: its cpuset, the CPUs the kernel allows it (Cpus_allowed_list)
+// and the CPUs isolated by the Qualcomm core control (where the kernel shows them).
+std::string WhyRefused(pid_t tid) {
+    char path[96];
+    snprintf(path, sizeof(path), "/proc/self/task/%d/status", int(tid));
+    std::string allowed = "?";
+    if (FILE* f = fopen(path, "r")) {
+        char line[256];
+        while (fgets(line, sizeof(line), f))
+            if (!strncmp(line, "Cpus_allowed_list:", 18)) {
+                line[strcspn(line, "\n")] = 0;
+                const char* v = line + 18;
+                while (*v == ' ' || *v == '\t') v++;
+                allowed = v;
+                break;
+            }
+        fclose(f);
+    }
+    std::string isolated = ReadLine("/sys/devices/system/cpu/isolated");
+    std::string ctl;
+    for (int cpu : {4, 6, 7}) {
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/core_ctl/active_cpus", cpu);
+        std::string a = ReadLine(path);
+        if (!a.empty()) {
+            ctl = " | core control: " + a + " active of the cluster at CPU " + std::to_string(cpu);
+            break;
+        }
+    }
+    return "cpuset " + CpusetOf(tid) + ", allowed CPUs " + allowed + ", isolated " +
+           (isolated.empty() ? std::string("?") : isolated) + ctl;
+}
 void WatchAffinity() {
     pthread_setname_np(pthread_self(), "dsr-affinity");
     const FastCores& fc = GetFastCores();
     // Checked 10 times a second: on the OnePlus 6T the system reset the affinity about once a second, so with
     // a one-second check the threads still spent much of their time on the efficiency cores.
     int restored = 0, refused = 0;
+    std::string why;
+    bool why_logged = false;
     auto summary_at = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         std::lock_guard<std::mutex> lk(g_watch_mutex);
+        pid_t refused_tid = 0;
         for (size_t i = 0; i < g_watched.size();) {
             Watched& w = g_watched[i];
             cpu_set_t cur;
@@ -135,6 +179,7 @@ void WatchAffinity() {
             if (!CPU_EQUAL(&cur, &fc.set)) {
                 const int r = sched_setaffinity(w.tid, sizeof(fc.set), &fc.set);
                 (r == 0 ? restored : refused)++;
+                if (r != 0 && !refused_tid) refused_tid = w.tid;
                 if (++w.restores <= 2)
                     LOGI("platform", "%s (tid %d): CPU affinity reset by the system (%d CPUs allowed, cpuset %s), "
                          "restored to CPUs%s: %s", w.who.c_str(), int(w.tid), CPU_COUNT(&cur),
@@ -142,13 +187,17 @@ void WatchAffinity() {
             }
             i++;
         }
+        if (refused_tid && !why_logged) why = WhyRefused(refused_tid), why_logged = true;
         if (std::chrono::steady_clock::now() >= summary_at) {
             summary_at += std::chrono::seconds(10);
             if (restored || refused)
                 LOGI("platform", "CPU affinity of the busy threads reset by the system and restored %d times in the "
                      "last 10 s (%d refused: none of CPUs%s online/allowed); CPUs now: %s", restored, refused,
                      fc.list.c_str(), CpuState().c_str());
+            if (refused && !why.empty()) LOGI("platform", "refused: %s", why.c_str());
             restored = refused = 0;
+            why.clear();
+            why_logged = false;
         }
     }
 }

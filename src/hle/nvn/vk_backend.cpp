@@ -326,18 +326,32 @@ VkComponentSwizzle Swizzle(uint8_t s) {
     }
 }
 
+// Hash of a byte range, 8 bytes per step (an FNV-style multiply plus a shift that carries the high bits down):
+// the byte-at-a-time FNV-1a it replaces was a few percent of the render thread on slower cores (texture change
+// checks, cache keys). In-memory only: nothing hashed here is stored across runs.
+inline uint64_t HashStep(uint64_t h, uint64_t w) {
+    h = (h ^ w) * 1099511628211ull;
+    return h ^ (h >> 32);
+}
 uint64_t Fnv(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
     const auto* b = static_cast<const uint8_t*>(p);
-    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, b + i, 8);
+        h = HashStep(h, w);
+    }
+    if (i < n) {
+        uint64_t w = 0;
+        memcpy(&w, b + i, n - i);
+        h = HashStep(h, w ^ (uint64_t(n - i) << 56));
+    }
     return h;
 }
-// Incremental 64-bit FNV-1a for cache keys (no allocation).
+// Incremental 64-bit hash for cache keys (no allocation).
 struct Key64 {
     uint64_t h = 1469598103934665603ull;
-    void Add(const void* p, size_t n) {
-        const uint8_t* b = static_cast<const uint8_t*>(p);
-        for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull;
-    }
+    void Add(const void* p, size_t n) { h = Fnv(p, n, h); }
     template <typename T>
     void Add(const T& v) { Add(&v, sizeof(v)); }
 };

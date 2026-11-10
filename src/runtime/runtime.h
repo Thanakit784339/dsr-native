@@ -29,9 +29,9 @@ struct RuntimeConfig {
     bool shader_depth_test = true;  // depth tests against gl_FragDepth-written depth done in the shader (square holes)  // refresh depth buffers written by gl_FragDepth before reuse (square holes)
     int hole_test = 0;  // square-hole diagnostics (bits): 1 = effects without depth test, 2 = uncompressed depth, 4 = no write-masked colour targets, 8 = one render pass per draw into reduced-size targets, 16 = depth textures read from copies, 64 = D24S8 depth, 128 = CPU waits for GPU idle at each slot, 256 = uncompressed colour targets, 512 = no null colour attachments, 1024 = effect shaders output debug values, 2048 = no depth test in reduced-size effect passes
     bool audio_smooth = false;  // release audio buffers at a smoothed pace (experiment; movies were not timed by it)
-    // Older Adreno GPUs: image format lists + storage usage only where needed, so images keep their
-    // bandwidth compression (0 = as before, for comparing).
-    bool gpu_compression = true;
+    // Older Adreno GPUs: storage usage and mutable format only where needed, so images keep their bandwidth
+    // compression. Off by default: purple streaks on the OnePlus 6T (Adreno 630) for ~5% less GPU time.
+    bool gpu_compression = false;
     bool fast_cores = true;  // keep the game's frame-critical threads off the efficiency cores
     bool record_thread = true;  // record Vulkan commands on a second thread (draw preparation stays on the render thread)
     bool pin_render_thread = false;  // keep the render thread on the fastest CPU core(s) (slower on 8 Gen 2: off)
