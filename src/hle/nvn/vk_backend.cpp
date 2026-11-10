@@ -1422,6 +1422,12 @@ private:
             return false;
         }
         LoadDeviceFunctions(device_);
+        if (const int rw = dsr::GetRuntime().config.render_width; rw != 1280 && rw > 0) {
+            hud_box_w_ = std::min(rw, 1280);
+            hud_box_h_ = hud_box_w_ * 9 / 16;
+            LOGI(kTag, "aspect ratio: HUD and menus drawn in a centred %dx%d box of the %dx720 frame", hud_box_w_,
+                 hud_box_h_, rw);
+        }
         if (en13.dynamicRendering) {
             begin_rendering_ = reinterpret_cast<PFN_vkCmdBeginRendering>(vkGetDeviceProcAddr(device_, "vkCmdBeginRendering"));
             end_rendering_ = reinterpret_cast<PFN_vkCmdEndRendering>(vkGetDeviceProcAddr(device_, "vkCmdEndRendering"));
@@ -4258,6 +4264,26 @@ private:
         d.set_layouts[0] = vsl;
         d.set_layouts[1] = fsl;
         DynamicState(extent, modes, &d.dyn);
+        // Other aspect ratios (aspect_ratio): the game draws its HUD and menus for 1280x720, stretched over the
+        // whole (wider or narrower) frame. Their draws (the game's 2D vertex shader, on the full-size target) go
+        // into a centred 16:9 box instead: centred 1280x720 on wider frames, the full width and 9/16 of it high
+        // on narrower ones, so they keep their shape and usual places.
+        if (hud_box_w_ && st_.program[0]->hash == 0x874d9c49347a2695ull && extent.height == 720 &&
+            int(extent.width) == dsr::GetRuntime().config.render_width) {
+            const float sx = float(hud_box_w_) / float(extent.width), sy = float(hud_box_h_) / 720.0f;
+            const float x0 = float((int(extent.width) - hud_box_w_) / 2), y0 = float((720 - hud_box_h_) / 2);
+            d.dyn.vp.x = x0 + d.dyn.vp.x * sx;
+            d.dyn.vp.width *= sx;
+            d.dyn.vp.y = y0 + d.dyn.vp.y * sy;
+            d.dyn.vp.height *= sy;
+            VkRect2D& sc = d.dyn.sc;
+            const int l = int(std::floor(x0 + float(sc.offset.x) * sx)), t = int(std::floor(y0 + float(sc.offset.y) * sy));
+            const int r = int(std::ceil(x0 + float(sc.offset.x + int(sc.extent.width)) * sx));
+            const int b = int(std::ceil(y0 + float(sc.offset.y + int(sc.extent.height)) * sy));
+            sc.offset = {l, t};
+            sc.extent = {uint32_t(std::max(0, r - l)), uint32_t(std::max(0, b - t))};
+            hud_draws_boxed_++;
+        }
         d.push[0] = st_.alpha_ref;
         d.indexed = use_indices;
         d.index_buf = fast ? index_buf : stream_;
@@ -5707,6 +5733,9 @@ private:
     std::unordered_map<uint64_t, VkDeviceSize> stream_cache_;
     uint64_t upload_hits_ = 0, upload_bytes_ = 0;
     uint64_t depth_gen_ = 0;
+    // HUD box for other aspect ratios (see Draw): size, 0 = off.
+    int hud_box_w_ = 0, hud_box_h_ = 0;
+    uint64_t hud_draws_boxed_ = 0;
     int viewports_logged_ = 0;
     int image_binds_logged_ = 0;
     std::set<uint64_t> mismatch_logged_;

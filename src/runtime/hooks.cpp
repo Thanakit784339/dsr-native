@@ -243,6 +243,7 @@ void InstallGameHooks() {
                 LOGI("hooks", "aspect ratio %s (%.3f): the game renders at %dx%d (was 1280x720)",
                      rt.config.aspect_ratio.c_str(), ar, width, height);
                 g_aspect = float(width) / float(height);
+                rt.config.render_width = width;
                 std::thread(CameraAspectThread).detach();
             }
             else
