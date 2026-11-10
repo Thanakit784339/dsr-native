@@ -383,6 +383,7 @@ struct Image {
     bool fragdepth_written = false;
     BcKind bc = BcKind::None;  // block-compressed texture decoded on upload (GPU without BC support)
     bool storage = false;      // created with VK_IMAGE_USAGE_STORAGE_BIT
+    bool mutable_fmt = false;  // created with VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT (views in `twin` allowed)
     uint64_t attach_gen = 0;  // times attached to a render pass (`hole_test` 16 copies)
     VkClearValue clear_value{};
     VkImageAspectFlags clear_aspect = 0;
@@ -1311,7 +1312,7 @@ private:
         uint32_t ndev_ext = 1;
         // Image format lists (core in 1.2): with them, sRGB/linear-viewable images keep their compression.
         format_list_ = VK_API_VERSION_MINOR(props_.apiVersion) >= 2;
-        if (!format_list_ && dsr::GetRuntime().config.gpu_compression) {
+        if (false) {  // VK_KHR_image_format_list on Vulkan 1.1 (Adreno 630): glitches (purple streaks); not used
             uint32_t n = 0;
             vkEnumerateDeviceExtensionProperties(phys_, nullptr, &n, nullptr);
             std::vector<VkExtensionProperties> exts(n);
@@ -1797,7 +1798,7 @@ private:
 
     // Creates the VkImage (and its memory) for an Image's description. `img.twin` = the sRGB/linear counterpart
     // views may use (UNDEFINED: none); it is cleared when the image cannot be viewed that way.
-    bool AllocImage(Image& img, bool storage, VkImage* out_image, VkDeviceMemory* out_memory) {
+    bool AllocImage(Image& img, bool storage, bool mutable_fmt, VkImage* out_image, VkDeviceMemory* out_memory) {
         const int target = img.target;
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ci.imageType = img.type;
@@ -1828,9 +1829,12 @@ private:
         // `hole_test` 256: colour render targets mutable with no format list (stored uncompressed on Adreno).
         const bool plain_color = (dsr::GetRuntime().config.hole_test & 256) && !IsDepthFormat(img.nvn_format) &&
                                  (ci.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        img.mutable_fmt = false;
         if (plain_color) {
             ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-        } else if (pair[1] != VK_FORMAT_UNDEFINED) {
+            img.mutable_fmt = true;
+        } else if (pair[1] != VK_FORMAT_UNDEFINED && mutable_fmt) {
+            img.mutable_fmt = true;
             ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
             fl.viewFormatCount = 2;
             fl.pViewFormats = pair;
@@ -1860,15 +1864,31 @@ private:
         return true;
     }
 
-    // An image the game writes as a storage image but that was created without the usage (lean_images_):
-    // re-created with it, contents copied over; the old one is retired like a destroyed image.
+    // Older Adreno GPUs (lean_images_): images are created without the storage usage and the mutable-format
+    // flag, which would turn off their bandwidth compression; an image the game writes as a storage image, or
+    // views in its sRGB/linear twin format, is re-created with them (contents copied over, the old one retired
+    // like a destroyed image, its layout restored).
     bool AddStorage(Image& img) {
         if (!lean_images_ || img.storage || !(img.features & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) return img.storage;
         storage_addrs_.insert(img.addr);
+        return Recreate(img, true, img.mutable_fmt, "written as a storage image");
+    }
+    bool MakeMutable(Image& img) {
+        if (img.mutable_fmt || img.twin == VK_FORMAT_UNDEFINED) return img.mutable_fmt;
+        mutable_addrs_.insert(img.addr);
+        return Recreate(img, img.storage, true, "viewed in its sRGB/linear twin format");
+    }
+    bool Recreate(Image& img, bool storage, bool mutable_fmt, const char* why) {
         EndRendering();
+        const VkImageLayout old_layout = img.layout;
         VkImage ni = VK_NULL_HANDLE;
         VkDeviceMemory nm = VK_NULL_HANDLE;
-        if (!AllocImage(img, true, &ni, &nm)) return false;
+        const bool was_storage = img.storage, was_mutable = img.mutable_fmt;
+        if (!AllocImage(img, storage, mutable_fmt, &ni, &nm)) {
+            img.storage = was_storage;
+            img.mutable_fmt = was_mutable;
+            return false;
+        }
         const bool keep = img.written || img.uploaded || img.clear_pending;
         if (keep) Transition(img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         const VkImage old_image = img.image;
@@ -1902,8 +1922,13 @@ private:
             persist_cache_.clear();
             desc_cache_.clear();
         });
-        LOGI(kTag, "image %dx%d format %d is written as a storage image: re-created with storage usage (%zu so far)",
-             img.width, img.height, img.nvn_format, storage_addrs_.size());
+        if (keep || old_layout != VK_IMAGE_LAYOUT_UNDEFINED) {
+            const VkImageLayout to = old_layout != VK_IMAGE_LAYOUT_UNDEFINED ? old_layout : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            Transition(img, to);
+        }
+        if (++recreated_ <= 16)
+            LOGI(kTag, "image %dx%d format %d is %s: re-created for it (%d so far)", img.width, img.height,
+                 img.nvn_format, why, recreated_);
         return true;
     }
 
@@ -1943,7 +1968,8 @@ private:
         // Older Adreno GPUs keep no bandwidth compression (UBWC) for images that may be storage images, so there
         // the usage is only added to images the game has written as storage images (see AddStorage).
         const bool storage = (feats & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && (!lean_images_ || storage_addrs_.count(t.addr));
-        if (!AllocImage(img, storage, &img.image, &img.memory)) return nullptr;
+        const bool mutable_fmt = img.twin != VK_FORMAT_UNDEFINED && (!lean_images_ || mutable_addrs_.count(t.addr));
+        if (!AllocImage(img, storage, mutable_fmt, &img.image, &img.memory)) return nullptr;
         if (images_created_++ < 48)
             LOGI(kTag, "image %dx%d%s NVN format %d (target %d, %d levels, %d layers) -> Vulkan format %d", img.width,
                  img.height, img.depth > 1 ? "x3D" : "", img.nvn_format, img.target, img.levels, img.layers, vf);
@@ -2144,6 +2170,8 @@ private:
         std::vector<uint32_t> key(parts, parts + 11);
         auto it = img.views.find(key);
         if (it != img.views.end()) return it->second;
+        if (format != VK_FORMAT_UNDEFINED && format != img.vk_format && !img.mutable_fmt && !MakeMutable(img))
+            format = VK_FORMAT_UNDEFINED;  // could not re-create: its own format
         VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         ci.image = img.image;
         ci.viewType = type;
@@ -5416,7 +5444,8 @@ private:
     // Older GPUs (Adreno 6xx): images get VK_IMAGE_USAGE_STORAGE_BIT only once written as storage images, since
     // the usage turns off their bandwidth compression. storage_addrs_: the game addresses of those.
     bool lean_images_ = false;
-    std::unordered_set<uint64_t> storage_addrs_;
+    std::unordered_set<uint64_t> storage_addrs_, mutable_addrs_;
+    int recreated_ = 0;
 
     // ---- render pass objects (GPUs without dynamic rendering) ----------------------------------------------
     // Render passes are cached by formats + load operations; framebuffers are made per pass and destroyed once
