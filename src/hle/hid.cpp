@@ -19,7 +19,10 @@ PadState g_state;
 uint64_t g_touch_buttons = 0;
 float g_touch_lx = 0, g_touch_ly = 0;
 // Touch camera: swipe distance gathered since the last sample; the stick follows the swipe speed.
-constexpr float kLookFullSpeed = 700.0f;  // dp per second for full right-stick deflection (speed 1)
+constexpr float kLookFullSpeed = 500.0f;  // dp per second for full right-stick deflection (speed 1)
+// The game turns the stick into -1..1 by dividing, without clamping (main+0x81ac3c): faster swipes give values
+// past full deflection, up to this many times, so the camera can turn faster than a real stick allows.
+constexpr float kLookMaxDeflection = 6.0f;
 float g_look_dx = 0, g_look_dy = 0;
 int64_t g_look_last_sample = 0, g_look_last_move = 0;
 float g_look_vx = 0, g_look_vy = 0;  // smoothed swipe speed, dp/s
@@ -75,8 +78,11 @@ PadState GetPad(int64_t* sampling) {
     }
     if (g_look_vx != 0 || g_look_vy != 0) {
         const float k = g_look_speed / kLookFullSpeed;
-        s.rx = ToStick(g_look_vx * k);
-        s.ry = ToStick((g_look_invert ? g_look_vy : -g_look_vy) * k);  // finger up = look up
+        auto over = [](float v) {
+            return int32_t(std::lround(std::max(-kLookMaxDeflection, std::min(kLookMaxDeflection, v)) * 32767.0f));
+        };
+        s.rx = over(g_look_vx * k);
+        s.ry = over((g_look_invert ? g_look_vy : -g_look_vy) * k);  // finger up = look up
     }
     return s;
 }

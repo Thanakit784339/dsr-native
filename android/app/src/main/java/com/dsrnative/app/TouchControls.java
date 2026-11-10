@@ -19,8 +19,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * On-screen controls drawn in a transparent panel window over the game. A floating stick on the left moves,
- * a swipe anywhere else (not on a button) turns the camera, and the Switch buttons sit around the edges.
+ * On-screen controls drawn in a transparent panel window over the game. A fixed stick at the bottom left
+ * moves, a swipe anywhere else (not on a button) turns the camera, and the Switch buttons sit around the edges.
  * They hide when a game controller is connected or used, and come back with a double tap on the screen.
  * State goes to native code (nativeState / nativeLook), which merges it with the controller.
  */
@@ -86,10 +86,9 @@ public final class TouchControls extends View implements InputManager.InputDevic
     private final Button[] mOn = new Button[16];
     private final float[] mLastX = new float[16], mLastY = new float[16];
 
-    // Floating stick: base where the finger came down (or the resting spot).
+    // Stick: fixed in place; a finger that comes down on it (or near it) drives it.
     private int mStickPointer = -1;
-    private float mStickBaseX, mStickBaseY, mStickX, mStickY, mStickRestX, mStickRestY, mStickRadius;
-    private float mStickZoneRight;
+    private float mStickBaseX, mStickBaseY, mStickX, mStickY, mStickRadius;
 
     // Double tap (to show the controls again).
     private long mLastTapTime;
@@ -252,9 +251,8 @@ public final class TouchControls extends View implements InputManager.InputDevic
         place(L3, 4.7f * u, h - 0.9f * u, 1.0f * u, 1.0f * u);
         // Stick: resting spot, and the area where a finger grabs it.
         mStickRadius = 1.6f * u;
-        mStickRestX = 2.8f * u;
-        mStickRestY = h - 3.0f * u;
-        mStickZoneRight = w * 0.42f;
+        mStickBaseX = 2.8f * u;
+        mStickBaseY = h - 3.0f * u;
         mText.setTextSize(0.45f * u);
         mStroke.setStrokeWidth(Math.max(2f, 0.05f * u));
     }
@@ -332,16 +330,19 @@ public final class TouchControls extends View implements InputManager.InputDevic
             mKind[id] = K_BUTTON;
             mOn[id] = b;
             b.pressCount++;
-        } else if (x < mStickZoneRight && mStickPointer < 0) {
+        } else if (mStickPointer < 0 && onStick(x, y)) {
             mKind[id] = K_STICK;
             mStickPointer = id;
-            mStickBaseX = x;
-            mStickBaseY = y;
             mStickX = x;
             mStickY = y;
         } else {
             mKind[id] = K_LOOK;
         }
+    }
+
+    private boolean onStick(float x, float y) {
+        float dx = x - mStickBaseX, dy = y - mStickBaseY, r = mStickRadius * 1.5f;
+        return dx * dx + dy * dy <= r * r;
     }
 
     private void move(int id, float x, float y) {
@@ -388,11 +389,9 @@ public final class TouchControls extends View implements InputManager.InputDevic
         if (mStickPointer >= 0) {
             float dx = mStickX - mStickBaseX, dy = mStickY - mStickBaseY;
             float len = (float) Math.sqrt(dx * dx + dy * dy);
-            if (len > mStickRadius) {  // the base follows a finger that goes past the edge
-                mStickBaseX = mStickX - dx / len * mStickRadius;
-                mStickBaseY = mStickY - dy / len * mStickRadius;
-                dx = mStickX - mStickBaseX;
-                dy = mStickY - mStickBaseY;
+            if (len > mStickRadius) {  // past the edge: full tilt in that direction
+                dx = dx / len * mStickRadius;
+                dy = dy / len * mStickRadius;
             }
             lx = dx / mStickRadius;
             ly = -dy / mStickRadius;
@@ -406,15 +405,20 @@ public final class TouchControls extends View implements InputManager.InputDevic
     @Override
     protected void onDraw(Canvas c) {
         if (!mShown) return;
-        // Stick.
-        float bx = mStickPointer >= 0 ? mStickBaseX : mStickRestX, by = mStickPointer >= 0 ? mStickBaseY : mStickRestY;
+        // Stick (the knob stays inside the ring).
+        final float bx = mStickBaseX, by = mStickBaseY;
         mFill.setColor(0x40000000);
         c.drawCircle(bx, by, mStickRadius, mFill);
         c.drawCircle(bx, by, mStickRadius, mStroke);
         float kx = bx, ky = by;
         if (mStickPointer >= 0) {
-            kx = mStickX;
-            ky = mStickY;
+            float dx = mStickX - bx, dy = mStickY - by, len = (float) Math.sqrt(dx * dx + dy * dy);
+            if (len > mStickRadius) {
+                dx = dx / len * mStickRadius;
+                dy = dy / len * mStickRadius;
+            }
+            kx = bx + dx;
+            ky = by + dy;
         }
         mFill.setColor(mStickPointer >= 0 ? 0xA0FFFFFF : 0x60FFFFFF);
         c.drawCircle(kx, ky, mStickRadius * 0.45f, mFill);
