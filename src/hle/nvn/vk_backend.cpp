@@ -5746,9 +5746,8 @@ private:
         if (std::fabs(m[0] - 2.0f / 1280.0f) > 1e-6f || std::fabs(m[5] + 2.0f / 720.0f) > 1e-6f || m[1] != 0.0f ||
             m[4] != 0.0f || std::fabs(m[3] + 1.0f) > 1e-4f || std::fabs(m[7] - 1.0f) > 1e-4f)
             return false;
-        const uint64_t hash = st_.program[0]->hash;
-        if (hud_box_logged_.insert(hash).second)
-            LOGI(kTag, "aspect ratio: HUD vertex shader %016llx drawn in the 16:9 box", (unsigned long long)hash);
+        // HUD and menu draws blend; the game's final full-screen copy of the frame (same projection) does not.
+        if (!(st_.color.blend_enable & 1)) return false;
         // The position attribute (location 0): its stream, format and the vertices the draw reads.
         const VkVertexInputAttributeDescription* pos = nullptr;
         for (const VkVertexInputAttributeDescription& a : vin.attributes)
@@ -5795,6 +5794,10 @@ private:
             y1 = std::max(y1, y);
         }
         const bool full = x0 <= 2.0f && x1 >= 1278.0f && y0 <= 2.0f && y1 >= 718.0f;
+        const uint64_t hash = st_.program[0]->hash;
+        if (hud_box_logged_.insert(hash * 2 + (full ? 1 : 0)).second)
+            LOGI(kTag, "aspect ratio: HUD vertex shader %016llx (%s): %.0f..%.0f x %.0f..%.0f", (unsigned long long)hash,
+                 full ? "full screen, not boxed" : "in the 16:9 box", x0, x1, y0, y1);
         if (full) hud_full_screen_++;
         return !full;
     }
