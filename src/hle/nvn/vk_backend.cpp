@@ -1771,6 +1771,9 @@ private:
         // pair listed so the driver can keep its compression.
         VkFormat pair[2] = {vf, SrgbTwin(vf)};
         VkImageFormatListCreateInfo fl{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+        // `hole_test` 2/3 (diagnostic): depth images mutable, which makes Adreno store them uncompressed.
+        if ((dsr::GetRuntime().config.hole_test & 2) && IsDepthFormat(t.tex.format))
+            ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
         if (pair[1] != VK_FORMAT_UNDEFINED) {
             ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
             fl.viewFormatCount = 2;
@@ -3828,8 +3831,15 @@ private:
         VkDescriptorSetLayout vsl = SetLayout(VK_SHADER_STAGE_VERTEX_BIT, vs->info);
         VkDescriptorSetLayout fsl = SetLayout(VK_SHADER_STAGE_FRAGMENT_BIT, fs->info);
         VkPipelineLayout layout = PipelineLayout(vsl, fsl);
+        // `hole_test` 1/3 (diagnostic for the square holes): the smoke / fog / glow shaders draw without the depth
+        // test, to tell a bad depth buffer from a bad depth texture.
+        const bool saved_depth_test = st_.depth.depth_test;
+        if ((dsr::GetRuntime().config.hole_test & 1) && st_.program[1] &&
+            (st_.program[1]->hash == 0x6f634579337b2b69ull || st_.program[1]->hash == 0x3fc1b1baa8114318ull))
+            st_.depth.depth_test = false;
         VkPipeline pipeline = GetPipeline(vs, fs, vin, topology, color_formats, depth ? depth->nvn_format : 0,
                                           depth_format, layout);
+        st_.depth.depth_test = saved_depth_test;
         if (!pipeline) {
             if (pipeline_pending_) return;  // compiling in the background: drawn once it is ready
             return Skip("pipeline creation failed");
