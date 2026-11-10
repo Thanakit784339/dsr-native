@@ -20,14 +20,8 @@ struct PadState {
 
 // Platform side: update with the latest state (thread-safe).
 void SetPad(const PadState& s);
-// Touch controls (merged with the controller): buttons held and the on-screen stick (-1..1, +y = up).
-void SetTouch(uint64_t buttons, float lx, float ly);
-// Touch camera: a swipe of (dx, dy) density-independent pixels (+y = down the screen). Turned into right-stick
-// deflection from the swipe speed: `speed` 1 = full deflection at kLookFullSpeed dp/s.
-void AddLook(float dx, float dy);
-void SetLookSpeed(float speed, bool invert_y);
-// True while a swipe is turning the camera (moved in the last 100 ms).
-bool LookActive();
+// Touch controls (merged with the controller): buttons held and the on-screen sticks (-1..1, +y = up).
+void SetTouch(uint64_t buttons, float lx, float ly, float rx, float ry);
 // HLE side: snapshot plus a monotonically increasing sampling number.
 PadState GetPad(int64_t* sampling_number);
 

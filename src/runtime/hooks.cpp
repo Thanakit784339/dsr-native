@@ -16,7 +16,6 @@
 #include <map>
 
 #include "common/log.h"
-#include "hle/input.h"
 #include "hle/os/os.h"
 #include <atomic>
 
@@ -98,62 +97,6 @@ void EnginePanic(const char* file, int line, const char* fmt, ...) {
           (unsigned long)GuestOffset(__builtin_return_address(0)));
 }
 
-// main+0x81ad14: the pad device's SetAxis(this, axis, value), virtual. Each frame the game reads the axes
-// (main+0x81a698: x / 32767, right stick at this+0x468/+0x46c), then the input mapping (main+0x834c1c and
-// +0x834dc4) applies dead zone and scale, clamps to its maximum (1) and writes them back through here. The touch
-// camera feeds the right stick past full deflection (dsr::input::AddLook) so fast swipes turn faster: for the
-// right stick, a value still past 1 at this point can only come from that, and is kept instead of the clamped
-// one. Controllers (|value| <= 1) behave as before.
-void PadSetAxis(uint8_t* self, int axis, float value) {
-    const unsigned i = unsigned(axis - 3);
-    if (i > 5) return;
-    float* slot = reinterpret_cast<float*>(self + 0x468) + i;
-    if (i <= 1 && std::fabs(*slot) > 1.001f) return;  // right stick overdriven by a swipe: keep it
-    *slot = value;
-}
-
-// ---- touch camera: fast swipes past the game's caps --------------------------------------------------------
-// The right stick reaches the camera as input "actions" (6 and 7 in this build): main+0x8312d0 stores each
-// action's value for the frame, then main+0x834978 applies the action's dead zone and scale and clamps it to
-// its maximum (1). A swipe faster than a full stick push gives values past 1 (dsr::input::AddLook); for those
-// actions, while the finger is moving, the clamp is skipped, so a fast flick turns the camera faster.
-std::atomic<uint64_t> g_look_actions{0};  // bit per action that has received an overdriven value
-
-// main+0x8312d0 (device, action, value): the action writer, reimplemented; it also learns the camera actions.
-void ActionWrite(uint8_t* dev, int action, float v) {
-    float* pos = *reinterpret_cast<float**>(dev + 0xd0);
-    float* neg = *reinterpret_cast<float**>(dev + 0xf8);
-    float p = pos[action], n = neg[action];
-    if (v >= 0.0f) {
-        if (p < v) pos[action] = p = v;
-    } else if (n > v) {
-        neg[action] = n = v;
-    }
-    (*reinterpret_cast<float**>(dev + 0x148))[action] = p + n;
-    if (std::fabs(v) > 1.001f && action >= 0 && action < 64) {
-        const uint64_t bit = 1ull << action;
-        if (!(g_look_actions.fetch_or(bit) & bit)) LOGI("hooks", "touch camera: right stick feeds action %d", action);
-    }
-}
-
-// main+0x821218 (list, i, &action, &pair, &a, &threshold, &dead_zone, &scale, [stack] &max): reads entry i
-// (0x1c bytes) of an action configuration list, reimplemented. For a camera action while a swipe is going on,
-// max reads as 0, which main+0x834978 takes as "no clamp".
-void ActionConfig(uint8_t* list, int i, int32_t* action, int32_t* pair, int32_t* a, int32_t* threshold,
-                  int32_t* dead_zone, int32_t* scale, int32_t* max) {
-    const auto* e = reinterpret_cast<const int32_t*>(*reinterpret_cast<uint8_t**>(list + 8) + int64_t(i) * 0x1c);
-    *action = e[0];
-    *pair = e[1];
-    *a = e[2];
-    *threshold = e[3];
-    *scale = e[4];
-    *max = e[5];
-    *dead_zone = e[6];
-    const int id = e[0];
-    if (id >= 0 && id < 64 && (g_look_actions.load(std::memory_order_relaxed) >> id & 1) && dsr::input::LookActive())
-        *max = 0;
-}
-
 struct Hook {
     uint64_t offset;
     void* fn;
@@ -163,9 +106,6 @@ const Hook kHooks[] = {
     {0x7fea18, reinterpret_cast<void*>(&EngineLog), "engine log"},
     {0x7feb30, reinterpret_cast<void*>(&EngineLogV), "engine vlog"},
     {0x7892d8, reinterpret_cast<void*>(&EnginePanic), "DL_PANIC"},
-    {0x81ad14, reinterpret_cast<void*>(&PadSetAxis), "pad axis (touch camera speed)"},
-    {0x8312d0, reinterpret_cast<void*>(&ActionWrite), "input action write (touch camera)"},
-    {0x821218, reinterpret_cast<void*>(&ActionConfig), "input action config (touch camera)"},
 };
 
 }  // namespace

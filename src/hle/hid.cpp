@@ -17,47 +17,23 @@ namespace {
 std::mutex g_mutex;
 PadState g_state;
 uint64_t g_touch_buttons = 0;
-float g_touch_lx = 0, g_touch_ly = 0;
-// Touch camera: swipe distance gathered since the last sample; the stick follows the swipe speed.
-constexpr float kLookFullSpeed = 500.0f;  // dp per second for full right-stick deflection (speed 1)
-// The game turns the stick into -1..1 by dividing, without clamping (main+0x81ac3c): faster swipes give values
-// past full deflection, up to this many times, so the camera can turn faster than a real stick allows.
-constexpr float kLookMaxDeflection = 6.0f;
-float g_look_dx = 0, g_look_dy = 0;
-int64_t g_look_last_sample = 0, g_look_last_move = 0;
-float g_look_vx = 0, g_look_vy = 0;  // smoothed swipe speed, dp/s
-float g_look_speed = 1.0f;
-bool g_look_invert = false;
+float g_touch_lx = 0, g_touch_ly = 0, g_touch_rx = 0, g_touch_ry = 0;
 int32_t ToStick(float v) { return int32_t(std::lround(std::max(-1.0f, std::min(1.0f, v)) * 32767.0f)); }
 }  // namespace
 void SetPad(const PadState& s) {
     std::lock_guard<std::mutex> lk(g_mutex);
     g_state = s;
 }
-void SetTouch(uint64_t buttons, float lx, float ly) {
+void SetTouch(uint64_t buttons, float lx, float ly, float rx, float ry) {
     std::lock_guard<std::mutex> lk(g_mutex);
     g_touch_buttons = buttons;
     g_touch_lx = lx;
     g_touch_ly = ly;
-}
-void AddLook(float dx, float dy) {
-    std::lock_guard<std::mutex> lk(g_mutex);
-    g_look_dx += dx;
-    g_look_dy += dy;
-    g_look_last_move = dsr::hle::os::NowNs();
-}
-void SetLookSpeed(float speed, bool invert_y) {
-    std::lock_guard<std::mutex> lk(g_mutex);
-    g_look_speed = speed > 0.05f ? speed : 0.05f;
-    g_look_invert = invert_y;
-}
-bool LookActive() {
-    std::lock_guard<std::mutex> lk(g_mutex);
-    return g_look_last_move && dsr::hle::os::NowNs() - g_look_last_move < 100'000'000;
+    g_touch_rx = rx;
+    g_touch_ry = ry;
 }
 PadState GetPad(int64_t* sampling) {
-    const int64_t now = dsr::hle::os::NowNs();
-    if (sampling) *sampling = now / 4'000'000;  // ~250 Hz sampling counter
+    if (sampling) *sampling = dsr::hle::os::NowNs() / 4'000'000;  // ~250 Hz sampling counter
     std::lock_guard<std::mutex> lk(g_mutex);
     PadState s = g_state;
     s.buttons |= g_touch_buttons;
@@ -65,28 +41,9 @@ PadState GetPad(int64_t* sampling) {
         s.lx = ToStick(g_touch_lx);
         s.ly = ToStick(g_touch_ly);
     }
-    // Swipe speed over the time since the previous sample (at least 8 ms, so several reads in one frame see the
-    // same value), smoothed; back to rest once the finger has not moved for 60 ms.
-    const int64_t dt = now - g_look_last_sample;
-    if (dt >= 8'000'000) {
-        const float secs = float(std::min<int64_t>(dt, 100'000'000)) / 1e9f;
-        const float vx = g_look_dx / secs, vy = g_look_dy / secs;
-        g_look_dx = g_look_dy = 0;
-        g_look_last_sample = now;
-        if (now - g_look_last_move > 60'000'000) {
-            g_look_vx = g_look_vy = 0;
-        } else {
-            g_look_vx = 0.5f * g_look_vx + 0.5f * vx;
-            g_look_vy = 0.5f * g_look_vy + 0.5f * vy;
-        }
-    }
-    if (g_look_vx != 0 || g_look_vy != 0) {
-        const float k = g_look_speed / kLookFullSpeed;
-        auto over = [](float v) {
-            return int32_t(std::lround(std::max(-kLookMaxDeflection, std::min(kLookMaxDeflection, v)) * 32767.0f));
-        };
-        s.rx = over(g_look_vx * k);
-        s.ry = over((g_look_invert ? g_look_vy : -g_look_vy) * k);  // finger up = look up
+    if (g_touch_rx != 0 || g_touch_ry != 0) {
+        s.rx = ToStick(g_touch_rx);
+        s.ry = ToStick(g_touch_ry);
     }
     return s;
 }

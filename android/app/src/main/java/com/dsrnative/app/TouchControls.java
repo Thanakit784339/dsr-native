@@ -20,9 +20,10 @@ import java.util.List;
 
 /**
  * On-screen controls drawn in a transparent panel window over the game. A fixed stick at the bottom left
- * moves, a swipe anywhere else (not on a button) turns the camera, and the Switch buttons sit around the edges.
+ * moves, a smaller stick appears wherever the right side of the screen is touched (not on a button) and turns
+ * the camera, and the Switch buttons sit around the edges.
  * They hide when a game controller is connected or used, and come back with a double tap on the screen.
- * State goes to native code (nativeState / nativeLook), which merges it with the controller.
+ * State goes to native code (nativeState), which merges it with the controller.
  */
 public final class TouchControls extends View implements InputManager.InputDeviceListener {
     // nn::hid button bits (src/hle/input.h).
@@ -30,17 +31,17 @@ public final class TouchControls extends View implements InputManager.InputDevic
             ZL = 1 << 8, ZR = 1 << 9, PLUS = 1 << 10, MINUS = 1 << 11, LEFT = 1 << 12, UP = 1 << 13, RIGHT = 1 << 14,
             DOWN = 1 << 15;
 
-    static native void nativeState(int buttons, float lx, float ly);
-    static native void nativeLook(float dx, float dy);
+    static native void nativeState(int buttons, float lx, float ly, float rx, float ry);
     static native void nativeVisible(boolean visible);
 
     private static TouchControls sView;
 
     /** Called by native code once the game starts. */
-    public static void attach(final Activity activity, final float opacity, final boolean enabled) {
+    public static void attach(final Activity activity, final float opacity, final float cameraSpeed,
+            final boolean enabled) {
         activity.runOnUiThread(() -> {
             if (sView != null || !enabled) return;
-            final TouchControls v = new TouchControls(activity, opacity);
+            final TouchControls v = new TouchControls(activity, opacity, cameraSpeed);
             v.addTo(activity, 0);
         });
     }
@@ -57,7 +58,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
     private final Handler mHandler = new Handler(Looper.getMainLooper());
     private boolean mShown = true;
 
-    private static final int K_BUTTON = 0, K_STICK = 1, K_LOOK = 2, K_NONE = 3;
+    private static final int K_BUTTON = 0, K_STICK = 1, K_RSTICK = 2, K_NONE = 3;
 
     private static final class Button {
         final String label;
@@ -89,6 +90,11 @@ public final class TouchControls extends View implements InputManager.InputDevic
     // Stick: fixed in place; a finger that comes down on it (or near it) drives it.
     private int mStickPointer = -1;
     private float mStickBaseX, mStickBaseY, mStickX, mStickY, mStickRadius;
+    // Camera stick: invisible until the right side is touched; appears under the finger and its base follows a
+    // finger that goes past its edge. Smaller than the left stick; `camera speed` = deflection per distance.
+    private int mRStickPointer = -1;
+    private float mRBaseX, mRBaseY, mRX, mRY, mRRadius;
+    private final float mCameraSpeed;
 
     // Double tap (to show the controls again).
     private long mLastTapTime;
@@ -99,9 +105,10 @@ public final class TouchControls extends View implements InputManager.InputDevic
     private final Paint mText = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF mRect = new RectF();
 
-    private TouchControls(Activity activity, float opacity) {
+    private TouchControls(Activity activity, float opacity, float cameraSpeed) {
         super(activity);
         mActivity = activity;
+        mCameraSpeed = Math.max(0.1f, Math.min(10f, cameraSpeed));
         mDensity = activity.getResources().getDisplayMetrics().density;
         setAlpha(Math.max(0.1f, Math.min(1.0f, opacity)));
         mStroke.setStyle(Paint.Style.STROKE);
@@ -199,6 +206,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
         }
         for (Button b : mButtons) b.pressCount = 0;
         mStickPointer = -1;
+        mRStickPointer = -1;
         sendState();
     }
 
@@ -251,6 +259,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
         place(L3, 4.7f * u, h - 0.9f * u, 1.0f * u, 1.0f * u);
         // Stick: resting spot, and the area where a finger grabs it.
         mStickRadius = 1.6f * u;
+        mRRadius = 1.05f * u;
         mStickBaseX = 2.8f * u;
         mStickBaseY = h - 3.0f * u;
         mText.setTextSize(0.45f * u);
@@ -335,8 +344,13 @@ public final class TouchControls extends View implements InputManager.InputDevic
             mStickPointer = id;
             mStickX = x;
             mStickY = y;
+        } else if (mRStickPointer < 0 && x > getWidth() * 0.5f) {
+            mKind[id] = K_RSTICK;
+            mRStickPointer = id;
+            mRBaseX = mRX = x;
+            mRBaseY = mRY = y;
         } else {
-            mKind[id] = K_LOOK;
+            mKind[id] = K_NONE;
         }
     }
 
@@ -361,9 +375,14 @@ public final class TouchControls extends View implements InputManager.InputDevic
                 mStickX = x;
                 mStickY = y;
                 break;
-            case K_LOOK: {
-                float dx = (x - mLastX[id]) / mDensity, dy = (y - mLastY[id]) / mDensity;
-                if (dx != 0 || dy != 0) nativeLook(dx, dy);
+            case K_RSTICK: {
+                mRX = x;
+                mRY = y;
+                float dx = x - mRBaseX, dy = y - mRBaseY, len = (float) Math.sqrt(dx * dx + dy * dy);
+                if (len > mRRadius) {  // the base follows the finger
+                    mRBaseX = x - dx / len * mRRadius;
+                    mRBaseY = y - dy / len * mRRadius;
+                }
                 break;
             }
             default:
@@ -377,6 +396,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
         if (id < 0 || id >= 16) return;
         if (mKind[id] == K_BUTTON && mOn[id] != null) mOn[id].pressCount--;
         if (mKind[id] == K_STICK) mStickPointer = -1;
+        if (mKind[id] == K_RSTICK) mRStickPointer = -1;
         mKind[id] = K_NONE;
         mOn[id] = null;
     }
@@ -397,7 +417,15 @@ public final class TouchControls extends View implements InputManager.InputDevic
             ly = -dy / mStickRadius;
             if (Math.abs(lx) < 0.08f && Math.abs(ly) < 0.08f) lx = ly = 0;
         }
-        nativeState(bits, lx, ly);
+        float rx = 0, ry = 0;
+        if (mRStickPointer >= 0) {
+            // Full tilt at 1 / speed of the ring's radius (speed 1: at the edge).
+            float reach = mRRadius / mCameraSpeed;
+            rx = Math.max(-1f, Math.min(1f, (mRX - mRBaseX) / reach));
+            ry = Math.max(-1f, Math.min(1f, -(mRY - mRBaseY) / reach));
+            if (Math.abs(rx) < 0.06f && Math.abs(ry) < 0.06f) rx = ry = 0;
+        }
+        nativeState(bits, lx, ly, rx, ry);
     }
 
     // ---- drawing --------------------------------------------------------------------------------------------
@@ -422,6 +450,19 @@ public final class TouchControls extends View implements InputManager.InputDevic
         }
         mFill.setColor(mStickPointer >= 0 ? 0xA0FFFFFF : 0x60FFFFFF);
         c.drawCircle(kx, ky, mStickRadius * 0.45f, mFill);
+        // Camera stick, only while touched.
+        if (mRStickPointer >= 0) {
+            mFill.setColor(0x40000000);
+            c.drawCircle(mRBaseX, mRBaseY, mRRadius, mFill);
+            c.drawCircle(mRBaseX, mRBaseY, mRRadius, mStroke);
+            float dx = mRX - mRBaseX, dy = mRY - mRBaseY, len = (float) Math.sqrt(dx * dx + dy * dy);
+            if (len > mRRadius) {
+                dx = dx / len * mRRadius;
+                dy = dy / len * mRRadius;
+            }
+            mFill.setColor(0xA0FFFFFF);
+            c.drawCircle(mRBaseX + dx, mRBaseY + dy, mRRadius * 0.45f, mFill);
+        }
         // Buttons.
         for (Button b : mButtons) {
             boolean on = b.pressCount > 0;

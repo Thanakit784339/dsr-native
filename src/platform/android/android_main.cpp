@@ -316,11 +316,11 @@ struct TouchSettings {
 std::atomic<bool> g_touch_visible{false};  // the on-screen controls show (set by TouchControls.java)
 
 #define TOUCH_HELP                                                                                            \
-    "# Touch controls: a floating stick on the left half, the Switch buttons around the edges (LOCK = lock-on,\n" \
-    "# the right stick press); swipe anywhere else to turn the camera. They hide when a controller is\n"        \
-    "# connected or used; double-tap the screen to bring them back.\n"                                         \
-    "# touch_controls: 1 = on, 0 = off. touch_opacity: 0.1 to 1. touch_camera_speed: camera turn speed for\n"   \
-    "# swipes (1 = normal, 2 = twice as fast). touch_camera_invert: 1 = swipe up to look down.\n"
+    "# Touch controls: a stick at the bottom left, the Switch buttons around the edges (LOCK = lock-on, the\n" \
+    "# right stick press); touch the right side anywhere else for a camera stick that follows your finger.\n"  \
+    "# They hide when a controller is connected or used; double-tap the screen to bring them back.\n"         \
+    "# touch_controls: 1 = on, 0 = off. touch_opacity: 0.1 to 1. touch_camera_speed: how far the camera\n"   \
+    "# stick moves for a full turn (1 = to its edge, 2 = half that). touch_camera_invert: 1 = up looks down.\n"
 #define TOUCH_DEFAULTS "touch_controls = 1\ntouch_opacity = 0.7\ntouch_camera_speed = 1.0\ntouch_camera_invert = 0\n"
 
 #define GPU_DRIVER_HELP                                                                                      \
@@ -486,7 +486,6 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
     LOGI(kTag, "settings: gpu_driver %s, bc_enabler %d", cfg->gpu_driver.c_str(), int(cfg->bc_enabler));
     LOGI(kTag, "settings: touch controls %s, opacity %.2f, camera speed %.2f%s", g_touch.enabled ? "on" : "off",
          g_touch.opacity, g_touch.camera_speed, g_touch.camera_invert ? ", camera inverted" : "");
-    dsr::input::SetLookSpeed(g_touch.camera_speed, g_touch.camera_invert);
     if (!cfg->shader_depth_test) LOGI(kTag, "settings: shader_depth_test off");
     if (cfg->hole_test || cfg->lrz_workaround)
         LOGI(kTag, "settings: hole_test %d, lrz_workaround %d", cfg->hole_test, int(cfg->lrz_workaround));
@@ -757,13 +756,12 @@ void PrepareGpuDriver(android_app* app, const std::string& base, dsr::RuntimeCon
 }
 
 // ---- touch controls (com.dsrnative.app.TouchControls) -------------------------------------------------------
-void JNICALL TouchNativeState(JNIEnv*, jclass, jint buttons, jfloat lx, jfloat ly) {
-    dsr::input::SetTouch(uint64_t(uint32_t(buttons)), lx, ly);
+void JNICALL TouchNativeState(JNIEnv*, jclass, jint buttons, jfloat lx, jfloat ly, jfloat rx, jfloat ry) {
+    dsr::input::SetTouch(uint64_t(uint32_t(buttons)), lx, ly, rx, g_touch.camera_invert ? -ry : ry);
 }
-void JNICALL TouchNativeLook(JNIEnv*, jclass, jfloat dx, jfloat dy) { dsr::input::AddLook(dx, dy); }
 void JNICALL TouchNativeVisible(JNIEnv*, jclass, jboolean visible) {
     g_touch_visible = visible != JNI_FALSE;
-    if (!visible) dsr::input::SetTouch(0, 0, 0);
+    if (!visible) dsr::input::SetTouch(0, 0, 0, 0, 0);
     LOGI(kTag, "touch controls %s", visible ? "shown" : "hidden");
 }
 jclass g_touch_cls = nullptr;  // global ref
@@ -797,18 +795,19 @@ void StartTouchControls(android_app* app) {
         return;
     }
     const JNINativeMethod methods[] = {
-        {const_cast<char*>("nativeState"), const_cast<char*>("(IFF)V"), reinterpret_cast<void*>(&TouchNativeState)},
-        {const_cast<char*>("nativeLook"), const_cast<char*>("(FF)V"), reinterpret_cast<void*>(&TouchNativeLook)},
+        {const_cast<char*>("nativeState"), const_cast<char*>("(IFFFF)V"), reinterpret_cast<void*>(&TouchNativeState)},
         {const_cast<char*>("nativeVisible"), const_cast<char*>("(Z)V"), reinterpret_cast<void*>(&TouchNativeVisible)},
     };
-    if (env->RegisterNatives(cls, methods, 3) != JNI_OK || env->ExceptionCheck()) {
+    if (env->RegisterNatives(cls, methods, 2) != JNI_OK || env->ExceptionCheck()) {
         env->ExceptionClear();
         LOGW(kTag, "touch controls: could not register natives");
         return;
     }
     g_touch_cls = static_cast<jclass>(env->NewGlobalRef(cls));
-    jmethodID attach = env->GetStaticMethodID(cls, "attach", "(Landroid/app/Activity;FZ)V");
-    if (attach) env->CallStaticVoidMethod(cls, attach, activity, jfloat(g_touch.opacity), jboolean(g_touch.enabled));
+    jmethodID attach = env->GetStaticMethodID(cls, "attach", "(Landroid/app/Activity;FFZ)V");
+    if (attach)
+        env->CallStaticVoidMethod(cls, attach, activity, jfloat(g_touch.opacity), jfloat(g_touch.camera_speed),
+                                  jboolean(g_touch.enabled));
     if (env->ExceptionCheck()) {
         env->ExceptionDescribe();
         env->ExceptionClear();
