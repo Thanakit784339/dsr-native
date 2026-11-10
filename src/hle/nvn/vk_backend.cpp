@@ -42,6 +42,7 @@
 #include "common/profiler.h"
 #include "common/platform.h"
 #include "hle/nvn/backend.h"
+#include "hle/nvn/bc_decode.h"
 #include "runtime/runtime.h"
 #include "hle/nvn/layout.h"
 #include "hle/os/os.h"
@@ -225,6 +226,35 @@ VertexFormat VertexFormatOf(int f) {
 }
 
 // ---- NVN enum -> Vulkan (NVN uses GL-style orderings; confirmed from the state logs) --------------------------
+// BC (block-compressed) NVN formats and what they are decoded to on GPUs without BC support.
+BcKind BcKindOf(int f) {
+    switch (f) {
+        case 65: case 66: case 69: case 70: return BcKind::BC1;
+        case 67: case 71: return BcKind::BC2;
+        case 68: case 72: return BcKind::BC3;
+        case 73: return BcKind::BC4U;
+        case 74: return BcKind::BC4S;
+        case 75: return BcKind::BC5U;
+        case 76: return BcKind::BC5S;
+        case 77: case 78: return BcKind::BC7;
+        case 79: return BcKind::BC6H_S;
+        case 80: return BcKind::BC6H_U;
+        default: return BcKind::None;
+    }
+}
+VkFormat BcDecodedFormat(int f) {
+    switch (f) {
+        case 65: case 66: case 67: case 68: case 77: return VK_FORMAT_R8G8B8A8_UNORM;
+        case 69: case 70: case 71: case 72: case 78: return VK_FORMAT_R8G8B8A8_SRGB;
+        case 73: return VK_FORMAT_R8_UNORM;
+        case 74: return VK_FORMAT_R8_SNORM;
+        case 75: return VK_FORMAT_R8G8_UNORM;
+        case 76: return VK_FORMAT_R8G8_SNORM;
+        case 79: case 80: return VK_FORMAT_R16G16B16A16_SFLOAT;
+        default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
 VkCompareOp CompareOp(int f) {  // NEVER=1 .. ALWAYS=8
     static const VkCompareOp k[] = {VK_COMPARE_OP_NEVER, VK_COMPARE_OP_NEVER, VK_COMPARE_OP_LESS,
                                     VK_COMPARE_OP_EQUAL, VK_COMPARE_OP_LESS_OR_EQUAL, VK_COMPARE_OP_GREATER,
@@ -351,6 +381,7 @@ struct Image {
     bool depth_exported = false;
     // Ever had depth written by a fragment shader (gl_FragDepth): depth tests against it are done in the shader.
     bool fragdepth_written = false;
+    BcKind bc = BcKind::None;  // block-compressed texture decoded on upload (GPU without BC support)
     uint64_t attach_gen = 0;  // times attached to a render pass (`hole_test` 16 copies)
     VkClearValue clear_value{};
     VkImageAspectFlags clear_aspect = 0;
@@ -1292,7 +1323,13 @@ private:
             begin_rendering_ = reinterpret_cast<PFN_vkCmdBeginRendering>(vkGetDeviceProcAddr(device_, "vkCmdBeginRendering"));
             end_rendering_ = reinterpret_cast<PFN_vkCmdEndRendering>(vkGetDeviceProcAddr(device_, "vkCmdEndRendering"));
         }
-        if (!begin_rendering_ || !end_rendering_) LOGW(kTag, "no dynamic rendering: draws will be skipped");
+        if (!begin_rendering_ || !end_rendering_) {
+            // Older drivers (Vulkan 1.1, e.g. Adreno 6xx on Android 10/11): render pass and framebuffer objects.
+            begin_rendering_ = nullptr;
+            end_rendering_ = nullptr;
+            rp_fallback_ = true;
+            LOGI(kTag, "no dynamic rendering: using render pass objects instead");
+        }
 
         vkGetDeviceQueue(device_, family_, 0, &queue_);
         VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -1473,6 +1510,8 @@ private:
             vkResetDescriptorPool(device_, sl.pool, 0);
             for (size_t k = 0; k < sl.extra_used; k++) vkResetDescriptorPool(device_, sl.extra_pools[k], 0);
             sl.extra_used = 0;
+            for (VkFramebuffer fb : sl.framebuffers) vkDestroyFramebuffer(device_, fb, nullptr);
+            sl.framebuffers.clear();
             desc_cache_.clear();
         });
     }
@@ -1685,6 +1724,21 @@ private:
                 break;
             }
         }
+        if (chosen == VK_FORMAT_UNDEFINED && BcKindOf(nvn_format) != BcKind::None) {
+            // No BC support (Adreno 6xx and older, Mali): decoded on upload into an uncompressed format.
+            const VkFormat f = BcDecodedFormat(nvn_format);
+            VkFormatProperties p;
+            vkGetPhysicalDeviceFormatProperties(phys_, f, &p);
+            if ((p.optimalTilingFeatures & need) == need) {
+                chosen = f;
+                feats = p.optimalTilingFeatures;
+                LOGI(kTag, "NVN format %d (block-compressed) not supported by the GPU: decoded on upload to Vulkan format %d",
+                     nvn_format, int(f));
+                if (BcKindOf(nvn_format) == BcKind::BC7 || BcKindOf(nvn_format) == BcKind::BC6H_S ||
+                    BcKindOf(nvn_format) == BcKind::BC6H_U)
+                    LOGW(kTag, "NVN format %d: decoding not implemented yet, shown as grey", nvn_format);
+            }
+        }
         if (chosen == VK_FORMAT_UNDEFINED) LOGW(kTag, "NVN format %d has no usable Vulkan format yet", nvn_format);
         format_cache_[nvn_format] = {chosen, feats};
         *features = feats;
@@ -1744,6 +1798,7 @@ private:
         img.addr = t.addr;
         img.tex = t.tex;
         img.vk_format = vf;
+        if (BcKindOf(t.tex.format) != BcKind::None && vf == BcDecodedFormat(t.tex.format)) img.bc = BcKindOf(t.tex.format);
         img.width = t.tex.width;
         img.height = t.tex.height;
         img.levels = std::max(1, std::min(t.tex.levels, int(layout.levels.size())));
@@ -1789,7 +1844,8 @@ private:
             ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
             fl.viewFormatCount = 2;
             fl.pViewFormats = pair;
-            ci.pNext = &fl;
+            // The format list is Vulkan 1.2 (or VK_KHR_image_format_list): older drivers get the mutable flag only.
+            if (VK_API_VERSION_MINOR(props_.apiVersion) >= 2) ci.pNext = &fl;
             img.twin = pair[1];
         }
         if (vkCreateImage(device_, &ci, nullptr, &img.image) != VK_SUCCESS) {
@@ -1877,6 +1933,8 @@ private:
     }
 
     // Fills a sampled texture from game memory: deswizzle each level/layer into the stream, then copy.
+    std::vector<uint8_t> bc_scratch_;
+    uint64_t bc_decoded_bytes_ = 0;
     void Upload(Image& img, const TexRef& t) {
         img.uploaded = true;
         img.cpu_source = true;
@@ -1895,7 +1953,9 @@ private:
         for (int layer = 0; layer < img.layers; layer++)
             for (int lv = 0; lv < img.levels; lv++) {
                 const LevelLayout& l = layout.levels[size_t(lv)];
-                needed += size_t(l.row_bytes) * l.rows * l.depth + 16;
+                needed += img.bc != BcKind::None
+                              ? size_t(l.width) * size_t(std::max(1, l.height)) * size_t(l.depth) * size_t(BcDecodedBytes(img.bc)) + 16
+                              : size_t(l.row_bytes) * l.rows * l.depth + 16;
             }
         if (needed > kStreamSize - kMaxUniformRange) {
             LogOnce("upload-size", "texture too large to upload in one go (%zu bytes)", needed);
@@ -1910,16 +1970,34 @@ private:
             for (int lv = 0; lv < img.levels; lv++) {
                 const LevelLayout& l = layout.levels[size_t(lv)];
                 const size_t n = size_t(l.row_bytes) * l.rows * l.depth;
-                VkDeviceSize off = StreamAlloc(n, 16);
                 const uint8_t* src = base + size_t(layer) * layout.layer_stride + l.offset;
-                if (layout.linear)
-                    memcpy(stream_ptr_ + off, src, n);
-                else
-                    DeswizzleLevel(stream_ptr_ + off, src, l);
                 VkBufferImageCopy r{};
-                r.bufferOffset = off;
-                r.bufferRowLength = uint32_t(l.row_bytes / fi.bytes_per_block * fi.block_w);
-                r.bufferImageHeight = uint32_t(l.rows * fi.block_h);
+                if (img.bc != BcKind::None) {
+                    // Deswizzle the blocks, then decode them into texels in the upload buffer.
+                    bc_scratch_.resize(n);
+                    if (layout.linear)
+                        memcpy(bc_scratch_.data(), src, n);
+                    else
+                        DeswizzleLevel(bc_scratch_.data(), src, l);
+                    const int w = std::max(1, l.width), h = std::max(1, l.height);
+                    const size_t slice = size_t(w) * size_t(h) * size_t(BcDecodedBytes(img.bc));
+                    VkDeviceSize off = StreamAlloc(slice * size_t(l.depth), 16);
+                    const int bx = int(l.row_bytes / std::max(1, fi.bytes_per_block));
+                    for (int z = 0; z < l.depth; z++)
+                        BcDecode(img.bc, bc_scratch_.data() + size_t(z) * size_t(l.row_bytes) * size_t(l.rows), bx, int(l.rows),
+                                 stream_ptr_ + off + size_t(z) * slice, w, h);
+                    r.bufferOffset = off;
+                    bc_decoded_bytes_ += n;
+                } else {
+                    VkDeviceSize off = StreamAlloc(n, 16);
+                    if (layout.linear)
+                        memcpy(stream_ptr_ + off, src, n);
+                    else
+                        DeswizzleLevel(stream_ptr_ + off, src, l);
+                    r.bufferOffset = off;
+                    r.bufferRowLength = uint32_t(l.row_bytes / fi.bytes_per_block * fi.block_w);
+                    r.bufferImageHeight = uint32_t(l.rows * fi.block_h);
+                }
                 r.imageSubresource = {img.aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT ? img.aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT
                                                                                  : img.aspect,
                                       uint32_t(lv), uint32_t(layer), 1};
@@ -1952,6 +2030,11 @@ private:
     // The Vulkan format a view with NVN format `view_nvn` uses on `img` (UNDEFINED: the image's own).
     VkFormat ViewFormat(const Image& img, int view_nvn) {
         if (!view_nvn || view_nvn == img.nvn_format) return VK_FORMAT_UNDEFINED;
+        if (img.bc != BcKind::None && BcKindOf(view_nvn) != BcKind::None) {  // decoded: compare decoded formats
+            const VkFormat f = BcDecodedFormat(view_nvn);
+            if (f == img.vk_format) return VK_FORMAT_UNDEFINED;
+            if (f == img.twin && f != VK_FORMAT_UNDEFINED) return f;
+        }
         for (VkFormat f : ImageCandidates(view_nvn)) {
             if (f == img.vk_format) return VK_FORMAT_UNDEFINED;
             if (f == img.twin && f != VK_FORMAT_UNDEFINED) {
@@ -2880,6 +2963,10 @@ private:
             LOGI(kTag, "watching the source @%llx (%zu bytes) of a %dx%d table copy", (unsigned long long)c.src_addr,
                  src_size, w, h);
         }
+        if (img->bc != BcKind::None) {
+            LogOnce("b2t-bc", "buffer-to-texture copy into a block-compressed texture on a GPU without BC support: skipped");
+            return;
+        }
         Begin();
         EndRendering();
         if (StreamRemaining() < row * rows * size_t(d) + 1024) Flush();
@@ -2927,7 +3014,12 @@ private:
     // `line`: the caller (diagnostics: which code path breaks render passes, counted per 10 s).
     void EndRendering(int line = __builtin_LINE()) {
         if (rendering_) {
-            Rec([this](VkCommandBuffer cb) { end_rendering_(cb); });
+            Rec([this](VkCommandBuffer cb) {
+                if (rp_fallback_)
+                    vkCmdEndRenderPass(cb);
+                else
+                    end_rendering_(cb);
+            });
             rendering_ = false;
             pass_breaks_[line]++;
         }
@@ -2943,6 +3035,8 @@ private:
     struct BeginPass {  // a vkCmdBeginRendering, as queued for the recorder
         VkRenderingAttachmentInfo colors[8];
         VkRenderingAttachmentInfo depth;
+        VkFormat color_formats[8] = {};  // for render pass objects (GPUs without dynamic rendering)
+        VkFormat depth_format = VK_FORMAT_UNDEFINED;
         uint32_t count = 0;
         bool has_depth = false, has_stencil = false;
         VkRect2D area;
@@ -3020,6 +3114,9 @@ private:
                 Transition(*c, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
                 a.imageView = AttachmentView(*c, RtSub(ci).first, RtSub(ci).second,
                                              ci < st_.rts.size() ? st_.rts[ci].view_format : 0);
+                const VkFormat vf = ci < st_.rts.size() && st_.rts[ci].view_format ? ViewFormat(*c, st_.rts[ci].view_format)
+                                                                                   : VK_FORMAT_UNDEFINED;
+                bp.color_formats[bp.count] = vf != VK_FORMAT_UNDEFINED ? vf : c->vk_format;
                 a.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                 a.loadOp = c->written ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
                 if (clear_on_load) {
@@ -3047,6 +3144,7 @@ private:
             if (clear_on_load) depth->clear_pending = false;
             Transition(*depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
             da.imageView = AttachmentView(*depth, RtSub(8).first, RtSub(8).second);
+            bp.depth_format = depth->vk_format;
             da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
             da.loadOp = depth->written ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
             da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -3072,7 +3170,10 @@ private:
             ri.pColorAttachments = bp.colors;
             if (bp.has_depth) ri.pDepthAttachment = &bp.depth;
             if (bp.has_stencil) ri.pStencilAttachment = &bp.depth;
-            begin_rendering_(cb, &ri);
+            if (rp_fallback_)
+                BeginRenderPassObject(cb, bp);
+            else
+                begin_rendering_(cb, &ri);
         });
         pass_color_count_ = std::min<size_t>(colors.size(), 8);
         for (size_t i = 0; i < pass_color_count_; i++) {
@@ -3395,7 +3496,7 @@ private:
         PhaseEnd phase_end{this};
         no_attachment_extent_ = {0, 0};
         if (p.count <= 0 || p.instances <= 0) return;
-        if (!begin_rendering_) return Skip("no dynamic rendering");
+        if (!begin_rendering_ && !rp_fallback_) return Skip("no dynamic rendering");
         if (!st_.program[0]) return Skip("no vertex program bound");
         const DeviceModes modes = GetDeviceModes();
 
@@ -4427,6 +4528,7 @@ private:
         std::vector<VkFormat> color_formats;
         VkFormat depth_format = VK_FORMAT_UNDEFINED, stencil_format = VK_FORMAT_UNDEFINED;
         VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkRenderPass render_pass = VK_NULL_HANDLE;  // set: no dynamic rendering (a compatible render pass)
         // Result.
         std::atomic<bool> done{false};
         VkPipeline pipeline = VK_NULL_HANDLE;
@@ -4471,6 +4573,11 @@ private:
         rinfo.stencilAttachmentFormat = j.stencil_format;
         VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         ci.pNext = &rinfo;
+        if (j.render_pass) {  // a render pass of the same formats (load / store operations do not matter)
+            ci.pNext = nullptr;
+            ci.renderPass = j.render_pass;
+            ci.subpass = 0;
+        }
         ci.stageCount = j.fs != VK_NULL_HANDLE ? 2 : 1;
         ci.pStages = stages;
         ci.pVertexInputState = &vi;
@@ -4635,6 +4742,7 @@ private:
         j.color_formats = color_formats;
         j.depth_format = has_depth ? depth_format : VK_FORMAT_UNDEFINED;
         j.stencil_format = has_stencil ? depth_format : VK_FORMAT_UNDEFINED;
+        if (rp_fallback_) j.render_pass = CompatRenderPass(j.color_formats, j.depth_format, j.stencil_format);
         j.layout = layout;
         new_pipelines_++;
 
@@ -5217,6 +5325,126 @@ private:
     VkSemaphore acquire_sem_ = VK_NULL_HANDLE, render_sem_ = VK_NULL_HANDLE;
     PFN_vkCmdBeginRendering begin_rendering_ = nullptr;
     PFN_vkCmdEndRendering end_rendering_ = nullptr;
+    bool rp_fallback_ = false;  // no dynamic rendering: VkRenderPass + VkFramebuffer per pass
+
+    // ---- render pass objects (GPUs without dynamic rendering) ----------------------------------------------
+    // Render passes are cached by formats + load operations; framebuffers are made per pass and destroyed once
+    // the slot that used them has finished on the GPU. Layouts stay what the explicit barriers set (initial =
+    // final = attachment layout), so the passes add no transitions of their own.
+    std::mutex rp_mutex_;
+    std::map<std::vector<uint32_t>, VkRenderPass> render_passes_cache_;
+    VkRenderPass MakeRenderPass(const VkFormat* colors, uint32_t ncolors, VkFormat depth, VkFormat stencil_hint,
+                                const VkAttachmentLoadOp* color_load, VkAttachmentLoadOp depth_load) {
+        std::vector<uint32_t> key;
+        for (uint32_t i = 0; i < ncolors; i++) {
+            key.push_back(uint32_t(colors[i]));
+            key.push_back(color_load ? uint32_t(color_load[i]) : 0u);
+        }
+        key.push_back(0xffffffffu);
+        key.push_back(uint32_t(depth));
+        key.push_back(uint32_t(depth_load));
+        std::lock_guard<std::mutex> lk(rp_mutex_);
+        auto it = render_passes_cache_.find(key);
+        if (it != render_passes_cache_.end()) return it->second;
+        std::vector<VkAttachmentDescription> att;
+        std::vector<VkAttachmentReference> refs;
+        for (uint32_t i = 0; i < ncolors; i++) {
+            if (colors[i] == VK_FORMAT_UNDEFINED) {
+                refs.push_back({VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_UNDEFINED});
+                continue;
+            }
+            VkAttachmentDescription a{};
+            a.format = colors[i];
+            a.samples = VK_SAMPLE_COUNT_1_BIT;
+            a.loadOp = color_load ? color_load[i] : VK_ATTACHMENT_LOAD_OP_LOAD;
+            a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            a.initialLayout = a.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            refs.push_back({uint32_t(att.size()), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL});
+            att.push_back(a);
+        }
+        VkAttachmentReference dref{VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_UNDEFINED};
+        if (depth != VK_FORMAT_UNDEFINED) {
+            VkAttachmentDescription a{};
+            a.format = depth;
+            a.samples = VK_SAMPLE_COUNT_1_BIT;
+            a.loadOp = depth_load;
+            a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            const bool stencil = stencil_hint != VK_FORMAT_UNDEFINED;
+            a.stencilLoadOp = stencil ? depth_load : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            a.stencilStoreOp = stencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            a.initialLayout = a.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            dref = {uint32_t(att.size()), VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+            att.push_back(a);
+        }
+        VkSubpassDescription sub{};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = uint32_t(refs.size());
+        sub.pColorAttachments = refs.data();
+        if (dref.attachment != VK_ATTACHMENT_UNUSED) sub.pDepthStencilAttachment = &dref;
+        VkRenderPassCreateInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        ci.attachmentCount = uint32_t(att.size());
+        ci.pAttachments = att.data();
+        ci.subpassCount = 1;
+        ci.pSubpasses = &sub;
+        VkRenderPass rp = VK_NULL_HANDLE;
+        if (vkCreateRenderPass(device_, &ci, nullptr, &rp) != VK_SUCCESS) {
+            LogOnce("renderpass", "vkCreateRenderPass failed");
+            rp = VK_NULL_HANDLE;
+        }
+        render_passes_cache_[key] = rp;
+        return rp;
+    }
+    VkRenderPass CompatRenderPass(const std::vector<VkFormat>& colors, VkFormat depth, VkFormat stencil) {
+        const VkFormat ds = depth != VK_FORMAT_UNDEFINED ? depth : stencil;
+        return MakeRenderPass(colors.data(), uint32_t(colors.size()), ds, stencil, nullptr, VK_ATTACHMENT_LOAD_OP_LOAD);
+    }
+    // Recorder thread.
+    void BeginRenderPassObject(VkCommandBuffer cb, const BeginPass& bp) {
+        VkFormat colors[8];
+        VkAttachmentLoadOp loads[8];
+        VkImageView views[9];
+        VkClearValue clears[9];
+        uint32_t nviews = 0;
+        for (uint32_t i = 0; i < bp.count; i++) {
+            const bool used = bp.colors[i].imageView != VK_NULL_HANDLE;
+            colors[i] = used ? bp.color_formats[i] : VK_FORMAT_UNDEFINED;
+            loads[i] = bp.colors[i].loadOp;
+            if (used) {
+                clears[nviews] = bp.colors[i].clearValue;
+                views[nviews++] = bp.colors[i].imageView;
+            }
+        }
+        const bool ds = (bp.has_depth || bp.has_stencil) && bp.depth.imageView != VK_NULL_HANDLE;
+        const VkFormat dfmt = ds ? bp.depth_format : VK_FORMAT_UNDEFINED;
+        if (ds) {
+            clears[nviews] = bp.depth.clearValue;
+            views[nviews++] = bp.depth.imageView;
+        }
+        VkRenderPass rp = MakeRenderPass(colors, bp.count, dfmt, bp.has_stencil ? dfmt : VK_FORMAT_UNDEFINED, loads,
+                                         ds ? bp.depth.loadOp : VK_ATTACHMENT_LOAD_OP_LOAD);
+        VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fi.renderPass = rp;
+        fi.attachmentCount = nviews;
+        fi.pAttachments = views;
+        fi.width = std::max(1u, bp.area.extent.width);
+        fi.height = std::max(1u, bp.area.extent.height);
+        fi.layers = 1;
+        VkFramebuffer fb = VK_NULL_HANDLE;
+        if (!rp || vkCreateFramebuffer(device_, &fi, nullptr, &fb) != VK_SUCCESS) {
+            LogOnce("framebuffer", "vkCreateFramebuffer failed");
+            return;
+        }
+        slots_[rec_slot_].framebuffers.push_back(fb);
+        VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        bi.renderPass = rp;
+        bi.framebuffer = fb;
+        bi.renderArea = bp.area;
+        bi.clearValueCount = nviews;
+        bi.pClearValues = clears;
+        vkCmdBeginRenderPass(cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    }
     bool recording_ = false, rendering_ = false;
     std::vector<uint64_t> rendering_key_;
 
@@ -5312,6 +5540,7 @@ private:
         bool ts_written = false;
         VkDescriptorPool pool = VK_NULL_HANDLE;
         std::vector<VkDescriptorPool> extra_pools;  // when `pool` fills up (recorder thread)
+        std::vector<VkFramebuffer> framebuffers;    // render pass fallback: destroyed when the slot is reused
         uint64_t submits_queued = 0;                // render thread
         uint64_t seq = 0;                           // submit_seq_ of its last submission
         std::atomic<uint64_t> submits_done{0};      // recorder, after vkQueueSubmit
