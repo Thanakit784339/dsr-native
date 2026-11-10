@@ -1777,7 +1777,13 @@ private:
         // `hole_test` 2/3 (diagnostic): depth images mutable, which makes Adreno store them uncompressed.
         if ((dsr::GetRuntime().config.hole_test & 2) && IsDepthFormat(t.tex.format))
             ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-        if (pair[1] != VK_FORMAT_UNDEFINED) {
+        // `hole_test` 256: colour render targets mutable with no format list (stored uncompressed on Adreno).
+        const bool plain_color = (dsr::GetRuntime().config.hole_test & 256) && !IsDepthFormat(t.tex.format) &&
+                                 (ci.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        if (plain_color) {
+            ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+            if (pair[1] != VK_FORMAT_UNDEFINED) img.twin = pair[1];
+        } else if (pair[1] != VK_FORMAT_UNDEFINED) {
             ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
             fl.viewFormatCount = 2;
             fl.pViewFormats = pair;
@@ -2481,6 +2487,9 @@ private:
             completed_seq_ = std::max(completed_seq_, sl.seq);  // one queue: earlier submissions are done too
             ReapRetired();
         }
+        // `hole_test` 128 (square holes): the CPU waits for the GPU to finish everything before it writes into the
+        // next slot, so nothing the GPU may still read can change under it.
+        if (dsr::GetRuntime().config.hole_test & 128) WaitGpuIdle();
         UseSlot(n);
         ResetTransient();
     }
