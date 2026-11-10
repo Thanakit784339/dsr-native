@@ -36,6 +36,9 @@ jobs:
       - name: Show APK signature
         run: $ANDROID_HOME/build-tools/34.0.0/apksigner verify --print-certs android/app/build/outputs/apk/debug/*.apk
 
+      - name: List native libraries in the APK
+        run: unzip -l android/app/build/outputs/apk/debug/*.apk | grep '\.so$'
+
       - uses: actions/upload-artifact@v4
         with:
           name: dsr-native-apk-${{ github.sha }}
