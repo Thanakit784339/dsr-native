@@ -382,6 +382,7 @@ struct Image {
     // Ever had depth written by a fragment shader (gl_FragDepth): depth tests against it are done in the shader.
     bool fragdepth_written = false;
     BcKind bc = BcKind::None;  // block-compressed texture decoded on upload (GPU without BC support)
+    bool storage = false;      // created with VK_IMAGE_USAGE_STORAGE_BIT
     uint64_t attach_gen = 0;  // times attached to a render pass (`hole_test` 16 copies)
     VkClearValue clear_value{};
     VkImageAspectFlags clear_aspect = 0;
@@ -1306,12 +1307,27 @@ private:
         qci.queueFamilyIndex = family_;
         qci.queueCount = 1;
         qci.pQueuePriorities = &prio;
-        const char* dev_ext[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+        const char* dev_ext[2] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, nullptr};
+        uint32_t ndev_ext = 1;
+        // Image format lists (core in 1.2): with them, sRGB/linear-viewable images keep their compression.
+        format_list_ = VK_API_VERSION_MINOR(props_.apiVersion) >= 2;
+        if (!format_list_) {
+            uint32_t n = 0;
+            vkEnumerateDeviceExtensionProperties(phys_, nullptr, &n, nullptr);
+            std::vector<VkExtensionProperties> exts(n);
+            vkEnumerateDeviceExtensionProperties(phys_, nullptr, &n, exts.data());
+            for (const VkExtensionProperties& e : exts)
+                if (!strcmp(e.extensionName, VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME)) {
+                    dev_ext[ndev_ext++] = VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME;
+                    format_list_ = true;
+                }
+            LOGI(kTag, "image format lists: %s", format_list_ ? "VK_KHR_image_format_list" : "not available");
+        }
         VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         dci.pNext = &en2;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
-        dci.enabledExtensionCount = 1;
+        dci.enabledExtensionCount = ndev_ext;
         dci.ppEnabledExtensionNames = dev_ext;
         r = vkCreateDevice(phys_, &dci, nullptr, &device_);
         if (r != VK_SUCCESS) {
@@ -1328,7 +1344,9 @@ private:
             begin_rendering_ = nullptr;
             end_rendering_ = nullptr;
             rp_fallback_ = true;
-            LOGI(kTag, "no dynamic rendering: using render pass objects instead");
+            lean_images_ = true;
+            LOGI(kTag, "no dynamic rendering: using render pass objects instead; storage usage only on images "
+                       "written as storage images");
         }
 
         vkGetDeviceQueue(device_, family_, 0, &queue_);
@@ -1777,6 +1795,118 @@ private:
         return img;
     }
 
+    // Creates the VkImage (and its memory) for an Image's description. `img.twin` = the sRGB/linear counterpart
+    // views may use (UNDEFINED: none); it is cleared when the image cannot be viewed that way.
+    bool AllocImage(Image& img, bool storage, VkImage* out_image, VkDeviceMemory* out_memory) {
+        const int target = img.target;
+        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.imageType = img.type;
+        ci.format = img.vk_format;
+        ci.extent = {uint32_t(img.width), uint32_t(img.type == VK_IMAGE_TYPE_1D ? 1 : img.height), uint32_t(img.depth)};
+        ci.mipLevels = uint32_t(img.levels);
+        ci.arrayLayers = uint32_t(img.layers);
+        ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        if ((target == kTargetCubemap || target == kTargetCubemapArray) && img.layers % 6 == 0 &&
+            img.width == img.height)
+            ci.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+        ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (storage) ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        img.storage = storage;
+        if (IsDepthFormat(img.nvn_format))
+            ci.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        else if (img.features & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)
+            ci.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        // Formats with an sRGB/linear counterpart may be viewed as either (NVN texture views): mutable, with the
+        // pair listed so the driver can keep its compression.
+        VkFormat pair[2] = {img.vk_format, img.twin};
+        VkImageFormatListCreateInfo fl{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+        // `hole_test` 2/3 (diagnostic): depth images mutable, which makes Adreno store them uncompressed.
+        if ((dsr::GetRuntime().config.hole_test & 2) && IsDepthFormat(img.nvn_format))
+            ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        // `hole_test` 256: colour render targets mutable with no format list (stored uncompressed on Adreno).
+        const bool plain_color = (dsr::GetRuntime().config.hole_test & 256) && !IsDepthFormat(img.nvn_format) &&
+                                 (ci.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        if (plain_color) {
+            ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        } else if (pair[1] != VK_FORMAT_UNDEFINED) {
+            ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+            fl.viewFormatCount = 2;
+            fl.pViewFormats = pair;
+            // The format list is Vulkan 1.2 or VK_KHR_image_format_list (without it Adreno stores mutable images
+            // uncompressed).
+            if (format_list_) ci.pNext = &fl;
+        }
+        VkImage image = VK_NULL_HANDLE;
+        if (vkCreateImage(device_, &ci, nullptr, &image) != VK_SUCCESS) {
+            LogOnce("image", "vkCreateImage failed for %dx%d format %d", img.width, img.height, img.nvn_format);
+            return false;
+        }
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(device_, image, &req);
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        if (vkAllocateMemory(device_, &ai, nullptr, &memory) != VK_SUCCESS) {
+            vkDestroyImage(device_, image, nullptr);
+            LogOnce("memory", "out of GPU memory for %dx%d format %d", img.width, img.height, img.nvn_format);
+            return false;
+        }
+        vkBindImageMemory(device_, image, memory, 0);
+        *out_image = image;
+        *out_memory = memory;
+        return true;
+    }
+
+    // An image the game writes as a storage image but that was created without the usage (lean_images_):
+    // re-created with it, contents copied over; the old one is retired like a destroyed image.
+    bool AddStorage(Image& img) {
+        if (!lean_images_ || img.storage || !(img.features & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) return img.storage;
+        storage_addrs_.insert(img.addr);
+        EndRendering();
+        VkImage ni = VK_NULL_HANDLE;
+        VkDeviceMemory nm = VK_NULL_HANDLE;
+        if (!AllocImage(img, true, &ni, &nm)) return false;
+        const bool keep = img.written || img.uploaded || img.clear_pending;
+        if (keep) Transition(img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        const VkImage old_image = img.image;
+        Retired r{submit_seq_ + 1, img.image, img.memory, {}};
+        for (auto& [k, v] : img.views) r.views.push_back(v);
+        retired_.push_back(std::move(r));
+        img.views.clear();
+        img.fast_views.clear();
+        img.image = ni;
+        img.memory = nm;
+        img.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        img.attach_unsynced = false;
+        if (keep) {
+            Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            std::vector<VkImageCopy> regions;
+            for (int l = 0; l < img.levels; l++) {
+                VkImageCopy c{};
+                c.srcSubresource = {img.aspect, uint32_t(l), 0, uint32_t(img.layers)};
+                c.dstSubresource = c.srcSubresource;
+                c.extent = {uint32_t(std::max(1, img.width >> l)),
+                            uint32_t(img.type == VK_IMAGE_TYPE_1D ? 1 : std::max(1, img.height >> l)),
+                            uint32_t(std::max(1, img.depth >> l))};
+                regions.push_back(c);
+            }
+            Rec([regions = std::move(regions), old_image, ni](VkCommandBuffer cb) {
+                vkCmdCopyImage(cb, old_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ni,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()), regions.data());
+            });
+        }
+        Rec([this](VkCommandBuffer) {
+            persist_cache_.clear();
+            desc_cache_.clear();
+        });
+        LOGI(kTag, "image %dx%d format %d is written as a storage image: re-created with storage usage (%zu so far)",
+             img.width, img.height, img.nvn_format, storage_addrs_.size());
+        return true;
+    }
+
     Image* CreateImage(const TexRef& t) {
         VkFormatFeatureFlags feats = 0;
         VkFormat vf = PickFormat(t.tex.format, &feats);
@@ -1809,60 +1939,11 @@ private:
         img.type = t.tex.target == kTarget3D ? VK_IMAGE_TYPE_3D
                    : (t.tex.target == kTarget1D || t.tex.target == kTarget1DArray) ? VK_IMAGE_TYPE_1D
                                                                                     : VK_IMAGE_TYPE_2D;
-        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ci.imageType = img.type;
-        ci.format = vf;
-        ci.extent = {uint32_t(img.width), uint32_t(img.type == VK_IMAGE_TYPE_1D ? 1 : img.height), uint32_t(img.depth)};
-        ci.mipLevels = uint32_t(img.levels);
-        ci.arrayLayers = uint32_t(img.layers);
-        ci.samples = VK_SAMPLE_COUNT_1_BIT;
-        ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-        if ((t.tex.target == kTargetCubemap || t.tex.target == kTargetCubemapArray) && img.layers % 6 == 0 &&
-            img.width == img.height)
-            ci.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-        ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        if (feats & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-        if (IsDepthFormat(t.tex.format))
-            ci.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-        else if (feats & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)
-            ci.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        // Formats with an sRGB/linear counterpart may be viewed as either (NVN texture views): mutable, with the
-        // pair listed so the driver can keep its compression.
-        VkFormat pair[2] = {vf, SrgbTwin(vf)};
-        VkImageFormatListCreateInfo fl{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
-        // `hole_test` 2/3 (diagnostic): depth images mutable, which makes Adreno store them uncompressed.
-        if ((dsr::GetRuntime().config.hole_test & 2) && IsDepthFormat(t.tex.format))
-            ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-        // `hole_test` 256: colour render targets mutable with no format list (stored uncompressed on Adreno).
-        const bool plain_color = (dsr::GetRuntime().config.hole_test & 256) && !IsDepthFormat(t.tex.format) &&
-                                 (ci.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-        if (plain_color) {
-            ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-            if (pair[1] != VK_FORMAT_UNDEFINED) img.twin = pair[1];
-        } else if (pair[1] != VK_FORMAT_UNDEFINED) {
-            ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-            fl.viewFormatCount = 2;
-            fl.pViewFormats = pair;
-            // The format list is Vulkan 1.2 (or VK_KHR_image_format_list): older drivers get the mutable flag only.
-            if (VK_API_VERSION_MINOR(props_.apiVersion) >= 2) ci.pNext = &fl;
-            img.twin = pair[1];
-        }
-        if (vkCreateImage(device_, &ci, nullptr, &img.image) != VK_SUCCESS) {
-            LogOnce("image", "vkCreateImage failed for %dx%d format %d", img.width, img.height, img.nvn_format);
-            return nullptr;
-        }
-        VkMemoryRequirements req;
-        vkGetImageMemoryRequirements(device_, img.image, &req);
-        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        ai.allocationSize = req.size;
-        ai.memoryTypeIndex = FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (vkAllocateMemory(device_, &ai, nullptr, &img.memory) != VK_SUCCESS) {
-            vkDestroyImage(device_, img.image, nullptr);
-            LogOnce("memory", "out of GPU memory for %dx%d format %d", img.width, img.height, img.nvn_format);
-            return nullptr;
-        }
-        vkBindImageMemory(device_, img.image, img.memory, 0);
+        img.twin = SrgbTwin(vf);
+        // Older Adreno GPUs keep no bandwidth compression (UBWC) for images that may be storage images, so there
+        // the usage is only added to images the game has written as storage images (see AddStorage).
+        const bool storage = (feats & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && (!lean_images_ || storage_addrs_.count(t.addr));
+        if (!AllocImage(img, storage, &img.image, &img.memory)) return nullptr;
         if (images_created_++ < 48)
             LOGI(kTag, "image %dx%d%s NVN format %d (target %d, %d levels, %d layers) -> Vulkan format %d", img.width,
                  img.height, img.depth > 1 ? "x3D" : "", img.nvn_format, img.target, img.levels, img.layers, vf);
@@ -3712,6 +3793,7 @@ private:
                 Image* img = ref.valid ? GetImage(ref, false) : nullptr;
                 if (!img) return Skip("storage image not bound");
                 if (!(img->features & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) return Skip("storage image format not supported");
+                if (!img->storage && !AddStorage(*img)) return Skip("storage image could not be re-created");
                 bool conflict = false;
                 for (Image* c : colors) conflict |= c == img;
                 if (conflict || depth == img) {
@@ -5327,6 +5409,11 @@ private:
     PFN_vkCmdBeginRendering begin_rendering_ = nullptr;
     PFN_vkCmdEndRendering end_rendering_ = nullptr;
     bool rp_fallback_ = false;  // no dynamic rendering: VkRenderPass + VkFramebuffer per pass
+    bool format_list_ = false;  // VkImageFormatListCreateInfo usable (Vulkan 1.2 or VK_KHR_image_format_list)
+    // Older GPUs (Adreno 6xx): images get VK_IMAGE_USAGE_STORAGE_BIT only once written as storage images, since
+    // the usage turns off their bandwidth compression. storage_addrs_: the game addresses of those.
+    bool lean_images_ = false;
+    std::unordered_set<uint64_t> storage_addrs_;
 
     // ---- render pass objects (GPUs without dynamic rendering) ----------------------------------------------
     // Render passes are cached by formats + load operations; framebuffers are made per pass and destroyed once
