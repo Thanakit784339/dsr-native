@@ -45,6 +45,7 @@ int main(int argc, char** argv) {
         if (!only.empty() && std::find(only.begin(), only.end(), int(h.index)) == only.end()) continue;
         total++;
         TranslateOptions opt;
+        if (getenv("DSR_DEBUG_OUTPUTS")) { opt.debug_outputs = true; opt.alpha_func = 5; }
         if (const char* a = getenv("DSR_ALPHA_FUNC")) opt.alpha_func = atoi(a);  // validate alpha-test variants
         TranslateResult r = Translate(code, h.code_size, opt);
         if (!r.ok) {
