@@ -103,7 +103,7 @@ void EnginePanic(const char* file, int line, const char* fmt, ...) {
 // scene keeps a 16:9 aspect ratio. Cameras keep {fov, aspect, near, far} at +0x50..+0x5c (main+0xfa7f4 reads
 // fov and aspect for the view frustum). This scans the guest heap and the game's data for such blocks with a
 // 16:9 aspect, logs them (with the owner's vtable, to find the code that sets it) and writes the wanted aspect
-// into them, again every 250 ms (rescanning every 20 s).
+// into them, again every 100 ms (rescanning every 2 s until cameras are found, then every 5 s).
 float g_aspect = 0;
 void CameraAspectThread() {
     pthread_setname_np(pthread_self(), "dsr-aspect");
@@ -115,7 +115,7 @@ void CameraAspectThread() {
         return fov > 0.2f && fov < 2.5f && nearz > 0.001f && nearz < 50.0f && farz > nearz && farz < 1e6f;
     };
     for (;;) {
-        std::this_thread::sleep_for(std::chrono::seconds(scans == 0 ? 20 : 20));
+        const auto scan_start = std::chrono::steady_clock::now();
         // Scan: 16:9 exactly (0x3FE38E39) at a 4-byte boundary.
         uintptr_t hb = 0;
         size_t hs = 0;
@@ -144,12 +144,16 @@ void CameraAspectThread() {
             }
         }
         scans++;
-        LOGI("hooks", "camera aspect: scan %d: %d new 16:9 cameras, %zu in all; setting them to %.3f", scans, new_found,
-             found.size(), g_aspect);
-        for (int k = 0; k < 80; k++) {  // 20 s of rewrites at 250 ms
+        const double scan_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - scan_start).count();
+        if (new_found || scans <= 3 || scans % 60 == 0)
+            LOGI("hooks", "camera aspect: scan %d (%.0f ms): %d new 16:9 cameras, %zu in all; setting them to %.3f", scans,
+                 scan_ms, new_found, found.size(), g_aspect);
+        const int rewrites = found.empty() ? 20 : 50;  // 2 s, then 5 s between scans
+        for (int k = 0; k < rewrites; k++) {
             for (float* a : found)
                 if (*a > 1.7777f && *a < 1.7779f && plausible(a)) *a = g_aspect;
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
 }

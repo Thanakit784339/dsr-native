@@ -4287,7 +4287,11 @@ private:
                 const float kx = float(hud_box_w_) / 1280.0f, ky = float(hud_box_h_) / 720.0f;
                 l = std::max(l, x0 + float(st_.scissor[0]) * kx);
                 t = std::max(t, y0 + float(st_.scissor[1]) * ky);
-                r = std::min(r, x0 + float(st_.scissor[0] + st_.scissor[2]) * kx);
+                // The game cuts its rectangles at the frame's edge (960 on a 4:3 frame), which in layout units is
+                // not the right edge: one ending there runs to the layout's right edge (1280).
+                const float right = st_.scissor[0] + st_.scissor[2] >= float(extent.width) - 0.5f
+                                        ? 1280.0f : st_.scissor[0] + st_.scissor[2];
+                r = std::min(r, x0 + right * kx);
                 b = std::min(b, y0 + float(st_.scissor[1] + st_.scissor[3]) * ky);
             }
             const int il = int(std::floor(l)), it = int(std::floor(t)), ir = int(std::ceil(r)), ib = int(std::ceil(b));
