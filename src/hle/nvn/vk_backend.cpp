@@ -4269,6 +4269,7 @@ private:
         // shaders: quads, text, bars) goes into a centred 16:9 box instead: 1280x720 in the middle of wider frames,
         // the full width and 9/16 of it high on narrower ones, so the HUD keeps its shape and layout. Full-screen
         // quads (fades, dimming behind menus) still cover the whole frame.
+        if (FixedQuad(p, vin, extent)) d.dyn.vp.width *= float(extent.width) / 1280.0f;
         if (hud_box_w_ && extent.height == 720 && int(extent.width) == dsr::GetRuntime().config.render_width &&
             HudBoxed(p, vin)) {
             const float sx = float(hud_box_w_) / float(extent.width), sy = float(hud_box_h_) / 720.0f;
@@ -5752,30 +5753,34 @@ private:
     // Whether a draw on the final frame is one of the game's 2D HUD / menu draws to keep in a 16:9 box: its vertex
     // shader's c3 is the 2D projection for a 1280x720 layout (x * 2/1280 - 1, y * -2/720 + 1), and its vertices do
     // not cover the whole 1280x720 screen (full-screen fades and dimming are left to fill the frame).
-    bool HudBoxed(const DrawParams& p, const VertexInput& vin) {
+    // The game's 2D projection in vertex shader c3 (row-major: x scale, y scale, translation -1 / +1), if it is one.
+    bool Projection2D(float* sx, float* sy) {
         const BufferRange& c3 = st_.uniforms[0][0];
         if (!c3.address || c3.size < 64 || !GuestRangeValid(c3.address, 64)) return false;
         float m[16];
         memcpy(m, reinterpret_cast<const void*>(c3.address), sizeof(m));
-        if (std::fabs(m[0] - 2.0f / 1280.0f) > 1e-6f || std::fabs(m[5] + 2.0f / 720.0f) > 1e-6f || m[1] != 0.0f ||
-            m[4] != 0.0f || std::fabs(m[3] + 1.0f) > 1e-4f || std::fabs(m[7] - 1.0f) > 1e-4f)
-            return false;
-        // HUD and menu draws blend; the game's final full-screen copy of the frame (same projection) does not.
-        if (!(st_.color.blend_enable & 1)) return false;
-        // The position attribute (location 0): its stream, format and the vertices the draw reads.
+        if (m[1] != 0.0f || m[4] != 0.0f || std::fabs(m[3] + 1.0f) > 1e-4f || std::fabs(m[7] - 1.0f) > 1e-4f) return false;
+        *sx = m[0];
+        *sy = m[5];
+        return true;
+    }
+    // The 2D extent of a draw's vertices (position attribute at location 0), read from guest memory; false if it
+    // cannot be read.
+    bool DrawBounds(const DrawParams& p, const VertexInput& vin, float* x0, float* x1, float* y0, float* y1) {
         const VkVertexInputAttributeDescription* pos = nullptr;
         for (const VkVertexInputAttributeDescription& a : vin.attributes)
             if (a.location == 0) pos = &a;
-        if (!pos || p.count <= 0 || p.count > 4096 || p.instances != 1) return true;
+        if (!pos || p.count <= 0 || p.count > 4096 || p.instances != 1) return false;
         uint32_t stride = 0;
         for (const VkVertexInputBindingDescription& b : vin.bindings)
             if (b.binding == pos->binding) stride = b.stride;
         const int fmt = st_.attribs[0].format;
-        if (fmt != 21 && fmt != 22 && fmt != 34 && fmt != 46) return true;
+        if (fmt != 21 && fmt != 22 && fmt != 34 && fmt != 46) return false;
         const BufferRange& vb = st_.vertex_buffers[pos->binding];
         const int isz = p.index_type == 0 ? 1 : p.index_type == 1 ? 2 : p.index_type == 2 ? 4 : 0;
-        if (isz && (!p.index_address || !GuestRangeValid(p.index_address, size_t(p.count) * isz))) return true;
-        float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;
+        if (isz && (!p.index_address || !GuestRangeValid(p.index_address, size_t(p.count) * isz))) return false;
+        *x0 = *y0 = 1e30f;
+        *x1 = *y1 = -1e30f;
         for (int k = 0; k < p.count; k++) {
             int64_t v;
             if (isz) {
@@ -5786,9 +5791,9 @@ private:
             } else {
                 v = int64_t(p.first) + k;
             }
-            if (v < 0) return true;
+            if (v < 0) return false;
             const uint64_t at = uint64_t(v) * stride + pos->offset;
-            if (!vb.address || at + 8 > vb.size || !GuestRangeValid(vb.address + at, 8)) return true;
+            if (!vb.address || at + 8 > vb.size || !GuestRangeValid(vb.address + at, 8)) return false;
             const uint8_t* src = reinterpret_cast<const uint8_t*>(vb.address + at);
             float x, y;
             if (fmt == 21) {
@@ -5802,11 +5807,24 @@ private:
                 x = xy[0];
                 y = xy[1];
             }
-            x0 = std::min(x0, x);
-            x1 = std::max(x1, x);
-            y0 = std::min(y0, y);
-            y1 = std::max(y1, y);
+            *x0 = std::min(*x0, x);
+            *x1 = std::max(*x1, x);
+            *y0 = std::min(*y0, y);
+            *y1 = std::max(*y1, y);
         }
+        return true;
+    }
+    // Whether a draw on the final frame is one of the game's 2D HUD / menu draws to keep in a 16:9 box: its vertex
+    // shader's c3 is the 2D projection for a 1280x720 layout (x * 2/1280 - 1, y * -2/720 + 1), it blends, and its
+    // vertices do not cover the whole 1280x720 screen (full-screen fades and dimming are left to fill the frame).
+    bool HudBoxed(const DrawParams& p, const VertexInput& vin) {
+        float sx, sy;
+        if (!Projection2D(&sx, &sy) || std::fabs(sx - 2.0f / 1280.0f) > 1e-6f || std::fabs(sy + 2.0f / 720.0f) > 1e-6f)
+            return false;
+        // HUD and menu draws blend; the game's final full-screen copy of the frame (same projection) does not.
+        if (!(st_.color.blend_enable & 1)) return false;
+        float x0, x1, y0, y1;
+        if (!DrawBounds(p, vin, &x0, &x1, &y0, &y1)) return true;
         const bool full = x0 <= 2.0f && x1 >= 1278.0f && y0 <= 2.0f && y1 >= 718.0f;
         const uint64_t hash = st_.program[0]->hash;
         if (hud_box_logged_.insert(hash * 2 + (full ? 1 : 0)).second)
@@ -5815,8 +5833,26 @@ private:
         if (full) hud_full_screen_++;
         return !full;
     }
+    // Other aspect ratios: some of the game's full-screen effect passes draw a 1280x720 quad (a fixed size) with
+    // the projection of the real frame width, so on wider frames they stop at 1280 pixels (on narrower ones they
+    // overshoot). Such a quad is stretched to the frame: true if this draw is one.
+    bool FixedQuad(const DrawParams& p, const VertexInput& vin, VkExtent2D extent) {
+        const int rw = dsr::GetRuntime().config.render_width;
+        if (rw == 1280 || int(extent.width) != rw || extent.height != 720 || p.count > 6) return false;
+        float sx, sy;
+        if (!Projection2D(&sx, &sy) || std::fabs(sx - 2.0f / float(rw)) > 1e-6f || std::fabs(sy + 2.0f / 720.0f) > 1e-6f)
+            return false;
+        float x0, x1, y0, y1;
+        if (!DrawBounds(p, vin, &x0, &x1, &y0, &y1)) return false;
+        const bool fixed = std::fabs(x0) < 1.0f && std::fabs(x1 - 1280.0f) < 1.0f && std::fabs(y0) < 1.0f &&
+                           std::fabs(y1 - 720.0f) < 1.0f;
+        if (fixed && fixed_quad_logged_.insert(st_.program[0]->hash).second)
+            LOGI(kTag, "aspect ratio: 1280x720 full-screen quad (vertex shader %016llx) stretched to the %dx720 frame",
+                 (unsigned long long)st_.program[0]->hash, rw);
+        return fixed;
+    }
     int hud_box_w_ = 0, hud_box_h_ = 0;
-    std::unordered_set<uint64_t> hud_box_logged_;
+    std::unordered_set<uint64_t> hud_box_logged_, fixed_quad_logged_;
     uint64_t hud_full_screen_ = 0;
     uint64_t hud_draws_boxed_ = 0;
     int viewports_logged_ = 0;

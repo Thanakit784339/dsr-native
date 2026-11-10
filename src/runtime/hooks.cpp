@@ -103,7 +103,7 @@ void EnginePanic(const char* file, int line, const char* fmt, ...) {
 // scene keeps a 16:9 aspect ratio. Cameras keep {fov, aspect, near, far} at +0x50..+0x5c (main+0xfa7f4 reads
 // fov and aspect for the view frustum). This scans the guest heap and the game's data for such blocks with a
 // 16:9 aspect, logs them (with the owner's vtable, to find the code that sets it) and writes the wanted aspect
-// into them, again every 100 ms (rescanning every 2 s until cameras are found, then every 5 s).
+// into them, again every second (rescanning every 2 s until cameras are found, then every 10 s).
 float g_aspect = 0;
 void CameraAspectThread() {
     pthread_setname_np(pthread_self(), "dsr-aspect");
@@ -149,11 +149,11 @@ void CameraAspectThread() {
         if (new_found || scans <= 3 || scans % 60 == 0)
             LOGI("hooks", "camera aspect: scan %d (%.0f ms): %d new 16:9 cameras, %zu in all; setting them to %.3f", scans,
                  scan_ms, new_found, found.size(), g_aspect);
-        const int rewrites = found.empty() ? 20 : 50;  // 2 s, then 5 s between scans
+        const int rewrites = found.empty() ? 2 : 10;  // 2 s, then 10 s between scans
         for (int k = 0; k < rewrites; k++) {
             for (float* a : found)
                 if (*a > 1.7777f && *a < 1.7779f && plausible(a)) *a = g_aspect;
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }
 }
