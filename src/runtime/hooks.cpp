@@ -161,8 +161,10 @@ void InstallGameHooks() {
     //   also becomes the screen size floats (main+0x1af4a7c / +0x1af4a84) the cameras take their aspect ratio
     //   from (e.g. main+0xbca88), so the 3D view widens (or narrows) instead of stretching;
     // - the handheld display mode (main+0x716158: main+0x716170 mov w1, #1280; +0x716178 mov w2, #720).
-    // Frame buffers are allocated at 1920x1080 (main+0x70a20c), the limit. Wider than 16:9: 720 high, wider;
-    // narrower: 1280 wide, taller.
+    // Frame buffers are allocated at 1920x1080 (main+0x70a20c), the limit. The height always stays 720: the
+    // game's half- and quarter-size buffers (640x360, 320x180) keep their 720-line sizes whatever the render
+    // resolution, and a 4:3 test at 1280x960 died silently on loading a save. Only the width changes: wider
+    // than 16:9 shows more at the sides, narrower (4:3: 960x720) less.
     if (rt.config.aspect_ratio != "16:9" && !rt.config.docked) {
         float ar = 0;
         if (rt.config.aspect_ratio == "auto") {
@@ -172,20 +174,14 @@ void InstallGameHooks() {
             if (sscanf(rt.config.aspect_ratio.c_str(), "%f:%f", &w, &h) == 2 && h > 0) ar = w / h;
         }
         if (ar > 0) {
-            int width = 1280, height = 720;
-            if (ar >= 16.0f / 9.0f)
-                width = std::min(1920, int(std::lround(720.0f * ar / 8.0f)) * 8);
-            else
-                height = std::min(1080, int(std::lround(1280.0f / ar / 8.0f)) * 8);
+            const int height = 720;
+            const int width = std::clamp(int(std::lround(720.0f * ar / 8.0f)) * 8, 640, 1920);
             std::string err;
             auto mov = [](int rd, int v) { return 0x52800000u | (uint32_t(v) << 5) | uint32_t(rd); };
             bool ok = true;
             if (width != 1280)
                 ok = ok && rt.main.PatchInstruction(0x6a170c, 0x5280A002, mov(2, width), &err) &&
                      rt.main.PatchInstruction(0x716170, 0x5280A001, mov(1, width), &err);
-            if (height != 720)
-                ok = ok && rt.main.PatchInstruction(0x6a1758, 0x52805A02, mov(2, height), &err) &&
-                     rt.main.PatchInstruction(0x716178, 0x52805A02, mov(2, height), &err);
             if (ok)
                 LOGI("hooks", "aspect ratio %s (%.3f): the game renders at %dx%d (was 1280x720)",
                      rt.config.aspect_ratio.c_str(), ar, width, height);
