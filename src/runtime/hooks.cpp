@@ -119,9 +119,10 @@ void PadSetAxis(uint8_t* self, int axis, float value) {
 // negative contribution of the frame (device+0xd0 / +0xf8) and stores their sum in the action values
 // (device+0x148). Reimplemented here to learn which action the right stick feeds: only a swipe's overdriven
 // stick gives |value| > 1. That action's value is then watched: a background thread write-protects its page
-// at random moments (20 ms apart), and the first access after that faults; the fault handler records who read
-// it (pc, lr and the frame-pointer chain), unprotects the page and lets the access go on. The camera code that
-// turns (and caps the turn speed) is among the readers. Logged every 10 s for 30 s, once per run.
+// and the next access faults; the fault handler records who read
+// it (pc, lr and the frame-pointer chain), unprotects the page and lets the access go on; the thread protects it
+// again right away. The camera code that turns (and caps the turn speed) is among the readers. Logged every
+// 10 s for 30 s, once per run.
 namespace probe {
 std::atomic<uint8_t*> g_dev{nullptr};
 std::atomic<int> g_action{-1};
@@ -133,6 +134,7 @@ struct Sample {
 constexpr int kSamples = 4096;
 Sample g_samples[kSamples];
 std::atomic<int> g_nsamples{0};
+std::atomic<int> g_faults{0};  // all faults on the page (any address)
 struct sigaction g_old_segv;
 size_t g_pagesize = 4096;
 
@@ -142,6 +144,7 @@ void OnFault(int sig, siginfo_t* si, void* uc_v) {
     if (page && addr >= page && addr < page + g_pagesize) {
         mprotect(reinterpret_cast<void*>(page), g_pagesize, PROT_READ | PROT_WRITE);
         g_armed.store(false, std::memory_order_release);
+        g_faults.fetch_add(1, std::memory_order_relaxed);
         const uintptr_t target = g_target.load(std::memory_order_relaxed);
         if (addr >= target && addr < target + 4) {
             const int i = g_nsamples.fetch_add(1, std::memory_order_relaxed);
@@ -193,12 +196,15 @@ void Run() {
     g_target = target;
     LOGI("hooks", "camera probe: right stick feeds action %d (device %p, value at %p): watching its readers", action,
          dev, reinterpret_cast<void*>(target));
-    uint32_t rnd = 12345;
+    // The value shares its page with the device object, which the input code touches all the time: the page
+    // is protected again right after every fault (a few tens of microseconds), so the reads that come later in
+    // the frame, outside the input code, still find it protected.
+    const uintptr_t page0 = target & ~(uintptr_t(g_pagesize) - 1);
+    (void)page0;
     const auto start = std::chrono::steady_clock::now();
     auto report = start + std::chrono::seconds(10);
     for (;;) {
-        rnd = rnd * 1664525u + 1013904223u;
-        std::this_thread::sleep_for(std::chrono::microseconds(15000 + (rnd >> 8) % 10000));
+        std::this_thread::sleep_for(std::chrono::microseconds(30));
         if (!g_armed.load()) {
             const uintptr_t page = target & ~(uintptr_t(g_pagesize) - 1);
             g_page.store(page, std::memory_order_release);
@@ -212,7 +218,10 @@ void Run() {
             std::map<std::vector<uintptr_t>, int> counts;
             for (int i = 0; i < n; i++)
                 counts[std::vector<uintptr_t>(g_samples[i].chain, g_samples[i].chain + 8)]++;
+            LOGI("hooks", "camera probe: %d accesses to action %d caught in the last 10 s (%d page faults in all)", n,
+                 action, g_faults.exchange(0));
             for (const auto& [c, k] : counts) {
+                if (!c[0] && !c[1]) continue;  // our own action writer
                 std::string line;
                 for (uintptr_t a : c) {
                     if (!a) break;
