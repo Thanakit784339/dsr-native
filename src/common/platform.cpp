@@ -5,8 +5,13 @@
 #include <string>
 
 #if defined(__linux__)
+#include <pthread.h>
 #include <sched.h>
+#include <unistd.h>
+#include <chrono>
 #include <cstdio>
+#include <thread>
+#include <vector>
 #endif
 
 #include "common/log.h"
@@ -16,16 +21,17 @@ namespace dsr::platform {
 namespace {
 std::atomic<CreateUserFileFn> g_create{nullptr};
 }
-void PreferFastCores(const char* who) {
+// The cores to keep busy threads on (all but the slowest kind), computed once. count 0: one kind of core.
+namespace {
 #if defined(__ANDROID__)
-    thread_local bool done = false;
-    if (done) return;
-    done = true;
-    if (!dsr::GetRuntime().config.fast_cores) return;
-    static cpu_set_t set;
-    static int count = -1;
+struct FastCores {
+    cpu_set_t set;
+    int count = 0;
+    std::string list;
+};
+const FastCores& GetFastCores() {
+    static FastCores fc;
     static std::once_flag once;
-    static std::string list;
     std::call_once(once, [] {
         long khz[32] = {}, lowest = 0, highest = 0;
         for (int cpu = 0; cpu < 32; cpu++) {
@@ -38,19 +44,70 @@ void PreferFastCores(const char* who) {
             if (khz[cpu] > 0 && (!lowest || khz[cpu] < lowest)) lowest = khz[cpu];
             if (khz[cpu] > highest) highest = khz[cpu];
         }
-        CPU_ZERO(&set);
-        count = 0;
+        CPU_ZERO(&fc.set);
         if (!lowest || lowest == highest) return;  // one kind of core: nothing to avoid
         for (int cpu = 0; cpu < 32; cpu++)
             if (khz[cpu] > lowest) {
-                CPU_SET(cpu, &set);
-                list += " " + std::to_string(cpu);
-                count++;
+                CPU_SET(cpu, &fc.set);
+                fc.list += " " + std::to_string(cpu);
+                fc.count++;
             }
     });
-    if (count <= 0) return;
-    const int r = sched_setaffinity(0, sizeof(set), &set);
-    LOGI("platform", "%s kept on CPUs%s: %s", who, list.c_str(), r == 0 ? "ok" : "refused");
+    return fc;
+}
+// Android moves an app's threads between cpusets as it changes state (start-up, dialogs, focus), and on older
+// kernels (4.x: Snapdragon 845) that resets their CPU affinity: the busy threads ended up on the efficiency
+// cores for the whole session. A watchdog thread checks the registered threads every second and restores it.
+struct Watched {
+    pid_t tid;
+    std::string who;
+    int restores = 0;
+};
+std::mutex g_watch_mutex;
+std::vector<Watched> g_watched;
+void WatchAffinity() {
+    pthread_setname_np(pthread_self(), "dsr-affinity");
+    const FastCores& fc = GetFastCores();
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::lock_guard<std::mutex> lk(g_watch_mutex);
+        for (size_t i = 0; i < g_watched.size();) {
+            Watched& w = g_watched[i];
+            cpu_set_t cur;
+            CPU_ZERO(&cur);
+            if (sched_getaffinity(w.tid, sizeof(cur), &cur) != 0) {  // thread gone
+                g_watched.erase(g_watched.begin() + long(i));
+                continue;
+            }
+            if (!CPU_EQUAL(&cur, &fc.set)) {
+                const int r = sched_setaffinity(w.tid, sizeof(fc.set), &fc.set);
+                if (++w.restores <= 3 || w.restores % 100 == 0)
+                    LOGI("platform", "%s (tid %d): CPU affinity reset by the system, restored to CPUs%s: %s (%d times)",
+                         w.who.c_str(), int(w.tid), fc.list.c_str(), r == 0 ? "ok" : "refused", w.restores);
+            }
+            i++;
+        }
+    }
+}
+#endif
+}  // namespace
+
+void PreferFastCores(const char* who) {
+#if defined(__ANDROID__)
+    thread_local bool done = false;
+    if (done) return;
+    done = true;
+    if (!dsr::GetRuntime().config.fast_cores) return;
+    const FastCores& fc = GetFastCores();
+    if (fc.count <= 0) return;
+    const int r = sched_setaffinity(0, sizeof(fc.set), &fc.set);
+    LOGI("platform", "%s kept on CPUs%s: %s", who, fc.list.c_str(), r == 0 ? "ok" : "refused");
+    {
+        std::lock_guard<std::mutex> lk(g_watch_mutex);
+        g_watched.push_back({pid_t(gettid()), who});
+    }
+    static std::once_flag watch_once;
+    std::call_once(watch_once, [] { std::thread(WatchAffinity).detach(); });
 #else
     (void)who;
 #endif

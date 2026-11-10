@@ -631,7 +631,10 @@ private:
     }
     void Run() {
         dsr::profiler::RegisterCurrentThread("render (Vulkan)");
-        PinToFastestCores();
+        if (dsr::GetRuntime().config.pin_render_thread)
+            PinToFastestCores();
+        else
+            dsr::platform::PreferFastCores("render thread");  // it ran on the efficiency cores on Snapdragon 845
         for (;;) {
             std::function<void()> task;
             {

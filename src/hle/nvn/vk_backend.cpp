@@ -2322,7 +2322,10 @@ private:
         std::thread([this] {
             pthread_setname_np(pthread_self(), "dsr-record");
             profiler::RegisterCurrentThread("dsr-record");
-            KeepOffSlowCores();
+            if (dsr::GetRuntime().config.fast_cores)
+                dsr::platform::PreferFastCores("recorder thread");  // also restored if the system resets it
+            else
+                KeepOffSlowCores();
             for (;;) {
                 // Batches arrive every few hundred microseconds while the render thread produces: wait for the
                 // next one awake for a moment, then sleep (it stays on the performance cores either way; spinning
