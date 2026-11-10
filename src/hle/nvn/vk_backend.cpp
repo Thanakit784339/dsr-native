@@ -345,6 +345,8 @@ struct Image {
     // Was an attachment of a render pass with no barrier on it since: a later pass that uses it again in the same
     // layout needs a barrier first (see BeginRendering).
     bool attach_unsynced = false;
+    // Depth written by a fragment shader (gl_FragDepth) since the image was last attached: see LrzTouch.
+    bool depth_exported = false;
     VkClearValue clear_value{};
     VkImageAspectFlags clear_aspect = 0;
     int clear_layer = 0, clear_level = 0;
@@ -2541,7 +2543,7 @@ private:
         });
         clears_flushed_++;
     }
-    uint64_t clears_deferred_ = 0, clears_flushed_ = 0, clears_in_pass_ = 0, pass_barriers_ = 0;
+    uint64_t clears_deferred_ = 0, clears_flushed_ = 0, clears_in_pass_ = 0, pass_barriers_ = 0, lrz_touches_ = 0;
     // The render pass currently open: its colour images (and subresources) and depth image.
     Image* pass_colors_[8] = {};
     std::pair<int, int> pass_color_sub_[8] = {};
@@ -2958,6 +2960,7 @@ private:
         *extent = {w, h};
         if (rendering_ && key == rendering_key_) return true;
         EndRendering();
+        if (depth && depth->depth_exported && dsr::GetRuntime().config.lrz_workaround) LrzTouch(*depth);
         // An image the previous pass rendered to, used again here in the same layout, gets no layout transition
         // and so had no barrier: without one the GPU may run the passes overlapped. On tiled GPUs (Adreno) a
         // bin of this pass then loads the image before the earlier pass stored that bin, and whatever it drew
@@ -3180,6 +3183,34 @@ private:
     // ======================================================================================================
     // 1x1 opaque white image for the dimension a shader expects (6 layers for cubes).
     // A copy of a depth buffer, refreshed when depth has been written since the last copy.
+    // Square holes in smoke, fog and glow: the game makes its half- and quarter-size depth buffers with a
+    // full-screen draw writing gl_FragDepth, then depth-tests its particles against them. Frame captures show the
+    // same rectangular screen regions missing from every particle pass of a frame while the depth itself is
+    // right: Adreno's low-resolution depth buffer (LRZ, which rejects whole blocks of pixels early) is left stale
+    // by the depth written from the fragment shader. A copy into a depth image makes the driver drop its LRZ data,
+    // so before such an image is attached again one texel is copied out and straight back (value unchanged).
+    void LrzTouch(Image& depth) {
+        depth.depth_exported = false;
+        TexRef t;
+        t.valid = true;
+        t.addr = 0x400 + uint64_t(uint32_t(depth.nvn_format));  // never a real guest address
+        t.tex.format = depth.nvn_format;
+        t.tex.width = t.tex.height = 1;
+        t.tex.levels = 1;
+        t.tex.target = kTarget2D;
+        t.tex.depth = 1;
+        auto it = images_.find(t.addr);
+        Image* one = it != images_.end() ? &it->second : CreateImage(t);
+        if (!one || one->vk_format != depth.vk_format) return;
+        CopyRegion px;
+        px.width = px.height = px.depth = 1;
+        const VkImageLayout back = depth.layout;
+        CopyImage(depth, px, *one, px, 0);
+        CopyImage(*one, px, depth, px, 0);
+        Transition(depth, back == VK_IMAGE_LAYOUT_UNDEFINED ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : back);
+        lrz_touches_++;
+    }
+
     Image* DepthSnapshot(Image& depth, const TexRef& ref) {
         TexRef snap_ref = ref;
         snap_ref.addr = ref.addr ^ (1ull << 62);
@@ -3807,6 +3838,7 @@ private:
         Phase(5);
         // ---- queue the draw: the recorder thread builds its descriptor sets and records it --------------------
         if (!EnsureRendering(colors, depth, &extent)) return Skip("no render target");
+        if (depth && fs->info.writes_depth && st_.depth.depth_write) depth->depth_exported = true;
         DrawPacket d;
         d.pipeline = pipeline;
         d.layout = layout;
@@ -4964,10 +4996,10 @@ private:
             readbacks_recorded_ = readbacks_done_ = 0;
         }
         LOGI(kTag, "clears: %llu done as render pass loads or deferred, %llu inside passes, %llu performed separately; "
-             "%llu barriers between passes reusing an attachment",
+             "%llu barriers between passes reusing an attachment, %llu depth buffers refreshed for LRZ",
              (unsigned long long)clears_deferred_, (unsigned long long)clears_in_pass_, (unsigned long long)clears_flushed_,
-             (unsigned long long)pass_barriers_);
-        clears_deferred_ = clears_in_pass_ = clears_flushed_ = pass_barriers_ = 0;
+             (unsigned long long)pass_barriers_, (unsigned long long)lrz_touches_);
+        clears_deferred_ = clears_in_pass_ = clears_flushed_ = pass_barriers_ = lrz_touches_ = 0;
         if (rt_writebacks_ || reports_done_) {
             LOGI(kTag, "small render targets written back to game memory: %llu; reports written: %llu",
                  (unsigned long long)rt_writebacks_, (unsigned long long)reports_done_);

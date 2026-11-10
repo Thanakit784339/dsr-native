@@ -343,7 +343,9 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     PRESENT_MODE_HELP
                     "present_mode = mailbox\n"
                     FACE_BUTTONS_HELP
-                    "face_buttons = label\n",
+                    "face_buttons = label\n"
+                    "# lrz_workaround: 1 = fix for see-through squares in smoke, fog and glow (0 = off, for testing)\n"
+                    "lrz_workaround = 1\n",
                     cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0,
                     cfg->gamma, cfg->exposure);
             fclose(w);
@@ -366,6 +368,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "record_thread")) cfg->record_thread = v != 0;
             else if (!strcmp(key, "fast_cores")) cfg->fast_cores = v != 0;
             else if (!strcmp(key, "audio_smooth")) cfg->audio_smooth = v != 0;
+            else if (!strcmp(key, "lrz_workaround")) cfg->lrz_workaround = v != 0;
             else if (!strcmp(key, "face_buttons")) {
                 g_face_by_position = !strcmp(value, "position");
                 have_face_buttons = true;
