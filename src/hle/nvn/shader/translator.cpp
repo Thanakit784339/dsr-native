@@ -186,6 +186,7 @@ public:
         // dying characters vanished). Hence no driver-chosen fusing here, and an invariant gl_Position.
         b_.exact_float = stage_ == Stage::Vertex;
         Setup();
+        if (stage_ == Stage::Fragment && opt_.depth_test_func) EmitDepthTest();
         const size_t count = (size_ - kCodeOffset) / 8;
         bool ended = false;
         for (size_t idx = 0; idx < count && !ended && error_.empty(); idx++) {
@@ -657,6 +658,39 @@ private:
             b_.Op(SpvOpStore, {pz, b_.OpResult(SpvOpFMul, t_f32_, {sum, b_.ConstFloat(0.5f)})});
         }
         b_.Op(SpvOpReturn, {});
+    }
+
+    // TranslateOptions::depth_test_func: compare gl_FragCoord.z with the depth copy in texture slot 31.
+    void EmitDepthTest() {
+        Id fc = BuiltinVar(&frag_coord_, SpvStorageClassInput, t_v4f_, SpvBuiltInFragCoord, "gl_FragCoord");
+        Id coord = b_.OpResult(SpvOpLoad, t_v4f_, {fc});
+        Id x = b_.OpResult(SpvOpConvertFToS, t_i32_, {b_.OpResult(SpvOpCompositeExtract, t_f32_, {coord, 0u})});
+        Id y = b_.OpResult(SpvOpConvertFToS, t_i32_, {b_.OpResult(SpvOpCompositeExtract, t_f32_, {coord, 1u})});
+        Id z = b_.OpResult(SpvOpCompositeExtract, t_f32_, {coord, 2u});
+        Id var = TextureVar(31, false, TexDim::D2, false);
+        Id sampled = b_.OpResult(SpvOpLoad, tex_type_[31], {var});
+        Id image = b_.OpResult(SpvOpImage, tex_image_type_[31], {sampled});
+        Id xy = b_.OpResult(SpvOpCompositeConstruct, t_v2i_, {x, y});
+        Id texel = b_.OpResult(SpvOpImageFetch, t_v4f_, {image, xy, uint32_t(SpvImageOperandsLodMask), b_.ConstInt(0)});
+        Id stored = b_.OpResult(SpvOpCompositeExtract, t_f32_, {texel, 0u});
+        Id pass;
+        switch (opt_.depth_test_func) {
+            case 1: pass = b_.ConstBool(false); break;
+            case 2: pass = b_.OpResult(SpvOpFOrdLessThan, t_bool_, {z, stored}); break;
+            case 3: pass = b_.OpResult(SpvOpFOrdEqual, t_bool_, {z, stored}); break;
+            case 4: pass = b_.OpResult(SpvOpFOrdLessThanEqual, t_bool_, {z, stored}); break;
+            case 5: pass = b_.OpResult(SpvOpFOrdGreaterThan, t_bool_, {z, stored}); break;
+            case 6: pass = b_.OpResult(SpvOpFOrdNotEqual, t_bool_, {z, stored}); break;
+            case 7: pass = b_.OpResult(SpvOpFOrdGreaterThanEqual, t_bool_, {z, stored}); break;
+            default: pass = b_.ConstBool(true); break;
+        }
+        Id kill = b_.NewId(), cont = b_.NewId();
+        b_.Op(SpvOpSelectionMerge, {cont, uint32_t(SpvSelectionControlMaskNone)});
+        b_.Op(SpvOpBranchConditional, {pass, cont, kill});
+        b_.Label(kill);
+        b_.Op(SpvOpKill, {});
+        b_.Label(cont);
+        info_.uses_discard = true;
     }
 
     Id AlphaRef() {

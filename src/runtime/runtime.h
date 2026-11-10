@@ -25,7 +25,8 @@ struct RuntimeConfig {
     bool profile = true;          // diagnostics: sampling CPU profile of the busy threads, logged every 10 s
     float gamma = 1.0f;           // extra display gamma applied through the game's brightness ramp (> 1 lifts shadows)
     std::string present_mode = "mailbox";  // swapchain present mode: mailbox, fifo, fifo_relaxed, immediate (FIFO if unsupported)
-    bool lrz_workaround = false;  // refresh depth buffers written by gl_FragDepth before reuse (square holes)
+    bool lrz_workaround = false;
+    bool shader_depth_test = true;  // depth tests against gl_FragDepth-written depth done in the shader (square holes)  // refresh depth buffers written by gl_FragDepth before reuse (square holes)
     int hole_test = 0;  // square-hole diagnostics (bits): 1 = effects without depth test, 2 = uncompressed depth, 4 = no write-masked colour targets, 8 = one render pass per draw into reduced-size targets, 16 = depth textures read from copies, 64 = D24S8 depth, 128 = CPU waits for GPU idle at each slot, 256 = uncompressed colour targets, 512 = no null colour attachments, 1024 = effect shaders output debug values, 2048 = no depth test in reduced-size effect passes
     bool audio_smooth = false;  // release audio buffers at a smoothed pace (experiment; movies were not timed by it)
     bool fast_cores = true;  // keep the game's frame-critical threads off the efficiency cores

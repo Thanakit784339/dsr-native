@@ -349,6 +349,8 @@ struct Image {
     bool attach_unsynced = false;
     // Depth written by a fragment shader (gl_FragDepth) since the image was last attached: see LrzTouch.
     bool depth_exported = false;
+    // Ever had depth written by a fragment shader (gl_FragDepth): depth tests against it are done in the shader.
+    bool fragdepth_written = false;
     uint64_t attach_gen = 0;  // times attached to a render pass (`hole_test` 16 copies)
     VkClearValue clear_value{};
     VkImageAspectFlags clear_aspect = 0;
@@ -2558,7 +2560,8 @@ private:
         });
         clears_flushed_++;
     }
-    uint64_t clears_deferred_ = 0, clears_flushed_ = 0, clears_in_pass_ = 0, pass_barriers_ = 0, lrz_touches_ = 0;
+    uint64_t clears_deferred_ = 0, clears_flushed_ = 0, clears_in_pass_ = 0, pass_barriers_ = 0, lrz_touches_ = 0,
+             shader_depth_draws_ = 0;
     // The render pass currently open: its colour images (and subresources) and depth image.
     Image* pass_colors_[8] = {};
     std::pair<int, int> pass_color_sub_[8] = {};
@@ -3410,6 +3413,18 @@ private:
         const bool debug_fx = (dsr::GetRuntime().config.hole_test & 1024) && st_.program[1] &&
                               (st_.program[1]->hash == 0x6f634579337b2b69ull || st_.program[1]->hash == 0x3fc1b1baa8114318ull);
         fopt.debug_outputs = debug_fx;
+        // Square holes in smoke, fog and glow: the game makes its half- and quarter-size depth buffers with a
+        // full-screen draw that writes gl_FragDepth, and then draws particles testing (not writing) against them.
+        // Adreno's hardware depth test then drops whole screen tiles of those particles (frame captures: the same
+        // tiles in every effect pass of a frame, different ones each frame; the depth values themselves are right,
+        // and with the hardware test off the holes are gone). Such draws test in the fragment shader instead,
+        // against a copy of the depth buffer, and the hardware test is off for them.
+        const Image* depth_peek = st_.rts.size() > size_t(st_.num_rt) ? GetImage(st_.rts[size_t(st_.num_rt)], false) : nullptr;
+        const bool shader_depth_test = dsr::GetRuntime().config.shader_depth_test && depth_peek &&
+                                       depth_peek->fragdepth_written && IsDepthFormat(depth_peek->nvn_format) &&
+                                       HasDepth(depth_peek->nvn_format) && st_.depth.depth_test && !st_.depth.depth_write &&
+                                       st_.program[1] && st_.depth.depth_func != 8 && !debug_fx;
+        if (shader_depth_test) fopt.depth_test_func = st_.depth.depth_func;
         Shader* vs = GetShader(*st_.program[0], vopt);
         // No pixel program: a depth-only pass (shadow maps, depth prepass). Draw with the vertex stage only.
         Shader* fs = st_.program[1] ? GetShader(*st_.program[1], fopt) : &no_fragment_;
@@ -3477,8 +3492,20 @@ private:
                 const bool plain = info.texture_mask >> slot & 1, shadow = info.shadow_mask >> slot & 1;
                 if (!plain && !shadow) continue;
                 BoundTexture bt = st_.textures[stage][slot];
-                if (!bt.valid) bt = HandleFromUniforms(stage, slot);
-                Image* img = bt.valid ? GetImage(bt.texture, true) : nullptr;
+                Image* img = nullptr;
+                if (shader_depth_test && stage == 1 && slot == 31 && depth) {
+                    // The depth copy the shader tests against (TranslateOptions::depth_test_func).
+                    bt = BoundTexture{};
+                    bt.valid = true;
+                    bt.texture = st_.rts[size_t(st_.num_rt)];
+                    for (int k = 0; k < 4; k++) bt.texture.tex.swizzle[k] = uint8_t(2 + k);
+                    img = DepthSnapshot(*depth, st_.rts[size_t(st_.num_rt)]);
+                    if (!img) return Skip("no depth copy for the shader depth test");
+                    shader_depth_draws_++;
+                } else {
+                    if (!bt.valid) bt = HandleFromUniforms(stage, slot);
+                    img = bt.valid ? GetImage(bt.texture, true) : nullptr;
+                }
                 if (!img) {
                     // Missing or unsupported texture: draw with a white stand-in rather than dropping the
                     // draw (one skipped pass can blank the whole frame).
@@ -3897,6 +3924,7 @@ private:
         const bool saved_depth_test = st_.depth.depth_test;
         const auto saved_blend_enable = st_.color.blend_enable;
         const auto saved_mask = st_.channel.mask;
+        if (shader_depth_test) st_.depth.depth_test = false;  // done in the fragment shader
         if (debug_fx) {
             st_.depth.depth_test = false;
             st_.color.blend_enable = 0;
@@ -3921,7 +3949,7 @@ private:
         Phase(5);
         // ---- queue the draw: the recorder thread builds its descriptor sets and records it --------------------
         if (!EnsureRendering(colors, depth, &extent)) return Skip("no render target");
-        if (depth && fs->info.writes_depth && st_.depth.depth_write) depth->depth_exported = true;
+        if (depth && fs->info.writes_depth && st_.depth.depth_write) depth->depth_exported = depth->fragdepth_written = true;
         DrawPacket d;
         d.pipeline = pipeline;
         d.layout = layout;
@@ -5098,10 +5126,11 @@ private:
             readbacks_recorded_ = readbacks_done_ = 0;
         }
         LOGI(kTag, "clears: %llu done as render pass loads or deferred, %llu inside passes, %llu performed separately; "
-             "%llu barriers between passes reusing an attachment, %llu depth buffers refreshed for LRZ",
+             "%llu barriers between passes reusing an attachment, %llu depth buffers refreshed for LRZ; %llu draws depth-tested "
+             "in the shader",
              (unsigned long long)clears_deferred_, (unsigned long long)clears_in_pass_, (unsigned long long)clears_flushed_,
-             (unsigned long long)pass_barriers_, (unsigned long long)lrz_touches_);
-        clears_deferred_ = clears_in_pass_ = clears_flushed_ = pass_barriers_ = lrz_touches_ = 0;
+             (unsigned long long)pass_barriers_, (unsigned long long)lrz_touches_, (unsigned long long)shader_depth_draws_);
+        clears_deferred_ = clears_in_pass_ = clears_flushed_ = pass_barriers_ = lrz_touches_ = shader_depth_draws_ = 0;
         if (rt_writebacks_ || reports_done_) {
             LOGI(kTag, "small render targets written back to game memory: %llu; reports written: %llu",
                  (unsigned long long)rt_writebacks_, (unsigned long long)reports_done_);

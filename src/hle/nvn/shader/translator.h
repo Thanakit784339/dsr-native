@@ -35,6 +35,10 @@ struct TranslateOptions {
     // Diagnostics (square holes): fragment shader without discards or alpha test, whose first output shows what
     // it computed: R = first sample of texture slot `debug_slot` (x, as is), G = the real output's alpha,
     // B = the real output's red, A = 1.
+    // Depth test done in the fragment shader (NVN compare func 1..8, 0 = off): fragments whose depth fails against
+    // texture slot 31 (a copy of the depth buffer) at their pixel are discarded. See vk_backend: depth written by
+    // a fragment shader is not tested correctly by Adreno's hardware.
+    int depth_test_func = 0;
     bool debug_outputs = false;
     uint32_t debug_slot = 2;
 };                                    // block offset 0 (fragment stage)

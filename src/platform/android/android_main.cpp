@@ -345,7 +345,9 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     FACE_BUTTONS_HELP
                     "face_buttons = label\n"
                     "# lrz_workaround: 1 = refresh depth buffers written by shaders before reuse (experiment, off)\n"
-                    "lrz_workaround = 0\n",
+                    "lrz_workaround = 0\n"
+                    "# shader_depth_test: 1 = fix for see-through squares in smoke, fog and glow (0 = off, for testing)\n"
+                    "shader_depth_test = 1\n",
                     cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0,
                     cfg->gamma, cfg->exposure);
             fclose(w);
@@ -369,6 +371,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "fast_cores")) cfg->fast_cores = v != 0;
             else if (!strcmp(key, "audio_smooth")) cfg->audio_smooth = v != 0;
             else if (!strcmp(key, "lrz_workaround")) cfg->lrz_workaround = v != 0;
+            else if (!strcmp(key, "shader_depth_test")) cfg->shader_depth_test = v != 0;
             else if (!strcmp(key, "hole_test")) cfg->hole_test = v;
             else if (!strcmp(key, "face_buttons")) {
                 g_face_by_position = !strcmp(value, "position");
@@ -405,6 +408,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
          path.c_str(), cfg->target_fps, cfg->async_pipelines ? "on" : "off", cfg->auto_capture ? "on" : "off",
          cfg->profile ? "on" : "off", cfg->gamma, cfg->exposure, cfg->present_mode.c_str(),
          g_face_by_position ? "position" : "label");
+    if (!cfg->shader_depth_test) LOGI(kTag, "settings: shader_depth_test off");
     if (cfg->hole_test || cfg->lrz_workaround)
         LOGI(kTag, "settings: hole_test %d, lrz_workaround %d", cfg->hole_test, int(cfg->lrz_workaround));
     if (cfg->profile) dsr::profiler::Enable();

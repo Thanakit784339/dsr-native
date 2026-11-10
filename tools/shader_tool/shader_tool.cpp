@@ -46,6 +46,7 @@ int main(int argc, char** argv) {
         total++;
         TranslateOptions opt;
         if (getenv("DSR_DEBUG_OUTPUTS")) { opt.debug_outputs = true; opt.alpha_func = 5; }
+        if (const char* d = getenv("DSR_DEPTH_TEST")) opt.depth_test_func = atoi(d);
         if (const char* a = getenv("DSR_ALPHA_FUNC")) opt.alpha_func = atoi(a);  // validate alpha-test variants
         TranslateResult r = Translate(code, h.code_size, opt);
         if (!r.ok) {
