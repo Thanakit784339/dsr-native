@@ -36,7 +36,8 @@ void FrameLimiter(uint8_t* self, int /*fps*/) {
     }
     const double seconds = last.time_since_epoch().count() ? std::chrono::duration<double>(now - last).count() : 1.0 / fps;
     last = now;
-    if (g_game_step) *g_game_step = float(std::clamp(seconds, 1.0 / 60.0, 1.0 / 30.0));
+    // Up to 1/20 s per step: slower devices (20-30 fps) keep the game at normal speed instead of slow motion.
+    if (g_game_step) *g_game_step = float(std::clamp(seconds, 1.0 / 60.0, 1.0 / 20.0));
     *reinterpret_cast<int64_t*>(self + 0x310) = hle::os::NowTicks();
     self[0x31d] = 0;
     self[0x31e] = 0;
@@ -125,7 +126,7 @@ void InstallGameHooks() {
     //    read-only data (main+0x66c9c8 adrp x8, page; +0x66c9cc ldr s8, [x8, #0x970]). It now loads a float in
     //    the scratch page instead.
     // 2. The render thread's frame limiter (main+0x70bd90, called once per game update with a hard-coded 30) is
-    //    replaced by FrameLimiter: it paces to 60 and sets that float to the measured frame period (1/60..1/30 s),
+    //    replaced by FrameLimiter: it paces to 60 and sets that float to the measured frame period (1/60..1/20 s),
     //    so the game keeps normal speed at 60 fps and when heavy areas run slower. It also keeps the game's
     //    frame-skip mode off (with it, slow frames ran two updates per shown frame).
     if (rt.config.target_fps > 30) {

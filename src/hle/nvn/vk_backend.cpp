@@ -1909,6 +1909,7 @@ private:
     void ReapRetired() {
         while (!retired_.empty() && retired_.front().seq <= completed_seq_) {
             Retired& r = retired_.front();
+            if (rp_fallback_) ForgetFramebuffers(r.views);
             for (VkImageView v : r.views) vkDestroyImageView(device_, v, nullptr);
             if (r.image) vkDestroyImage(device_, r.image, nullptr);
             if (r.memory) vkFreeMemory(device_, r.memory, nullptr);
@@ -5333,6 +5334,28 @@ private:
     // final = attachment layout), so the passes add no transitions of their own.
     std::mutex rp_mutex_;
     std::map<std::vector<uint32_t>, VkRenderPass> render_passes_cache_;
+    std::mutex fb_mutex_;
+    std::map<std::vector<uint64_t>, VkFramebuffer> fb_cache_;  // {render pass, w<<32|h, views...}
+    // Destroys cached framebuffers that use any of `views` (about to be destroyed; the GPU is done with them).
+    void ForgetFramebuffers(const std::vector<VkImageView>& views) {
+        if (views.empty()) return;
+        std::lock_guard<std::mutex> lk(fb_mutex_);
+        for (auto it = fb_cache_.begin(); it != fb_cache_.end();) {
+            bool uses = false;
+            for (size_t i = 2; i < it->first.size() && !uses; i++)
+                for (VkImageView v : views)
+                    if (it->first[i] == reinterpret_cast<uint64_t>(v)) {
+                        uses = true;
+                        break;
+                    }
+            if (uses) {
+                vkDestroyFramebuffer(device_, it->second, nullptr);
+                it = fb_cache_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     VkRenderPass MakeRenderPass(const VkFormat* colors, uint32_t ncolors, VkFormat depth, VkFormat stencil_hint,
                                 const VkAttachmentLoadOp* color_load, VkAttachmentLoadOp depth_load) {
         std::vector<uint32_t> key;
@@ -5424,19 +5447,39 @@ private:
         }
         VkRenderPass rp = MakeRenderPass(colors, bp.count, dfmt, bp.has_stencil ? dfmt : VK_FORMAT_UNDEFINED, loads,
                                          ds ? bp.depth.loadOp : VK_ATTACHMENT_LOAD_OP_LOAD);
-        VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-        fi.renderPass = rp;
-        fi.attachmentCount = nviews;
-        fi.pAttachments = views;
-        fi.width = std::max(1u, bp.area.extent.width);
-        fi.height = std::max(1u, bp.area.extent.height);
-        fi.layers = 1;
-        VkFramebuffer fb = VK_NULL_HANDLE;
-        if (!rp || vkCreateFramebuffer(device_, &fi, nullptr, &fb) != VK_SUCCESS) {
-            LogOnce("framebuffer", "vkCreateFramebuffer failed");
+        if (!rp) {
+            LogOnce("framebuffer", "no render pass object");
             return;
         }
-        slots_[rec_slot_].framebuffers.push_back(fb);
+        const uint32_t fw = std::max(1u, bp.area.extent.width), fh = std::max(1u, bp.area.extent.height);
+        // Framebuffers are cached by render pass, size and views (creating one per pass cost the driver an
+        // mmap/munmap each, a large part of the recorder thread on Adreno 6xx); they go when a view is destroyed.
+        std::vector<uint64_t> key;
+        key.reserve(nviews + 2);
+        key.push_back(reinterpret_cast<uint64_t>(rp));
+        key.push_back(uint64_t(fw) << 32 | fh);
+        for (uint32_t i = 0; i < nviews; i++) key.push_back(reinterpret_cast<uint64_t>(views[i]));
+        VkFramebuffer fb = VK_NULL_HANDLE;
+        {
+            std::lock_guard<std::mutex> lk(fb_mutex_);
+            auto it = fb_cache_.find(key);
+            if (it != fb_cache_.end()) fb = it->second;
+        }
+        if (!fb) {
+            VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            fi.renderPass = rp;
+            fi.attachmentCount = nviews;
+            fi.pAttachments = views;
+            fi.width = fw;
+            fi.height = fh;
+            fi.layers = 1;
+            if (vkCreateFramebuffer(device_, &fi, nullptr, &fb) != VK_SUCCESS) {
+                LogOnce("framebuffer", "vkCreateFramebuffer failed");
+                return;
+            }
+            std::lock_guard<std::mutex> lk(fb_mutex_);
+            fb_cache_.emplace(std::move(key), fb);
+        }
         VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         bi.renderPass = rp;
         bi.framebuffer = fb;
