@@ -181,15 +181,44 @@ public final class SettingsMenu {
         }
     }
 
-    /** The game's root in or around a chosen folder (the folder holding exefs/main), or null. */
+    /** The files a game folder must hold: the program and the data archives the game opens at start-up. */
+    static final String[] GAME_FILES = {"exefs/main", "dvdbnd0.bhd5", "dvdbnd0.bdt", "dvdbnd1.bhd5", "dvdbnd1.bdt"};
+
+    /** The required game files missing from a folder, comma separated ("" when complete). */
+    static String missingGameFiles(String dir) {
+        StringBuilder b = new StringBuilder();
+        for (String f : GAME_FILES)
+            if (!new File(dir, f).isFile()) b.append(b.length() == 0 ? "" : ", ").append(f);
+        return b.toString();
+    }
+
+    private static int presentGameFiles(File dir) {
+        int n = 0;
+        for (String f : GAME_FILES)
+            if (new File(dir, f).isFile()) n++;
+        return n;
+    }
+
+    /** The folder itself, its game/ subfolder or (for an exefs folder) its parent. */
+    private static File[] gameRootCandidates(String path) {
+        File p = new File(path);
+        File parent = p.getName().equals("exefs") ? p.getParentFile() : null;
+        return new File[] {p, new File(p, "game"), parent};
+    }
+
+    /** The game's root in or around a chosen folder (holding exefs/main and the data archives), or null. */
     static String findGameRoot(String path) {
         if (path == null) return null;
-        File p = new File(path);
-        if (new File(p, "exefs/main").isFile()) return p.getPath();
-        File game = new File(p, "game");  // the folder above it, as Download/DSRNative
-        if (new File(game, "exefs/main").isFile()) return game.getPath();
-        File parent = p.getParentFile();  // the exefs folder itself
-        if (p.getName().equals("exefs") && parent != null && new File(p, "main").isFile()) return parent.getPath();
+        for (File c : gameRootCandidates(path))
+            if (c != null && presentGameFiles(c) == GAME_FILES.length) return c.getPath();
+        return null;
+    }
+
+    /** A folder in or around the chosen one with part of the game (not all of it), or null. */
+    static String findPartialGameRoot(String path) {
+        if (path == null) return null;
+        for (File c : gameRootCandidates(path))
+            if (c != null && presentGameFiles(c) > 0) return c.getPath();
         return null;
     }
 
@@ -489,8 +518,14 @@ public final class SettingsMenu {
         String path = treeToPath(uri);
         String root = findGameRoot(path);
         if (root == null) {
-            popup("No game files there", (path == null ? "That folder" : path) + " does not hold the game files "
-                    + "(no exefs/main in it). Choose the folder that contains the exefs folder and dvdbnd0.bdt.");
+            String partial = findPartialGameRoot(path);
+            if (partial != null)
+                popup("Game files incomplete", partial + " is missing:\n" + missingGameFiles(partial)
+                        + "\n\nThese files belong next to the exefs folder. Choose a folder that holds the complete "
+                        + "game.");
+            else
+                popup("No game files there", (path == null ? "That folder" : path) + " does not hold the game "
+                        + "files. Choose the folder that contains the exefs folder, dvdbnd0.bdt and dvdbnd1.bdt.");
             return;
         }
         if (!writeSetting("game_dir", root)) {

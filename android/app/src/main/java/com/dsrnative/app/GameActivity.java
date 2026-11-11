@@ -50,15 +50,15 @@ public class GameActivity extends NativeActivity {
         return f;
     }
 
-    /** Called by native code when the game files are nowhere to be found. */
-    public void askGameFolder(final String message) {
+    /** Called by native code when the game files are not found, or found incomplete. */
+    public void askGameFolder(final String title, final String message) {
         sFolderState = 1;
-        runOnUiThread(() -> showFolderDialog(message));
+        runOnUiThread(() -> showFolderDialog(title, message));
     }
 
-    private void showFolderDialog(String message) {
+    private void showFolderDialog(String title, String message) {
         AlertDialog d = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                .setTitle("Game files not found")
+                .setTitle(title)
                 .setMessage(message)
                 .setCancelable(false)
                 .setPositiveButton("Choose folder", (dlg, which) -> pickGameFolder())
@@ -71,8 +71,8 @@ public class GameActivity extends NativeActivity {
         try {
             startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_GAME_FOLDER);
         } catch (Exception e) {
-            showFolderDialog("No file manager is available to choose a folder. Copy the game files to "
-                    + "Download/DSRNative/game instead, then start the app again.");
+            showFolderDialog("Game files not found", "No file manager is available to choose a folder. Copy the "
+                    + "complete game folder to Download/DSRNative/game instead, then start the app again.");
         }
     }
 
@@ -83,15 +83,23 @@ public class GameActivity extends NativeActivity {
         if (requestCode != REQ_GAME_FOLDER) return;
         Uri uri = resultCode == RESULT_OK && data != null ? data.getData() : null;
         if (uri == null) {
-            showFolderDialog("No folder was chosen. Choose the folder that holds the game files: the one that "
-                    + "contains the exefs folder and dvdbnd0.bdt.");
+            showFolderDialog("Game files not found", "No folder was chosen. Choose the folder that holds the game "
+                    + "files: the one that contains the exefs folder, dvdbnd0.bdt and dvdbnd1.bdt.");
             return;
         }
         String path = SettingsMenu.treeToPath(uri);
         String root = path == null ? null : SettingsMenu.findGameRoot(path);
         if (root == null) {
-            showFolderDialog((path == null ? "That folder" : path) + " does not hold the game files (no exefs/main "
-                    + "in it).\n\nChoose the folder that contains the exefs folder and dvdbnd0.bdt.");
+            String partial = path == null ? null : SettingsMenu.findPartialGameRoot(path);
+            if (partial != null)
+                showFolderDialog("Game files incomplete", partial + " is missing:\n"
+                        + SettingsMenu.missingGameFiles(partial) + "\n\nThese files belong next to the exefs folder. "
+                        + "Copy the complete game folder (the base game with the 1.0.3 update merged in), or choose "
+                        + "a folder that holds all of it.");
+            else
+                showFolderDialog("Game files not found", (path == null ? "That folder" : path)
+                        + " does not hold the game files.\n\nChoose the folder that contains the exefs folder, "
+                        + "dvdbnd0.bdt and dvdbnd1.bdt.");
             return;
         }
         sFolder = root;

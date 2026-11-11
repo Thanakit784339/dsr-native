@@ -24,6 +24,7 @@
 #include <zlib.h>
 
 #include <algorithm>
+#include <iterator>
 #include <atomic>
 #include <cerrno>
 #include <cstring>
@@ -1061,14 +1062,16 @@ std::string TakeGameFolder(android_app* app) {
     return r;
 }
 // Shows the "game files not found" dialog, whose button opens the system folder picker.
-void AskGameFolder(android_app* app, const std::string& message) {
+void AskGameFolder(android_app* app, const std::string& title, const std::string& message) {
     JNIEnv* env = GlueEnv(app);
     if (!env) return;
     jclass cls = env->GetObjectClass(app->activity->clazz);
-    jmethodID m = env->GetMethodID(cls, "askGameFolder", "(Ljava/lang/String;)V");
+    jmethodID m = env->GetMethodID(cls, "askGameFolder", "(Ljava/lang/String;Ljava/lang/String;)V");
     if (m && !env->ExceptionCheck()) {
+        jstring jt = env->NewStringUTF(title.c_str());
         jstring js = env->NewStringUTF(message.c_str());
-        env->CallVoidMethod(app->activity->clazz, m, js);
+        env->CallVoidMethod(app->activity->clazz, m, jt, js);
+        env->DeleteLocalRef(jt);
         env->DeleteLocalRef(js);
     }
     if (env->ExceptionCheck()) {
@@ -1087,7 +1090,25 @@ void HideTouchControlsForController(android_app* app) {
     if (env->ExceptionCheck()) env->ExceptionClear();
 }
 
-bool HasGame(const std::string& dir) { return !dir.empty() && FileExists(dir + "/exefs/main"); }
+// The files a game folder must hold: the program and the data archives it opens at start-up (without them the
+// game crashed a moment after starting).
+constexpr const char* kGameFiles[] = {"exefs/main", "dvdbnd0.bhd5", "dvdbnd0.bdt", "dvdbnd1.bhd5", "dvdbnd1.bdt"};
+std::vector<std::string> MissingGameFiles(const std::string& dir) {
+    std::vector<std::string> missing;
+    for (const char* f : kGameFiles)
+        if (dir.empty() || !FileExists(dir + "/" + f)) missing.push_back(f);
+    return missing;
+}
+bool HasGame(const std::string& dir) { return !dir.empty() && MissingGameFiles(dir).empty(); }
+// A folder holding part of the game (the program or some archives, not all): worth naming in the message.
+bool HasPartOfGame(const std::string& dir) {
+    return !dir.empty() && MissingGameFiles(dir).size() < std::size(kGameFiles);
+}
+std::string JoinFiles(const std::vector<std::string>& files) {
+    std::string r;
+    for (const std::string& f : files) r += (r.empty() ? "" : ", ") + f;
+    return r;
+}
 
 // Start-up state kept while the player is asked for the game folder (StartGame then runs again on resume).
 struct StartState {
@@ -1163,9 +1184,13 @@ void StartGame(android_app* app) {
             SaveSetting(base + "/settings.txt", "game_dir", picked);
             LOGI(kTag, "game files: folder chosen by the player, %s (remembered as game_dir)", picked.c_str());
         } else if (!picked.empty()) {
-            LOGW(kTag, "the chosen folder %s has no exefs/main", picked.c_str());
+            LOGW(kTag, "the chosen folder %s lacks %s", picked.c_str(), JoinFiles(MissingGameFiles(picked)).c_str());
         }
     }
+    // A folder with only part of the game (e.g. exefs without the data archives): named in the message.
+    std::string partial;
+    for (const std::string& d : {base + "/game", g_custom_game_dir})
+        if (game.empty() && partial.empty() && HasPartOfGame(d)) partial = d;
     if (game.empty()) {
         if (!st.reported_missing) {
             st.reported_missing = true;
@@ -1180,16 +1205,30 @@ void StartGame(android_app* app) {
                           w);
                     fclose(w);
                 }
-            LOGE(kTag, "game files not found: expected %s/game/exefs/main%s%s", base.c_str(),
-                 g_custom_game_dir.empty() ? "" : " or ", g_custom_game_dir.empty() ? "" : (g_custom_game_dir + "/exefs/main").c_str());
-            LOGE(kTag, "asking for the game folder (the one containing exefs/ and dvdbnd0.bdt)");
+            if (!partial.empty())
+                LOGE(kTag, "game files incomplete in %s: missing %s", partial.c_str(),
+                     JoinFiles(MissingGameFiles(partial)).c_str());
+            else
+                LOGE(kTag, "game files not found: expected %s/game/exefs/main%s%s", base.c_str(),
+                     g_custom_game_dir.empty() ? "" : " or ",
+                     g_custom_game_dir.empty() ? "" : (g_custom_game_dir + "/exefs/main").c_str());
+            LOGE(kTag, "asking for the game folder (the one containing exefs/, dvdbnd0.bdt and dvdbnd1.bdt)");
         }
         if (GameFolderState(app) == 0) {
-            std::string msg = "Dark Souls Remastered was not found in " + base + "/game";
-            if (!g_custom_game_dir.empty()) msg += " or in the folder chosen before (" + g_custom_game_dir + ")";
-            msg += ".\n\nChoose the folder that holds the game files: the one that contains the exefs folder and "
-                   "dvdbnd0.bdt.";
-            AskGameFolder(app, msg);
+            std::string title, msg;
+            if (!partial.empty()) {
+                title = "Game files incomplete";
+                msg = "The game folder " + partial + " is missing:\n" + JoinFiles(MissingGameFiles(partial)) +
+                      "\n\nThese files belong next to the exefs folder. Copy the complete game folder there (the base "
+                      "game with the 1.0.3 update merged in), or choose a folder that holds all of it.";
+            } else {
+                title = "Game files not found";
+                msg = "Dark Souls Remastered was not found in " + base + "/game";
+                if (!g_custom_game_dir.empty()) msg += " or in the folder chosen before (" + g_custom_game_dir + ")";
+                msg += ".\n\nChoose the folder that holds the game files: the one that contains the exefs folder, "
+                       "dvdbnd0.bdt and dvdbnd1.bdt.";
+            }
+            AskGameFolder(app, title, msg);
         }
         return;
     }
