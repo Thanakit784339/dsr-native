@@ -1,363 +1,570 @@
 package com.dsrnative.app;
 
+import android.app.Activity;
 import android.content.Context;
-import android.graphics.Color;
-import android.util.Log;
-import android.view.Gravity;
+import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.graphics.PixelFormat;
+import android.graphics.RectF;
+import android.hardware.input.InputManager;
+import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
+import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.View;
-import android.widget.Button;
-import android.widget.FrameLayout;
-import android.widget.Toast;
+import android.view.WindowManager;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileReader;
-import java.io.FileWriter;
-import java.io.IOException;
-import java.util.LinkedHashMap;
-import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-
-import io.github.controlwear.virtual.joystick.android.JoystickView;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
- * On-screen touch controls: two library-provided analog sticks (movement, camera) plus plain Android
- * buttons for everything else. Default positions are fixed gravity/margins; long-press the toggle
- * button (top-right) to enter Edit Mode, drag anything to reposition it, long-press again to save and
- * resume play. Positions persist to touch_layout.txt next to settings.txt.
- *
- * See GameActivity.addTouchOverlay() for why this has to be added as a separate window rather than
- * drawn into the game's own surface.
+ * On-screen controls drawn in a transparent panel window over the game. A fixed stick at the bottom left
+ * moves, a smaller stick appears wherever the right side of the screen is touched (not on a button) and turns
+ * the camera, and the Switch buttons sit around the edges.
+ * They hide when a game controller is connected or used, and come back with a double tap on the screen.
+ * State goes to native code (nativeState), which merges it with the controller.
  */
-public class TouchControls extends FrameLayout {
-    // NativeActivity loads libdsr.so itself via a raw dlopen in its own native bootstrap, which never
-    // registers the library with this classloader's JNI native-method list -- so a *different* Java
-    // class trying to call a native method here finds nothing, even though the library is already
-    // mapped in the process. Loading it again is cheap (same cached handle) and fixes that lookup.
-    static {
-        System.loadLibrary("dsr");
-    }
+public final class TouchControls extends View implements InputManager.InputDeviceListener {
+    // nn::hid button bits (src/hle/input.h).
+    static final int A = 1, B = 1 << 1, X = 1 << 2, Y = 1 << 3, L3 = 1 << 4, R3 = 1 << 5, L = 1 << 6, R = 1 << 7,
+            ZL = 1 << 8, ZR = 1 << 9, PLUS = 1 << 10, MINUS = 1 << 11, LEFT = 1 << 12, UP = 1 << 13, RIGHT = 1 << 14,
+            DOWN = 1 << 15;
 
-    // nn::hid::NpadButton bit positions (must match dsr::input::Button in src/hle/input.h).
-    private static final long BTN_A = 1L, BTN_B = 1L << 1, BTN_X = 1L << 2, BTN_Y = 1L << 3;
-    private static final long BTN_STICK_L = 1L << 4, BTN_STICK_R = 1L << 5;
-    private static final long BTN_L = 1L << 6, BTN_R = 1L << 7, BTN_ZL = 1L << 8, BTN_ZR = 1L << 9;
-    private static final long BTN_PLUS = 1L << 10, BTN_MINUS = 1L << 11;
-    private static final long BTN_LEFT = 1L << 12, BTN_UP = 1L << 13, BTN_RIGHT = 1L << 14, BTN_DOWN = 1L << 15;
+    static native void nativeState(int buttons, float lx, float ly, float rx, float ry);
+    static native void nativeVisible(boolean visible);
 
-    private static final String TAG = "TouchControls";
+    private static TouchControls sView;
+    /** settings.txt touch_camera_recenter: a thumb resting on the camera stick brings it back to the centre. */
+    static volatile boolean sRecenter = true;
 
-    private static native void nativeSetTouchButtons(long mask);
-    private static native void nativeSetTouchStick(int which, int x, int y);
-
-    private long mButtonMask = 0;
-    private View mButtonsLayer, mSticksLayer;
-    private boolean mVisible = true;
-    private boolean mEditMode = false;
-
-    // Every repositionable control (both sticks, all buttons -- not the toggle, which stays put), in
-    // the coordinate space of this view: each sits in a full-bleed child layer (mSticksLayer /
-    // mButtonsLayer), which is why a child's getLeft()/getTop() already equal its position here too.
-    private final Map<String, View> mControls = new LinkedHashMap<>();
-
-    // Edit-mode drag tracking: pointer id -> the control it grabbed, and the finger's offset from
-    // that control's top-left corner (so dragging doesn't snap the control to the touch point).
-    private String mDragId;
-    private int mDragOffsetX, mDragOffsetY;
-    private View mToggle;
-
-    public TouchControls(Context c) {
-        super(c);
-        // Same Mali/MediaTek gralloc issue as before: hardware-accelerated compositing of a view
-        // stacked as a separate window over a NativeActivity's Vulkan surface fails silently on this
-        // GPU. Software compositing avoids that path.
-        setLayerType(LAYER_TYPE_SOFTWARE, null);
-
-        mSticksLayer = buildSticks();
-        mButtonsLayer = buildButtons();
-        addView(mSticksLayer);
-        addView(mButtonsLayer);
-        addToggle();
-
-        loadLayout();
-    }
-
-    private View buildSticks() {
-        FrameLayout layer = new FrameLayout(getContext());
-        final int size = dp(120);
-
-        JoystickView move = new JoystickView(getContext());
-        styleStick(move);
-        FrameLayout.LayoutParams mlp = new FrameLayout.LayoutParams(size, size);
-        mlp.gravity = Gravity.BOTTOM | Gravity.START;
-        mlp.setMargins(dp(24), 0, 0, dp(24));
-        layer.addView(move, mlp);
-        mControls.put("LSTICK", move);
-        // angle: 0-360 counter-clockwise from the +x axis; strength: 0-100% of the way to the border.
-        // -32767..32767, +y = up (matches dsr::input::PadState / AxisToStick in android_main.cpp).
-        move.setOnMoveListener((angle, strength) -> {
-            Log.d(TAG, "left stick onMove angle=" + angle + " strength=" + strength + " buttonMask=0x"
-                    + Long.toHexString(mButtonMask));
-            final double rad = Math.toRadians(angle);
-            final float mag = strength / 100f * 32767f;
-            nativeSetTouchStick(0, (int) (Math.cos(rad) * mag), (int) (Math.sin(rad) * mag));
-        }, 16);
-
-        JoystickView look = new JoystickView(getContext());
-        styleStick(look);
-        FrameLayout.LayoutParams llp = new FrameLayout.LayoutParams(size, size);
-        llp.gravity = Gravity.BOTTOM | Gravity.END;
-        llp.setMargins(0, 0, dp(24), dp(24));
-        layer.addView(look, llp);
-        mControls.put("RSTICK", look);
-        look.setOnMoveListener((angle, strength) -> {
-            final double rad = Math.toRadians(angle);
-            final float mag = strength / 100f * 32767f;
-            nativeSetTouchStick(1, (int) (Math.cos(rad) * mag), (int) (Math.sin(rad) * mag));
-        }, 16);
-
-        // L3/R3: dedicated small buttons next to each stick, not "press the stick itself" -- that
-        // would fire on every touch-down used to start moving the stick, not just a deliberate click.
-        addButton(layer, "STICK_L", "L3", BTN_STICK_L, Gravity.BOTTOM | Gravity.START, dp(24) + size + dp(8), 0, 0,
-                dp(24) + size - dp(40), dp(40));
-        addButton(layer, "STICK_R", "R3", BTN_STICK_R, Gravity.BOTTOM | Gravity.END, 0, 0, dp(24) + size + dp(8),
-                dp(24) + size - dp(40), dp(40));
-
-        return layer;
-    }
-
-    // The library defaults background/border to fully transparent and only the small drag-knob to
-    // black -- with no styling at all, that's an all-but-invisible dot on a dark game scene. These
-    // match the translucent-white look of the plain buttons elsewhere in this overlay.
-    private void styleStick(JoystickView stick) {
-        stick.setBackgroundColor(Color.argb(60, 255, 255, 255));
-        stick.setBorderColor(Color.argb(160, 255, 255, 255));
-        stick.setBorderWidth(dp(2));
-        stick.setButtonColor(Color.argb(220, 255, 255, 255));
-    }
-
-    private View buildButtons() {
-        FrameLayout layer = new FrameLayout(getContext());
-        final int btn = dp(52), gap = dp(8);
-
-        // D-pad, above the left stick.
-        addButton(layer, "DPAD_L", "◀", BTN_LEFT, Gravity.BOTTOM | Gravity.START, dp(24) - btn - gap, 0, 0, dp(168), btn);
-        addButton(layer, "DPAD_U", "▲", BTN_UP, Gravity.BOTTOM | Gravity.START, dp(24), 0, 0, dp(168) + btn + gap, btn);
-        addButton(layer, "DPAD_R", "▶", BTN_RIGHT, Gravity.BOTTOM | Gravity.START, dp(24) + btn + gap, 0, 0, dp(168), btn);
-        addButton(layer, "DPAD_D", "▼", BTN_DOWN, Gravity.BOTTOM | Gravity.START, dp(24), 0, 0, dp(168) - btn - gap, btn);
-
-        // Face buttons, above the right stick (Switch layout: A right, B bottom, X top, Y left).
-        addButton(layer, "FACE_A", "A", BTN_A, Gravity.BOTTOM | Gravity.END, 0, 0, dp(24) - btn - gap, dp(168), btn);
-        addButton(layer, "FACE_B", "B", BTN_B, Gravity.BOTTOM | Gravity.END, 0, 0, dp(24), dp(168) - btn - gap, btn);
-        addButton(layer, "FACE_X", "X", BTN_X, Gravity.BOTTOM | Gravity.END, 0, 0, dp(24), dp(168) + btn + gap, btn);
-        addButton(layer, "FACE_Y", "Y", BTN_Y, Gravity.BOTTOM | Gravity.END, 0, 0, dp(24) + btn + gap, dp(168), btn);
-
-        // Shoulders, top corners; +/- top centre.
-        addButton(layer, "BTN_ZL", "ZL", BTN_ZL, Gravity.TOP | Gravity.START, dp(12), dp(12), 0, 0, btn);
-        addButton(layer, "BTN_L", "L", BTN_L, Gravity.TOP | Gravity.START, dp(12) + btn + gap, dp(12), 0, 0, btn);
-        addButton(layer, "BTN_ZR", "ZR", BTN_ZR, Gravity.TOP | Gravity.END, 0, dp(12), dp(12), 0, btn);
-        addButton(layer, "BTN_R", "R", BTN_R, Gravity.TOP | Gravity.END, 0, dp(12), dp(12) + btn + gap, 0, btn);
-        addButton(layer, "BTN_MINUS", "-", BTN_MINUS, Gravity.TOP | Gravity.CENTER_HORIZONTAL, -dp(44), dp(12), 0, 0, dp(44));
-        addButton(layer, "BTN_PLUS", "+", BTN_PLUS, Gravity.TOP | Gravity.CENTER_HORIZONTAL, dp(44), dp(12), 0, 0, dp(44));
-
-        return layer;
-    }
-
-    private void addButton(FrameLayout layer, String id, String label, long bit, int gravity, int left, int top,
-                            int right, int bottom, int size) {
-        Button b = new Button(getContext());
-        b.setText(label);
-        b.setAllCaps(false);
-        b.setBackgroundColor(Color.argb(96, 255, 255, 255));
-        b.setTextColor(Color.argb(220, 255, 255, 255));
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(size, size);
-        lp.gravity = gravity;
-        lp.setMargins(left, top, right, bottom);
-        b.setOnTouchListener((v, event) -> {
-            switch (event.getActionMasked()) {
-                case MotionEvent.ACTION_DOWN:
-                    mButtonMask |= bit;
-                    nativeSetTouchButtons(mButtonMask);
-                    Log.d(TAG, "button " + id + " DOWN, pointers now active=" + event.getPointerCount()
-                            + " mask=0x" + Long.toHexString(mButtonMask));
-                    return true;
-                case MotionEvent.ACTION_UP:
-                case MotionEvent.ACTION_CANCEL:
-                    mButtonMask &= ~bit;
-                    nativeSetTouchButtons(mButtonMask);
-                    Log.d(TAG, "button " + id + " UP/CANCEL mask=0x" + Long.toHexString(mButtonMask));
-                    return true;
-                default:
-                    return false;
-            }
+    /** Called by native code once the game starts. */
+    public static void attach(final Activity activity, final float opacity, final float cameraSpeed,
+            final boolean enabled) {
+        activity.runOnUiThread(() -> {
+            if (sView != null || !enabled) return;
+            final TouchControls v = new TouchControls(activity, opacity, cameraSpeed);
+            v.addTo(activity, 0);
         });
-        layer.addView(b, lp);
-        mControls.put(id, b);
     }
 
-    private void addToggle() {
-        Button toggle = new Button(getContext());
-        toggle.setText("⊡");
-        toggle.setBackgroundColor(Color.argb(140, 64, 64, 64));
-        toggle.setTextColor(Color.WHITE);
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(40), dp(40));
-        lp.gravity = Gravity.TOP | Gravity.END;
-        lp.setMargins(0, dp(60), dp(8), 0);  // clear of the ZR/R buttons above
-        toggle.setOnClickListener(v -> {
-            if (mEditMode) return;  // tap does nothing while editing; use long-press to exit
-            mVisible = !mVisible;
-            mSticksLayer.setVisibility(mVisible ? VISIBLE : GONE);
-            mButtonsLayer.setVisibility(mVisible ? VISIBLE : GONE);
-            if (!mVisible) releaseAllInputs();
-        });
-        toggle.setOnLongClickListener(v -> {
-            mEditMode = !mEditMode;
-            Log.i(TAG, "toggle long-pressed, edit mode now " + mEditMode);
-            toggle.setBackgroundColor(mEditMode ? Color.argb(180, 255, 180, 0) : Color.argb(140, 64, 64, 64));
-            releaseAllInputs();
-            if (mEditMode) {
-                mVisible = true;
-                mSticksLayer.setVisibility(VISIBLE);
-                mButtonsLayer.setVisibility(VISIBLE);
-                Toast.makeText(getContext(), "Edit mode: drag to move, long-press ⊡ again to save",
-                        Toast.LENGTH_SHORT).show();
-            } else {
-                saveLayout();
-            }
-            return true;
-        });
-        addView(toggle, lp);
-        mToggle = toggle;
-    }
-
-    private void releaseAllInputs() {
-        mButtonMask = 0;
-        nativeSetTouchButtons(0);
-        nativeSetTouchStick(0, 0, 0);
-        nativeSetTouchStick(1, 0, 0);
-    }
-
-    // ---- edit mode: intercept everything so children never see the drag (no accidental presses /
-    // joystick knob drags while repositioning), reposition by writing a fresh LayoutParams directly. --
-    @Override
-    public boolean onInterceptTouchEvent(MotionEvent event) {
-        if (!mEditMode) return super.onInterceptTouchEvent(event);
-        // Never intercept over the toggle itself -- otherwise, once edit mode starts, the long-press
-        // that's supposed to exit it can never reach the toggle's own listener again.
-        final int x = (int) event.getX(), y = (int) event.getY();
-        if (mToggle != null && x >= mToggle.getLeft() && x <= mToggle.getRight() && y >= mToggle.getTop() &&
-            y <= mToggle.getBottom())
-            return false;
-        return true;
-    }
-
-    @Override
-    public boolean onTouchEvent(MotionEvent event) {
-        if (!mEditMode) return super.onTouchEvent(event);
-        final int x = (int) event.getX(), y = (int) event.getY();
-        switch (event.getActionMasked()) {
-            case MotionEvent.ACTION_DOWN:
-                mDragId = findControlAt(x, y);
-                if (mDragId != null) {
-                    View v = mControls.get(mDragId);
-                    mDragOffsetX = x - v.getLeft();
-                    mDragOffsetY = y - v.getTop();
+    /**
+     * Settings menu: turns the controls on or off and changes their opacity and camera stick speed, at once.
+     */
+    public static void applySettings(final Activity activity, final boolean enabled, final float opacity,
+            final float cameraSpeed) {
+        activity.runOnUiThread(() -> {
+            if (!enabled) {
+                if (sView != null) {
+                    TouchControls v = sView;
+                    sView = null;
+                    v.releaseAll();
+                    nativeVisible(false);
+                    InputManager im = (InputManager) activity.getSystemService(Context.INPUT_SERVICE);
+                    if (im != null) im.unregisterInputDeviceListener(v);
+                    try {
+                        activity.getWindowManager().removeView(v);
+                    } catch (Exception e) {
+                        android.util.Log.w("DSRNative", "touch controls: could not remove the overlay", e);
+                    }
                 }
-                return mDragId != null;
-            case MotionEvent.ACTION_MOVE:
-                if (mDragId == null) return false;
-                moveControl(mDragId, x - mDragOffsetX, y - mDragOffsetY);
-                return true;
-            case MotionEvent.ACTION_UP:
-            case MotionEvent.ACTION_CANCEL:
-                mDragId = null;
-                return true;
-            default:
-                return true;
+                return;
+            }
+            if (sView == null) {
+                final TouchControls v = new TouchControls(activity, opacity, cameraSpeed);
+                v.mShown = true;  // turned on by the player: shown even with a controller connected
+                v.addTo(activity, 0);
+                return;
+            }
+            sView.setAlpha(Math.max(0.1f, Math.min(1.0f, opacity)));
+            sView.mCameraSpeed = Math.max(0.1f, Math.min(10f, cameraSpeed));
+            sView.invalidate();
+        });
+    }
+
+    /** The settings menu opened: everything held is let go (its releases go to the menu). */
+    public static void releaseForMenu() {
+        if (sView != null) {
+            sView.releaseAll();
+            sView.invalidate();
         }
     }
 
-    private String findControlAt(int x, int y) {
-        for (Map.Entry<String, View> e : mControls.entrySet()) {
-            View v = e.getValue();
-            if (x >= v.getLeft() && x <= v.getRight() && y >= v.getTop() && y <= v.getBottom()) return e.getKey();
+    /** Called by native code when a controller is used while the controls show. */
+    public static void controllerUsed(final Activity activity) {
+        activity.runOnUiThread(() -> {
+            if (sView != null) sView.setShown(false);
+        });
+    }
+
+    private final Activity mActivity;
+    private final float mDensity;
+    private final Handler mHandler = new Handler(Looper.getMainLooper());
+    private boolean mShown = true;
+
+    private static final int K_BUTTON = 0, K_STICK = 1, K_RSTICK = 2, K_NONE = 3;
+
+    private static final class Button {
+        final String label;
+        final int bit;
+        final boolean round;
+        float cx, cy, w, h;  // centre and size (px)
+        int pressCount;
+        Button(String label, int bit, boolean round) {
+            this.label = label;
+            this.bit = bit;
+            this.round = round;
         }
+        boolean hit(float x, float y, float slop) {
+            if (round) {
+                float r = w / 2 + slop, dx = x - cx, dy = y - cy;
+                return dx * dx + dy * dy <= r * r;
+            }
+            return Math.abs(x - cx) <= w / 2 + slop && Math.abs(y - cy) <= h / 2 + slop;
+        }
+    }
+
+    private final List<Button> mButtons = new ArrayList<>();
+
+    // Per finger (pointer id 0..15): what it does.
+    private final int[] mKind = new int[16];
+    private final Button[] mOn = new Button[16];
+    private final float[] mLastX = new float[16], mLastY = new float[16];
+
+    // Stick: fixed in place; a finger that comes down on it (or near it) drives it.
+    private int mStickPointer = -1;
+    private float mStickBaseX, mStickBaseY, mStickX, mStickY, mStickRadius;
+    // Camera stick: shown faintly only while touched; it appears under a finger that touches the right side and
+    // its base follows a finger that goes past its edge. Smaller than the left stick; `camera speed` = deflection
+    // per distance.
+    private int mRStickPointer = -1;
+    private float mRBaseX, mRBaseY, mRX, mRY, mRRadius;
+    // A thumb resting on it: the base slides under the thumb, so the camera eases to a stop instead of turning
+    // on and on. The slide fades in over the first moments of stillness (no jolt when it starts) and runs every
+    // display frame (Choreographer), with a short time constant.
+    private long mRLastMove;
+    private long mRLastFrameNs;
+    private static final float REST_START_S = 0.012f, REST_RAMP_S = 0.045f;  // stillness before / to full slide
+    private static final float RECENTER_TIME_S = 0.06f;  // time constant of the slide at full strength
+    private final android.view.Choreographer.FrameCallback mRecenter = new android.view.Choreographer.FrameCallback() {
+        @Override
+        public void doFrame(long frameNs) {
+            if (mRStickPointer < 0) return;
+            float dt = mRLastFrameNs == 0 ? 0.016f : Math.min(0.05f, (frameNs - mRLastFrameNs) / 1e9f);
+            mRLastFrameNs = frameNs;
+            float still = (android.os.SystemClock.uptimeMillis() - mRLastMove) / 1000f;
+            float ramp = sRecenter ? Math.max(0f, Math.min(1f, (still - REST_START_S) / REST_RAMP_S)) : 0f;
+            ramp = ramp * ramp * (3f - 2f * ramp);  // smoothstep
+            if (ramp > 0f && (mRX != mRBaseX || mRY != mRBaseY)) {
+                float k = 1f - (float) Math.exp(-dt * ramp / RECENTER_TIME_S);
+                mRBaseX += (mRX - mRBaseX) * k;
+                mRBaseY += (mRY - mRBaseY) * k;
+                float dx = mRX - mRBaseX, dy = mRY - mRBaseY;
+                if (dx * dx + dy * dy < 0.25f) {
+                    mRBaseX = mRX;
+                    mRBaseY = mRY;
+                }
+                sendState();
+                invalidate();
+            }
+            android.view.Choreographer.getInstance().postFrameCallback(this);
+        }
+    };
+    private float mCameraSpeed;
+
+    // Double tap (to show the controls again).
+    private long mLastTapTime;
+    private float mLastTapX, mLastTapY;
+
+    private final Paint mFill = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint mStroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint mText = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final RectF mRect = new RectF();
+
+    private TouchControls(Activity activity, float opacity, float cameraSpeed) {
+        super(activity);
+        mActivity = activity;
+        mCameraSpeed = Math.max(0.1f, Math.min(10f, cameraSpeed));
+        mDensity = activity.getResources().getDisplayMetrics().density;
+        setAlpha(Math.max(0.1f, Math.min(1.0f, opacity)));
+        mStroke.setStyle(Paint.Style.STROKE);
+        mStroke.setColor(0xFFFFFFFF);
+        mText.setColor(0xFFFFFFFF);
+        mText.setTextAlign(Paint.Align.CENTER);
+        mText.setFakeBoldText(true);
+        mButtons.add(new Button("A", A, true));
+        mButtons.add(new Button("B", B, true));
+        mButtons.add(new Button("X", X, true));
+        mButtons.add(new Button("Y", Y, true));
+        mButtons.add(new Button("L", L, false));
+        mButtons.add(new Button("ZL", ZL, false));
+        mButtons.add(new Button("R", R, false));
+        mButtons.add(new Button("ZR", ZR, false));
+        mButtons.add(new Button("−", MINUS, true));
+        mButtons.add(new Button("+", PLUS, true));
+        mButtons.add(new Button("▲", UP, false));
+        mButtons.add(new Button("▼", DOWN, false));
+        mButtons.add(new Button("◀", LEFT, false));
+        mButtons.add(new Button("▶", RIGHT, false));
+        mButtons.add(new Button("L3", L3, true));
+        mButtons.add(new Button("LOCK", R3, true));
+        for (int i = 0; i < 16; i++) mKind[i] = K_NONE;
+        // A controller already connected (or built in, as on handhelds): start hidden.
+        if (controllerConnected()) mShown = false;
+        InputManager im = (InputManager) activity.getSystemService(Context.INPUT_SERVICE);
+        if (im != null) im.registerInputDeviceListener(this, mHandler);
+    }
+
+    private void addTo(final Activity activity, final int attempt) {
+        final View decor = activity.getWindow().getDecorView();
+        if (decor.getWindowToken() == null) {  // the game's window is not attached yet
+            if (attempt < 50) mHandler.postDelayed(() -> addTo(activity, attempt + 1), 100);
+            return;
+        }
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT);
+        lp.token = decor.getWindowToken();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
+            lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        try {
+            activity.getWindowManager().addView(this, lp);
+            sView = this;
+            nativeVisible(mShown);
+        } catch (Exception e) {
+            android.util.Log.w("DSRNative", "touch controls: could not add the overlay", e);
+        }
+    }
+
+    private boolean controllerConnected() {
+        for (int id : InputDevice.getDeviceIds()) {
+            InputDevice d = InputDevice.getDevice(id);
+            if (d == null || d.isVirtual()) continue;
+            int s = d.getSources();
+            if ((s & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
+                    || (s & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK)
+                return true;
+        }
+        return false;
+    }
+
+    @Override
+    public void onInputDeviceAdded(int deviceId) {
+        InputDevice d = InputDevice.getDevice(deviceId);
+        if (d == null) return;
+        int s = d.getSources();
+        if ((s & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
+                || (s & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK)
+            setShown(false);
+    }
+
+    @Override
+    public void onInputDeviceRemoved(int deviceId) {}
+
+    @Override
+    public void onInputDeviceChanged(int deviceId) {}
+
+    void setShown(boolean shown) {
+        if (mShown == shown) return;
+        mShown = shown;
+        releaseAll();
+        nativeVisible(shown);
+        invalidate();
+    }
+
+    private void releaseAll() {
+        for (int i = 0; i < 16; i++) {
+            mKind[i] = K_NONE;
+            mOn[i] = null;
+        }
+        for (Button b : mButtons) b.pressCount = 0;
+        mStickPointer = -1;
+        mRStickPointer = -1;
+        sendState();
+    }
+
+    // ---- layout ---------------------------------------------------------------------------------------------
+
+    @Override
+    protected void onSizeChanged(int w, int h, int ow, int oh) {
+        super.onSizeChanged(w, h, ow, oh);
+        layout(w, h);
+    }
+
+    private Button find(int bit) {
+        for (Button b : mButtons)
+            if (b.bit == bit) return b;
         return null;
     }
 
-    private void moveControl(String id, int left, int top) {
-        View v = mControls.get(id);
-        if (v == null) return;
-        left = clamp(left, 0, getWidth() - v.getWidth());
-        top = clamp(top, 0, getHeight() - v.getHeight());
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(v.getWidth(), v.getHeight());
-        lp.gravity = Gravity.TOP | Gravity.START;
-        lp.setMargins(left, top, 0, 0);
-        v.setLayoutParams(lp);
+    private void place(int bit, float cx, float cy, float w, float h) {
+        Button b = find(bit);
+        b.cx = cx;
+        b.cy = cy;
+        b.w = w;
+        b.h = h;
     }
 
-    private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
+    private void layout(int w, int h) {
+        final float u = Math.min(w, h) / 10f;  // layout unit: a tenth of the short side
+        // Face buttons, Switch layout (X top, A right, B bottom, Y left).
+        final float fcx = w - 3.0f * u, fcy = h - 3.0f * u, d = 1.45f * u, fb = 1.3f * u;
+        place(A, fcx + d, fcy, fb, fb);
+        place(B, fcx, fcy + d, fb, fb);
+        place(X, fcx, fcy - d, fb, fb);
+        place(Y, fcx - d, fcy, fb, fb);
+        place(R3, w - 5.6f * u, h - 1.2f * u, 1.3f * u, 1.3f * u);
+        // Shoulders: ZL / ZR in the top corners, L / R below them.
+        final float sw = 2.4f * u, sh = 1.1f * u;
+        place(ZL, 1.7f * u, 1.0f * u, sw, sh);
+        place(L, 1.7f * u, 2.5f * u, sw, sh);
+        place(ZR, w - 1.7f * u, 1.0f * u, sw, sh);
+        place(R, w - 1.7f * u, 2.5f * u, sw, sh);
+        // Minus / plus at the top centre.
+        place(MINUS, w / 2f - 1.3f * u, 0.9f * u, 1.0f * u, 1.0f * u);
+        place(PLUS, w / 2f + 1.3f * u, 0.9f * u, 1.0f * u, 1.0f * u);
+        // D-pad, bottom, right of the stick.
+        final float dcx = 6.9f * u, dcy = h - 2.0f * u, ds = 0.95f * u, db = 0.9f * u;
+        place(UP, dcx, dcy - ds, db, db);
+        place(DOWN, dcx, dcy + ds, db, db);
+        place(LEFT, dcx - ds, dcy, db, db);
+        place(RIGHT, dcx + ds, dcy, db, db);
+        place(L3, 4.7f * u, h - 0.9f * u, 1.0f * u, 1.0f * u);
+        // Stick: resting spot, and the area where a finger grabs it.
+        mStickRadius = 1.6f * u;
+        mRRadius = 1.05f * u;
+        mStickBaseX = 2.8f * u;
+        mStickBaseY = h - 3.0f * u;
+        mText.setTextSize(0.45f * u);
+        mStroke.setStrokeWidth(Math.max(2f, 0.05f * u));
+    }
 
-    // ---- persistence: touch_layout.txt, "pos_<id> = fx fy" (top-left corner, fraction of this
-    // view's own width/height) for whichever controls were ever dragged -- untouched ones just keep
-    // their default gravity/margin layout from build{Sticks,Buttons}() above. ------------------------
-    private static final Pattern KV = Pattern.compile("^\\s*pos_([A-Z_]+)\\s*=\\s*([0-9.]+)\\s+([0-9.]+)\\s*$");
+    // ---- touch ----------------------------------------------------------------------------------------------
 
-    private void loadLayout() {
-        File f = AppFiles.resolve(getContext(), "touch_layout.txt");
-        Log.i(TAG, "loading layout from " + f.getAbsolutePath() + " exists=" + f.exists());
-        if (!f.exists()) return;
-        // Positions are fractions of this view's size, which isn't known until after layout.
-        post(() -> {
-            try (BufferedReader r = new BufferedReader(new FileReader(f))) {
-                String line;
-                while ((line = r.readLine()) != null) {
-                    Matcher m = KV.matcher(line);
-                    if (!m.matches()) continue;
-                    View v = mControls.get(m.group(1));
-                    if (v == null) continue;
-                    final float fx = parseF(m.group(2)), fy = parseF(m.group(3));
-                    moveControl(m.group(1), (int) (fx * getWidth()), (int) (fy * getHeight()));
+    @Override
+    public boolean onTouchEvent(MotionEvent e) {
+        final int action = e.getActionMasked();
+        if (!mShown) {
+            if (action == MotionEvent.ACTION_DOWN) checkDoubleTap(e.getX(), e.getY());
+            return true;
+        }
+        switch (action) {
+            case MotionEvent.ACTION_DOWN:
+            case MotionEvent.ACTION_POINTER_DOWN: {
+                int i = e.getActionIndex();
+                down(e.getPointerId(i), e.getX(i), e.getY(i));
+                break;
+            }
+            case MotionEvent.ACTION_MOVE:
+                for (int i = 0; i < e.getPointerCount(); i++) move(e.getPointerId(i), e.getX(i), e.getY(i));
+                break;
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_POINTER_UP: {
+                int i = e.getActionIndex();
+                up(e.getPointerId(i));
+                break;
+            }
+            case MotionEvent.ACTION_CANCEL:
+                releaseAll();
+                break;
+            default:
+                break;
+        }
+        sendState();
+        invalidate();
+        return true;
+    }
+
+    private void checkDoubleTap(float x, float y) {
+        long now = android.os.SystemClock.uptimeMillis();
+        float slop = 60 * mDensity;
+        if (now - mLastTapTime < 350 && Math.abs(x - mLastTapX) < slop && Math.abs(y - mLastTapY) < slop) {
+            mLastTapTime = 0;
+            setShown(true);
+        } else {
+            mLastTapTime = now;
+            mLastTapX = x;
+            mLastTapY = y;
+        }
+    }
+
+    private Button hit(float x, float y) {
+        float slop = 0.15f * Math.min(getWidth(), getHeight()) / 10f;
+        Button best = null;
+        float bestDist = Float.MAX_VALUE;
+        for (Button b : mButtons)
+            if (b.hit(x, y, slop)) {
+                float dx = x - b.cx, dy = y - b.cy, dist = dx * dx + dy * dy;
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    best = b;
                 }
-            } catch (IOException ignored) {
             }
-        });
+        return best;
     }
 
-    private void saveLayout() {
-        File f = AppFiles.resolve(getContext(), "touch_layout.txt");
-        Log.i(TAG, "saving layout to " + f.getAbsolutePath());
-        File parent = f.getParentFile();
-        if (parent != null) {
-            final boolean madeDirs = parent.mkdirs();
-            Log.i(TAG, "parent dir " + parent.getAbsolutePath() + " exists=" + parent.exists()
-                    + " (mkdirs created new=" + madeDirs + ")");
+    private void down(int id, float x, float y) {
+        if (id < 0 || id >= 16) return;
+        mLastX[id] = x;
+        mLastY[id] = y;
+        Button b = hit(x, y);
+        if (b != null) {
+            mKind[id] = K_BUTTON;
+            mOn[id] = b;
+            b.pressCount++;
+        } else if (mStickPointer < 0 && onStick(x, y)) {
+            mKind[id] = K_STICK;
+            mStickPointer = id;
+            mStickX = x;
+            mStickY = y;
+        } else if (mRStickPointer < 0 && x > getWidth() * 0.5f) {
+            mKind[id] = K_RSTICK;
+            mRStickPointer = id;
+            mRBaseX = mRX = x;
+            mRBaseY = mRY = y;
+            mRLastMove = android.os.SystemClock.uptimeMillis();
+            mRLastFrameNs = 0;
+            android.view.Choreographer.getInstance().removeFrameCallback(mRecenter);
+            android.view.Choreographer.getInstance().postFrameCallback(mRecenter);
+        } else {
+            mKind[id] = K_NONE;
         }
-        try (FileWriter w = new FileWriter(f)) {
-            w.write("# On-screen control positions (long-press the toggle button, top-right, to edit in-game)\n");
-            for (Map.Entry<String, View> e : mControls.entrySet()) {
-                View v = e.getValue();
-                w.write("pos_" + e.getKey() + " = " + (v.getLeft() / (float) getWidth()) + " "
-                        + (v.getTop() / (float) getHeight()) + "\n");
+    }
+
+    private boolean onStick(float x, float y) {
+        float dx = x - mStickBaseX, dy = y - mStickBaseY, r = mStickRadius * 1.5f;
+        return dx * dx + dy * dy <= r * r;
+    }
+
+    private void move(int id, float x, float y) {
+        if (id < 0 || id >= 16) return;
+        switch (mKind[id]) {
+            case K_BUTTON: {  // slide between buttons (e.g. across the face buttons)
+                Button b = hit(x, y);
+                if (b != mOn[id]) {
+                    if (mOn[id] != null) mOn[id].pressCount--;
+                    mOn[id] = b;
+                    if (b != null) b.pressCount++;
+                }
+                break;
             }
-            Log.i(TAG, "layout saved: " + mControls.size() + " controls, file now " + f.length() + " bytes");
-            Toast.makeText(getContext(), "Layout saved", Toast.LENGTH_SHORT).show();
-        } catch (IOException e) {
-            // Not fatal to play -- the layout just reverts to defaults (or whatever was last saved)
-            // next launch -- but silently swallowing this is exactly how "it doesn't save" becomes
-            // impossible to diagnose, so it's logged and surfaced instead.
-            Log.e(TAG, "failed to save layout to " + f.getAbsolutePath(), e);
-            Toast.makeText(getContext(), "Couldn't save layout: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            case K_STICK:
+                mStickX = x;
+                mStickY = y;
+                break;
+            case K_RSTICK: {
+                if (x != mRX || y != mRY) mRLastMove = android.os.SystemClock.uptimeMillis();
+                mRX = x;
+                mRY = y;
+                float dx = x - mRBaseX, dy = y - mRBaseY, len = (float) Math.sqrt(dx * dx + dy * dy);
+                if (len > mRRadius) {  // the base follows the finger
+                    mRBaseX = x - dx / len * mRRadius;
+                    mRBaseY = y - dy / len * mRRadius;
+                }
+                break;
+            }
+            default:
+                break;
         }
+        mLastX[id] = x;
+        mLastY[id] = y;
     }
 
-    private static float parseF(String s) {
-        try { return Float.parseFloat(s); } catch (NumberFormatException e) { return 0f; }
+    private void up(int id) {
+        if (id < 0 || id >= 16) return;
+        if (mKind[id] == K_BUTTON && mOn[id] != null) mOn[id].pressCount--;
+        if (mKind[id] == K_STICK) mStickPointer = -1;
+        if (mKind[id] == K_RSTICK) mRStickPointer = -1;
+        mKind[id] = K_NONE;
+        mOn[id] = null;
     }
 
-    private int dp(int v) {
-        return (int) (v * getResources().getDisplayMetrics().density);
+    private void sendState() {
+        int bits = 0;
+        for (Button b : mButtons)
+            if (b.pressCount > 0) bits |= b.bit;
+        float lx = 0, ly = 0;
+        if (mStickPointer >= 0) {
+            float dx = mStickX - mStickBaseX, dy = mStickY - mStickBaseY;
+            float len = (float) Math.sqrt(dx * dx + dy * dy);
+            if (len > mStickRadius) {  // past the edge: full tilt in that direction
+                dx = dx / len * mStickRadius;
+                dy = dy / len * mStickRadius;
+            }
+            lx = dx / mStickRadius;
+            ly = -dy / mStickRadius;
+            if (Math.abs(lx) < 0.08f && Math.abs(ly) < 0.08f) lx = ly = 0;
+        }
+        float rx = 0, ry = 0;
+        if (mRStickPointer >= 0) {
+            // Full tilt at 1 / speed of the ring's radius (speed 1: at the edge).
+            float reach = mRRadius / mCameraSpeed;
+            rx = Math.max(-1f, Math.min(1f, (mRX - mRBaseX) / reach));
+            ry = Math.max(-1f, Math.min(1f, -(mRY - mRBaseY) / reach));
+            if (Math.abs(rx) < 0.06f && Math.abs(ry) < 0.06f) rx = ry = 0;
+        }
+        nativeState(bits, lx, ly, rx, ry);
+    }
+
+    // ---- drawing --------------------------------------------------------------------------------------------
+
+    @Override
+    protected void onDraw(Canvas c) {
+        if (!mShown) return;
+        // Stick (the knob stays inside the ring).
+        final float bx = mStickBaseX, by = mStickBaseY;
+        mFill.setColor(0x40000000);
+        c.drawCircle(bx, by, mStickRadius, mFill);
+        c.drawCircle(bx, by, mStickRadius, mStroke);
+        float kx = bx, ky = by;
+        if (mStickPointer >= 0) {
+            float dx = mStickX - bx, dy = mStickY - by, len = (float) Math.sqrt(dx * dx + dy * dy);
+            if (len > mStickRadius) {
+                dx = dx / len * mStickRadius;
+                dy = dy / len * mStickRadius;
+            }
+            kx = bx + dx;
+            ky = by + dy;
+        }
+        mFill.setColor(mStickPointer >= 0 ? 0xA0FFFFFF : 0x60FFFFFF);
+        c.drawCircle(kx, ky, mStickRadius * 0.45f, mFill);
+        // Camera stick, only while touched, faint: 10% opaque on screen (whatever touch_opacity is).
+        if (mRStickPointer >= 0) {
+            final int a = Math.max(1, Math.min(255, Math.round(255 * 0.10f / Math.max(0.1f, getAlpha()))));
+            mFill.setColor(a << 24);
+            c.drawCircle(mRBaseX, mRBaseY, mRRadius, mFill);
+            mStroke.setAlpha(a);
+            c.drawCircle(mRBaseX, mRBaseY, mRRadius, mStroke);
+            mStroke.setAlpha(0xFF);
+            float dx = mRX - mRBaseX, dy = mRY - mRBaseY, len = (float) Math.sqrt(dx * dx + dy * dy);
+            if (len > mRRadius) {
+                dx = dx / len * mRRadius;
+                dy = dy / len * mRRadius;
+            }
+            mFill.setColor((a << 24) | 0xFFFFFF);
+            c.drawCircle(mRBaseX + dx, mRBaseY + dy, mRRadius * 0.45f, mFill);
+        }
+        // Buttons.
+        for (Button b : mButtons) {
+            boolean on = b.pressCount > 0;
+            mFill.setColor(on ? 0x90FFFFFF : 0x50000000);
+            if (b.round) {
+                c.drawCircle(b.cx, b.cy, b.w / 2, mFill);
+                c.drawCircle(b.cx, b.cy, b.w / 2, mStroke);
+            } else {
+                mRect.set(b.cx - b.w / 2, b.cy - b.h / 2, b.cx + b.w / 2, b.cy + b.h / 2);
+                float r = Math.min(b.w, b.h) * 0.3f;
+                c.drawRoundRect(mRect, r, r, mFill);
+                c.drawRoundRect(mRect, r, r, mStroke);
+            }
+            mText.setColor(on ? 0xFF000000 : 0xFFFFFFFF);
+            float size = mText.getTextSize();
+            if (b.label.length() > 2) mText.setTextSize(size * 0.7f);
+            c.drawText(b.label, b.cx, b.cy - (mText.descent() + mText.ascent()) / 2, mText);
+            mText.setTextSize(size);
+        }
     }
 }

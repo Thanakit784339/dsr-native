@@ -46,26 +46,11 @@ std::atomic<bool> g_game_started{false};
 std::mutex g_pad_mutex;  // guards g_pad: written by the input-event thread, read by the touch UI thread too
 dsr::input::PadState g_pad;
 
-// On-screen touch controls (TouchControls.java, over JNI): a separate input source, merged with the
-// physical pad below so either can drive the game regardless of which one last moved.
-std::atomic<uint64_t> g_touch_buttons{0};
-std::atomic<int32_t> g_touch_lx{0}, g_touch_ly{0}, g_touch_rx{0}, g_touch_ry{0};
-
-// Recomputes the combined state and pushes it to nn::hid. Touch sticks only override the physical ones
-// while actually being dragged (zero means "not touched"), so a connected gamepad still works normally.
+// Pushes the physical pad to nn::hid. On-screen touch controls merge in separately (dsr::input::SetTouch,
+// see hid.cpp's GetPad) -- either can drive the game regardless of which one last moved.
 void PushMergedPad() {
-    using namespace dsr::input;
-    PadState s;
-    {
-        std::lock_guard<std::mutex> lk(g_pad_mutex);
-        s = g_pad;
-    }
-    s.buttons |= g_touch_buttons.load(std::memory_order_relaxed);
-    const int32_t tlx = g_touch_lx.load(std::memory_order_relaxed), tly = g_touch_ly.load(std::memory_order_relaxed);
-    const int32_t trx = g_touch_rx.load(std::memory_order_relaxed), try_ = g_touch_ry.load(std::memory_order_relaxed);
-    if (tlx || tly) { s.lx = tlx; s.ly = tly; }
-    if (trx || try_) { s.rx = trx; s.ry = try_; }
-    SetPad(s);
+    std::lock_guard<std::mutex> lk(g_pad_mutex);
+    dsr::input::SetPad(g_pad);
 }
 
 bool FileExists(const std::string& p) {
@@ -405,8 +390,21 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
              have_texture_mip_skip = false, have_astc_transcode = false;
         char line[256];
         while (fgets(line, sizeof(line), f)) {
+            if (line[0] == '#') continue;
+            // game_dir (a folder the player picked via the Options screen's file picker) can contain spaces,
+            // which the generic "%s" value parser below would truncate at -- handled as a raw line instead.
+            if (!strncmp(line, "game_dir", 8)) {
+                char* eq = strchr(line, '=');
+                if (eq) {
+                    std::string val = eq + 1;
+                    const size_t b = val.find_first_not_of(" \t");
+                    const size_t e = val.find_last_not_of(" \t\r\n");
+                    cfg->game_dir = (b == std::string::npos || e == std::string::npos) ? "" : val.substr(b, e - b + 1);
+                }
+                continue;
+            }
             char key[64], value[64];
-            if (line[0] == '#' || sscanf(line, " %63[a-z_0-9] = %63s", key, value) != 2) continue;
+            if (sscanf(line, " %63[a-z_0-9] = %63s", key, value) != 2) continue;
             const int v = atoi(value);
             if (!strcmp(key, "fps")) cfg->target_fps = std::clamp(v, 30, 60);  // e.g. 45: a steady cap below 60
             else if (!strcmp(key, "async_pipelines")) cfg->async_pipelines = v != 0;
@@ -755,22 +753,20 @@ int32_t OnInput(android_app*, AInputEvent* ev) {
 }
 
 // ---- on-screen touch controls (TouchControls.java) ----------------------------------------------------
-extern "C" JNIEXPORT void JNICALL Java_com_dsrnative_app_TouchControls_nativeSetTouchButtons(JNIEnv*, jobject,
-                                                                                              jlong mask) {
-    g_touch_buttons.store(uint64_t(mask), std::memory_order_relaxed);
-    PushMergedPad();
+// TouchControls.java merges on the Java side and sends one full state per update; dsr::input::SetTouch
+// (hid.cpp) does the actual merge with the physical pad, same as the controller path above.
+extern "C" JNIEXPORT void JNICALL Java_com_dsrnative_app_TouchControls_nativeState(JNIEnv*, jclass, jint buttons,
+                                                                                    jfloat lx, jfloat ly, jfloat rx,
+                                                                                    jfloat ry) {
+    dsr::input::SetTouch(uint64_t(uint32_t(buttons)), lx, ly, rx, ry);
 }
-extern "C" JNIEXPORT void JNICALL Java_com_dsrnative_app_TouchControls_nativeSetTouchStick(JNIEnv*, jobject,
-                                                                                            jint which, jint x,
-                                                                                            jint y) {
-    if (which == 0) {
-        g_touch_lx.store(x, std::memory_order_relaxed);
-        g_touch_ly.store(y, std::memory_order_relaxed);
-    } else {
-        g_touch_rx.store(x, std::memory_order_relaxed);
-        g_touch_ry.store(y, std::memory_order_relaxed);
-    }
-    PushMergedPad();
+extern "C" JNIEXPORT void JNICALL Java_com_dsrnative_app_TouchControls_nativeVisible(JNIEnv*, jclass,
+                                                                                      jboolean visible) {
+    // Not porting upstream's native-triggered "hide while an already-connected controller is actively
+    // used" -- TouchControls.java's own onInputDeviceAdded already auto-hides on a NEW controller
+    // connection, the common case. A controller plugged in before launch would need that native hook
+    // to auto-hide on first use; skipped as a real but minor UX gap, not a functional one.
+    if (!visible) dsr::input::SetTouch(0, 0, 0, 0, 0);
 }
 
 // ---- on-screen FPS counter (GameActivity's overlay) --------------------------------------------------

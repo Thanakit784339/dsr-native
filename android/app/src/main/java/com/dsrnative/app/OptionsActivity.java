@@ -2,10 +2,13 @@ package com.dsrnative.app;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
+import android.provider.DocumentsContract;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.widget.ArrayAdapter;
@@ -39,6 +42,11 @@ public class OptionsActivity extends Activity {
     private CheckBox mAsyncPipelines, mAutoCapture, mProfile, mTouchControls, mDocked, mFpsCounter;
     private CheckBox mAudioSmooth, mFastCores, mRecordThread, mPinRenderThread, mAstcTranscode, mMaliBarriers;
     private FloatSlider mGamma, mExposure, mRenderScale;
+    private TextView mGameFolderStatus;
+    // null until the player picks a new folder this session; the existing settings.txt line (if any) is
+    // left untouched otherwise -- this screen doesn't know the default location well enough to show it,
+    // so it should never overwrite a working custom folder just because the field wasn't touched.
+    private String mGameDir;
 
     private File settingsFile() { return AppFiles.resolve(this, "settings.txt"); }
 
@@ -55,6 +63,20 @@ public class OptionsActivity extends Activity {
         scroll.addView(root);
 
         root.addView(title("DSR Native — Settings"));
+
+        mGameFolderStatus = new TextView(this);
+        mGameFolderStatus.setTextSize(13);
+        root.addView(mGameFolderStatus);
+        Button pickFolder = new Button(this);
+        pickFolder.setText("Choose game folder…");
+        LinearLayout.LayoutParams pickLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        pickLp.topMargin = dp(8);
+        pickFolder.setLayoutParams(pickLp);
+        pickFolder.setOnClickListener(v -> pickGameFolder());
+        root.addView(pickFolder);
+        tip(root, "The app looks in Download/DSRNative/game by default. Use this only if your game files are "
+                + "somewhere else -- pick the folder that contains the exefs folder, dvdbnd0.bdt and dvdbnd1.bdt.");
 
         mFps = labeledSpinner(root, "Frame rate cap", new String[] {"30", "45", "60"});
         tip(root, "30 matches the original Switch rate and is easiest to hold steady. 45/60 move smoother "
@@ -95,8 +117,9 @@ public class OptionsActivity extends Activity {
                 + "by physical position instead, matching a Nintendo-layout controller.");
 
         mTouchControls = checkBox(root, "Show on-screen touch controls");
-        tip(root, "On: on-screen buttons shown (a toggle button, top-right, can hide/show them in-game too). "
-                + "Off: fully hidden, use a physical controller.");
+        tip(root, "On: a fixed stick (bottom-left) and Switch buttons around the edges, plus a floating camera "
+                + "stick wherever you touch the right side. They hide automatically when a controller is "
+                + "connected or used, and come back with a double-tap on the screen. Off: fully hidden.");
 
         mFpsCounter = checkBox(root, "Show FPS counter");
         tip(root, "On: small FPS counter overlay, top-left. Off: no overlay. No real performance difference.");
@@ -171,6 +194,105 @@ public class OptionsActivity extends Activity {
         }
     }
 
+    // ---- game folder picker (Storage Access Framework, then converted to a plain path -- native code
+    // still just opens files by path, it never reads through a content:// URI) ---------------------------
+    private static final int REQ_GAME_FOLDER = 4103;
+
+    private void pickGameFolder() {
+        try {
+            startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_GAME_FOLDER);
+        } catch (Exception e) {
+            new AlertDialog.Builder(this).setTitle("No file manager")
+                    .setMessage("No app is available to choose a folder.").setPositiveButton("OK", null).show();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_GAME_FOLDER) return;
+        Uri uri = resultCode == RESULT_OK && data != null ? data.getData() : null;
+        if (uri == null) return;
+        String path = treeToPath(uri);
+        String root = findGameRoot(path);
+        if (root == null) {
+            String partial = findPartialGameRoot(path);
+            String msg = partial != null
+                    ? partial + " is missing:\n" + missingGameFiles(partial)
+                            + "\n\nThese files belong next to the exefs folder. Choose a folder that holds the "
+                            + "complete game."
+                    : (path == null ? "That folder" : path) + " does not hold the game files.\n\nChoose the "
+                            + "folder that contains the exefs folder, dvdbnd0.bdt and dvdbnd1.bdt.";
+            new AlertDialog.Builder(this).setTitle("No game files there").setMessage(msg)
+                    .setPositiveButton("OK", null).show();
+            return;
+        }
+        mGameDir = root;
+        mGameFolderStatus.setText("Game folder: " + root + " (chosen, saved on Start Game)");
+    }
+
+    /** A folder picked with ACTION_OPEN_DOCUMENT_TREE as a file path (the app has "All files access"). */
+    private static String treeToPath(Uri uri) {
+        try {
+            String id = DocumentsContract.getTreeDocumentId(uri);
+            if (id == null) return null;
+            if (id.startsWith("raw:")) return id.substring(4);
+            if ("com.android.providers.downloads.documents".equals(uri.getAuthority()) && "downloads".equals(id))
+                return Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).getPath();
+            int c = id.indexOf(':');
+            if (c < 0) return null;
+            String volume = id.substring(0, c), rel = id.substring(c + 1);
+            String root = "primary".equalsIgnoreCase(volume) ? Environment.getExternalStorageDirectory().getPath()
+                                                             : "/storage/" + volume;
+            while (rel.endsWith("/")) rel = rel.substring(0, rel.length() - 1);
+            return rel.isEmpty() ? root : root + "/" + rel;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** The files a game folder must hold: the program and the data archives the game opens at start-up. */
+    private static final String[] GAME_FILES = {"exefs/main", "dvdbnd0.bhd5", "dvdbnd0.bdt", "dvdbnd1.bhd5",
+            "dvdbnd1.bdt"};
+
+    /** The required game files missing from a folder, comma separated ("" when complete). */
+    private static String missingGameFiles(String dir) {
+        StringBuilder b = new StringBuilder();
+        for (String f : GAME_FILES)
+            if (!new File(dir, f).isFile()) b.append(b.length() == 0 ? "" : ", ").append(f);
+        return b.toString();
+    }
+
+    private static int presentGameFiles(File dir) {
+        int n = 0;
+        for (String f : GAME_FILES)
+            if (new File(dir, f).isFile()) n++;
+        return n;
+    }
+
+    /** The folder itself, its game/ subfolder or (for an exefs folder) its parent. */
+    private static File[] gameRootCandidates(String path) {
+        File p = new File(path);
+        File parent = p.getName().equals("exefs") ? p.getParentFile() : null;
+        return new File[] {p, new File(p, "game"), parent};
+    }
+
+    /** The game's root in or around a chosen folder (holding exefs/main and the data archives), or null. */
+    private static String findGameRoot(String path) {
+        if (path == null) return null;
+        for (File c : gameRootCandidates(path))
+            if (c != null && presentGameFiles(c) == GAME_FILES.length) return c.getPath();
+        return null;
+    }
+
+    /** A folder in or around the chosen one with part of the game (not all of it), or null. */
+    private static String findPartialGameRoot(String path) {
+        if (path == null) return null;
+        for (File c : gameRootCandidates(path))
+            if (c != null && presentGameFiles(c) > 0) return c.getPath();
+        return null;
+    }
+
     // ---- reading the existing file (if any) so the screen reflects what's actually set ----------------
     private void loadCurrentValues() {
         setSpinner(mFps, "30");
@@ -193,12 +315,21 @@ public class OptionsActivity extends Activity {
         mPinRenderThread.setChecked(false);
         mAstcTranscode.setChecked(false);
         mMaliBarriers.setChecked(true);
+        mGameFolderStatus.setText("Game folder: Download/DSRNative/game (default)");
 
         File f = settingsFile();
         if (f.exists()) {
             try (BufferedReader r = new BufferedReader(new FileReader(f))) {
                 String line;
                 while ((line = r.readLine()) != null) {
+                    // game_dir can contain spaces, which the generic KV pattern's value group (\S+) would
+                    // truncate at -- handled separately, same reasoning as the native-side settings parser.
+                    Matcher gd = GAME_DIR_LINE.matcher(line);
+                    if (gd.matches()) {
+                        String dir = gd.group(1).trim();
+                        if (!dir.isEmpty()) mGameFolderStatus.setText("Game folder: " + dir + " (chosen)");
+                        continue;
+                    }
                     Matcher m = KV.matcher(line);
                     if (!m.matches()) continue;
                     final String key = m.group(1), value = m.group(2);
@@ -241,6 +372,7 @@ public class OptionsActivity extends Activity {
 
     // ---- writing back: only the keys this screen has a widget for are touched --------------------------
     private static final Pattern KV = Pattern.compile("^\\s*([a-z_0-9]+)\\s*=\\s*(\\S+)\\s*$");
+    private static final Pattern GAME_DIR_LINE = Pattern.compile("^\\s*game_dir\\s*=(.*)$");
 
     private void saveAndLaunch() {
         List<String> lines = new ArrayList<>();
@@ -272,6 +404,7 @@ public class OptionsActivity extends Activity {
         upsert(lines, "pin_render_thread", mPinRenderThread.isChecked() ? "1" : "0");
         upsert(lines, "astc_transcode", mAstcTranscode.isChecked() ? "1" : "0");
         upsert(lines, "mali_barriers", mMaliBarriers.isChecked() ? "1" : "0");
+        if (mGameDir != null) upsert(lines, "game_dir", mGameDir);
 
         File parent = f.getParentFile();
         if (parent != null) parent.mkdirs();

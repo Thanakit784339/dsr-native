@@ -1,6 +1,8 @@
 // nn::hid — one virtual controller fed by the platform layer (dsr::input). It is reported both as
 // player 1 (Pro Controller style) and as the handheld console, whichever the game polls.
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 
 #include "common/log.h"
@@ -14,15 +16,36 @@ namespace dsr::input {
 namespace {
 std::mutex g_mutex;
 PadState g_state;
+uint64_t g_touch_buttons = 0;
+float g_touch_lx = 0, g_touch_ly = 0, g_touch_rx = 0, g_touch_ry = 0;
+int32_t ToStick(float v) { return int32_t(std::lround(std::max(-1.0f, std::min(1.0f, v)) * 32767.0f)); }
 }  // namespace
 void SetPad(const PadState& s) {
     std::lock_guard<std::mutex> lk(g_mutex);
     g_state = s;
 }
+void SetTouch(uint64_t buttons, float lx, float ly, float rx, float ry) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_touch_buttons = buttons;
+    g_touch_lx = lx;
+    g_touch_ly = ly;
+    g_touch_rx = rx;
+    g_touch_ry = ry;
+}
 PadState GetPad(int64_t* sampling) {
     if (sampling) *sampling = dsr::hle::os::NowNs() / 4'000'000;  // ~250 Hz sampling counter
     std::lock_guard<std::mutex> lk(g_mutex);
-    return g_state;
+    PadState s = g_state;
+    s.buttons |= g_touch_buttons;
+    if (g_touch_lx != 0 || g_touch_ly != 0) {
+        s.lx = ToStick(g_touch_lx);
+        s.ly = ToStick(g_touch_ly);
+    }
+    if (g_touch_rx != 0 || g_touch_ry != 0) {
+        s.rx = ToStick(g_touch_rx);
+        s.ry = ToStick(g_touch_ry);
+    }
+    return s;
 }
 }  // namespace dsr::input
 

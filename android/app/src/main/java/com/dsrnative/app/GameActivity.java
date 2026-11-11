@@ -95,7 +95,6 @@ public class GameActivity extends NativeActivity {
         hideSystemBars();
     }
 
-    private TouchControls mOverlay;
     private TextView mFpsView;
     private final Handler mFpsHandler = new Handler(Looper.getMainLooper());
     private native float nativeGetFps();
@@ -154,16 +153,11 @@ public class GameActivity extends NativeActivity {
     // its own layer above the activity's main surface. Drawing into the activity's own content view
     // was tried first and failed: that view shares the same surface the Vulkan swapchain presents to
     // directly, so the two were racing for one buffer instead of being layered, and the overlay's
-    // content got overwritten before it was ever visible. A sub-window needs the activity's window
-    // token, which isn't valid until the window actually has focus, so this can't happen in onCreate.
+    // content got overwritten before it was ever visible. TouchControls.attach() owns the window
+    // creation now (it retries internally until the activity's window token is actually valid, so this
+    // can be called from onCreate without waiting for focus the way the old inline version needed to).
     private void addTouchOverlay() {
-        if (mOverlay != null || !touchControlsEnabled()) return;
-        mOverlay = new TouchControls(this);
-        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.TYPE_APPLICATION_PANEL, 0, PixelFormat.TRANSLUCENT);
-        lp.token = getWindow().getDecorView().getWindowToken();
-        getWindowManager().addView(mOverlay, lp);
+        TouchControls.attach(this, 0.7f, 1.0f, touchControlsEnabled());
     }
 
     // settings.txt's touch_controls key (set by OptionsActivity); defaults to on if missing.
