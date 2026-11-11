@@ -4269,7 +4269,6 @@ private:
         // shaders: quads, text, bars) goes into a centred 16:9 box instead: 1280x720 in the middle of wider frames,
         // the full width and 9/16 of it high on narrower ones, so the HUD keeps its shape and layout. Full-screen
         // quads (fades, dimming behind menus) still cover the whole frame.
-        if (FixedQuad(p, vin, extent)) d.dyn.vp.width *= float(extent.width) / 1280.0f;
         if (hud_box_w_ && extent.height == 720 && int(extent.width) == dsr::GetRuntime().config.render_width &&
             HudBoxed(p, vin)) {
             const float sx = float(hud_box_w_) / float(extent.width), sy = float(hud_box_h_) / 720.0f;
@@ -5833,26 +5832,8 @@ private:
         if (full) hud_full_screen_++;
         return !full;
     }
-    // Other aspect ratios: some of the game's full-screen effect passes draw a 1280x720 quad (a fixed size) with
-    // the projection of the real frame width, so on wider frames they stop at 1280 pixels (on narrower ones they
-    // overshoot). Such a quad is stretched to the frame: true if this draw is one.
-    bool FixedQuad(const DrawParams& p, const VertexInput& vin, VkExtent2D extent) {
-        const int rw = dsr::GetRuntime().config.render_width;
-        if (rw == 1280 || int(extent.width) != rw || extent.height != 720 || p.count > 6) return false;
-        float sx, sy;
-        if (!Projection2D(&sx, &sy) || std::fabs(sx - 2.0f / float(rw)) > 1e-6f || std::fabs(sy + 2.0f / 720.0f) > 1e-6f)
-            return false;
-        float x0, x1, y0, y1;
-        if (!DrawBounds(p, vin, &x0, &x1, &y0, &y1)) return false;
-        const bool fixed = std::fabs(x0) < 1.0f && std::fabs(x1 - 1280.0f) < 1.0f && std::fabs(y0) < 1.0f &&
-                           std::fabs(y1 - 720.0f) < 1.0f;
-        if (fixed && fixed_quad_logged_.insert(st_.program[0]->hash).second)
-            LOGI(kTag, "aspect ratio: 1280x720 full-screen quad (vertex shader %016llx) stretched to the %dx720 frame",
-                 (unsigned long long)st_.program[0]->hash, rw);
-        return fixed;
-    }
     int hud_box_w_ = 0, hud_box_h_ = 0;
-    std::unordered_set<uint64_t> hud_box_logged_, fixed_quad_logged_;
+    std::unordered_set<uint64_t> hud_box_logged_;
     uint64_t hud_full_screen_ = 0;
     uint64_t hud_draws_boxed_ = 0;
     int viewports_logged_ = 0;

@@ -218,7 +218,9 @@ void InstallGameHooks() {
     }
     // Aspect ratio. Two places set the game's resolution, both with built-in defaults:
     // - the render resolution, read from the game's settings with defaults 1280 / 720 (main+0x6a16b0:
-    //   "Normal.Resolution.Width" main+0x6a170c mov w2, #1280; "...Height" main+0x6a1758 mov w2, #720). It
+    //   "Normal.Resolution.Width" main+0x6a170c mov w2, #1280; "...Height" main+0x6a1758 mov w2, #720), and
+    //   again by the width getter main+0x6a18cc (main+0x6a18f8 mov w2, #1280) whose callers (main+0x101d80,
+    //   +0x66e99c, +0x66e9cc) size the post-processing buffers and their copies of the scene. It
     //   also becomes the screen size floats (main+0x1af4a7c / +0x1af4a84) the cameras take their aspect ratio
     //   from (e.g. main+0xbca88), so the 3D view widens (or narrows) instead of stretching;
     // - the handheld display mode (main+0x716158: main+0x716170 mov w1, #1280; +0x716178 mov w2, #720).
@@ -242,6 +244,7 @@ void InstallGameHooks() {
             bool ok = true;
             if (width != 1280)
                 ok = ok && rt.main.PatchInstruction(0x6a170c, 0x5280A002, mov(2, width), &err) &&
+                     rt.main.PatchInstruction(0x6a18f8, 0x5280A002, mov(2, width), &err) &&
                      rt.main.PatchInstruction(0x716170, 0x5280A001, mov(1, width), &err);
             if (ok) {
                 LOGI("hooks", "aspect ratio %s (%.3f): the game renders at %dx%d (was 1280x720)",
