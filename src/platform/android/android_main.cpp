@@ -944,6 +944,9 @@ void JNICALL MenuOpen(JNIEnv*, jclass, jboolean open) {
     LOGI(kTag, "settings menu %s", g_menu_open ? "opened (game held)" : "closed");
 }
 
+// Frames shown so far, for the FPS counter (SettingsMenu polls it twice a second).
+jlong JNICALL MenuFrames(JNIEnv*, jclass) { return jlong(dsr::platform::FramesShown()); }
+
 jclass g_menu_cls = nullptr;  // global ref
 
 // Opens the menu when - and + (controller or on-screen) are held together for a second.
@@ -1006,15 +1009,17 @@ void StartSettingsMenu(android_app* app, const std::string& base, const dsr::Run
         {const_cast<char*>("nativeApply"), const_cast<char*>("(Ljava/lang/String;Ljava/lang/String;)Z"),
          reinterpret_cast<void*>(&MenuApply)},
         {const_cast<char*>("nativeMenuOpen"), const_cast<char*>("(Z)V"), reinterpret_cast<void*>(&MenuOpen)},
+        {const_cast<char*>("nativeFrames"), const_cast<char*>("()J"), reinterpret_cast<void*>(&MenuFrames)},
     };
-    if (env->RegisterNatives(cls, methods, 2) != JNI_OK || env->ExceptionCheck()) {
+    if (env->RegisterNatives(cls, methods, 3) != JNI_OK || env->ExceptionCheck()) {
         env->ExceptionClear();
         LOGW(kTag, "settings menu: could not register natives");
         return;
     }
     g_menu_cls = static_cast<jclass>(env->NewGlobalRef(cls));
     jmethodID configure = env->GetStaticMethodID(
-        cls, "configure", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+        cls, "configure",
+        "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
     if (configure) {
         const std::string running = cfg.gpu_driver_lib.empty() ? "system" : cfg.gpu_driver;
         jstring a = env->NewStringUTF((base + "/settings.txt").c_str());
@@ -1022,7 +1027,7 @@ void StartSettingsMenu(android_app* app, const std::string& base, const dsr::Run
         jstring c = env->NewStringUTF(running.c_str());
         jstring d = env->NewStringUTF(cfg.game_dir.c_str());
         jstring e = env->NewStringUTF((base + "/game").c_str());
-        env->CallStaticVoidMethod(cls, configure, a, b, c, d, e);
+        env->CallStaticVoidMethod(cls, configure, activity, a, b, c, d, e);
     }
     if (env->ExceptionCheck()) {
         env->ExceptionDescribe();

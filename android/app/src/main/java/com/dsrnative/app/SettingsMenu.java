@@ -54,6 +54,8 @@ public final class SettingsMenu {
     static native boolean nativeApply(String key, String value);
     /** The menu opened (true) or closed: the game is held while it shows. */
     static native void nativeMenuOpen(boolean open);
+    /** Frames shown on screen so far (the FPS counter). */
+    static native long nativeFrames();
 
     static final int REQ_DRIVER = 4101, REQ_FOLDER = 4102;
 
@@ -62,14 +64,16 @@ public final class SettingsMenu {
     private static SettingsMenu sOpen;
 
     /** Called by native code at game start. */
-    public static void configure(String settingsPath, String driversDir, String runningDriver, String gameDir,
-            String defaultGameDir) {
+    public static void configure(Activity activity, String settingsPath, String driversDir, String runningDriver,
+            String gameDir, String defaultGameDir) {
         sSettingsPath = settingsPath;
         sDriversDir = driversDir;
         sRunningDriver = runningDriver == null || runningDriver.isEmpty() ? "system" : runningDriver;
         sGameDir = gameDir;
         sDefaultGameDir = defaultGameDir;
-        TouchControls.sRecenter = !"0".equals(readSettings().get("touch_camera_recenter"));
+        Map<String, String> v = readSettings();
+        TouchControls.sRecenter = !"0".equals(v.get("touch_camera_recenter"));
+        if ("1".equals(v.get("fps_counter"))) FpsCounter.apply(activity, true);
     }
 
     /** Called by native code when - and + have been held for a second. */
@@ -432,6 +436,10 @@ public final class SettingsMenu {
                 + "to the screen's shape. Changes at the next start.",
                 new String[] {"16:9", "auto", "4:3", "21:9"},
                 new String[] {"16:9 (default)", "Fill screen", "4:3", "21:9"}, "16:9");
+        toggle("fps_counter", "FPS counter",
+                "Shows the frame rate at the top of the screen. Drawn by Android over the game, so it costs the game "
+                        + "no frames. Changes at once.",
+                "1", "0", "0");
         choice("exposure", "Brightness", "Changes at once.", new String[] {"1.0", "1.37", "1.7"},
                 new String[] {"Original", "Default", "Brighter"}, "1.37");
         choice("present_mode", "Frame presentation", "Changes at the next start.",
@@ -609,7 +617,10 @@ public final class SettingsMenu {
         } catch (Throwable e) {
             android.util.Log.w("DSRNative", "settings menu: nativeApply failed", e);
         }
-        if (key.equals("touch_camera_recenter")) {
+        if (key.equals("fps_counter")) {
+            FpsCounter.apply(mA, "1".equals(value));
+            now = true;
+        } else if (key.equals("touch_camera_recenter")) {
             TouchControls.sRecenter = !"0".equals(value);
             now = true;
         } else if (key.startsWith("touch_") && !key.equals("touch_camera_invert")) {

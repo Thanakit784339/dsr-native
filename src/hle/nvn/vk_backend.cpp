@@ -1226,6 +1226,7 @@ public:
         Publish();
         NextSlot();
         if (++presented_ == 1) LOGI(kTag, "first frame on screen");
+        dsr::platform::CountFrameShown();
     }
 
 private:

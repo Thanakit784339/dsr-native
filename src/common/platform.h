@@ -27,6 +27,10 @@ void PreferFastCores(const char* who);
 
 // The app is in the background (Android: between onPause and onResume): the game is held still. Presents,
 // the audio output and the game's sleeping threads wait in WaitWhilePaused until it comes back.
+// Frames shown on screen so far (counted at each present): read by the FPS counter overlay.
+void CountFrameShown();
+uint64_t FramesShown();
+
 void SetPaused(bool paused);
 bool IsPaused();
 // Blocks while paused; returns the milliseconds waited (0 if not paused). `grace_ms`: only block once the

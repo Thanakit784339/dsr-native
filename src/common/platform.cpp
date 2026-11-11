@@ -233,6 +233,12 @@ std::condition_variable g_pause_cv;
 std::atomic<bool> g_paused{false};
 std::chrono::steady_clock::time_point g_paused_at;
 }  // namespace
+namespace {
+std::atomic<uint64_t> g_frames_shown{0};
+}
+void CountFrameShown() { g_frames_shown.fetch_add(1, std::memory_order_relaxed); }
+uint64_t FramesShown() { return g_frames_shown.load(std::memory_order_relaxed); }
+
 void SetPaused(bool paused) {
     {
         std::lock_guard<std::mutex> lk(g_pause_mutex);
