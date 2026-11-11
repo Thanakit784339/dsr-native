@@ -1191,6 +1191,9 @@ public:
         std::lock_guard<std::mutex> lk(m_);
         if (!EnsureDevice()) return;
         ReportDraws();
+        // The frame rate cap changed while the game runs (settings menu): tell the display.
+        if (window_ && swapchain_ && window_fps_ && window_fps_ != std::clamp(dsr::GetRuntime().config.target_fps, 30, 60))
+            SetWindowFrameRate();
         Image* src = tex.valid ? FindImage(tex) : nullptr;
         if (src && !(src->written && !IsDepthFormat(src->nvn_format))) src = nullptr;
         // The swapchain is sized for the game's frame (see EnsureSwapchain): a frame of another size remakes it.
@@ -1681,6 +1684,7 @@ private:
             LOGI(kTag, "ANativeWindow_setFrameRate not available: display rate left to the system");
             return;
         }
+        window_fps_ = int(fps);
         const int32_t r = fn(static_cast<ANativeWindow*>(window_), fps, 1 /* FIXED_SOURCE */);
         LOGI(kTag, "window frame rate set to %.0f fps (fixed source): %s", fps, r == 0 ? "ok" : "refused");
     }
@@ -5982,6 +5986,7 @@ private:
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     std::atomic<bool> swapchain_dirty_{false};  // set by the recorder (acquire/present), read by the render thread
     VkExtent2D sc_extent_{};
+    int window_fps_ = 0;  // the rate last given to ANativeWindow_setFrameRate
     int frame_w_ = 0, frame_h_ = 0;  // the game's presented frame the swapchain is sized for (compositor_scaling)
     std::vector<VkImage> sc_images_;
 

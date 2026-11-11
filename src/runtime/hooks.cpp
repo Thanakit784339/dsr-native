@@ -179,6 +179,7 @@ void SetMoviePlaying(bool playing) {
     const int n = playing ? ++g_movies : --g_movies;
     LOGI("hooks", "movie %s: frame rate %d fps", playing ? "started" : "ended", n > 0 ? 30 : std::clamp(GetRuntime().config.target_fps, 30, 60));
 }
+bool FrameRateAdjustable() { return g_game_step != nullptr; }
 int FrameRateNow() {
     return g_movies.load(std::memory_order_relaxed) > 0 ? 30 : std::clamp(GetRuntime().config.target_fps, 30, 60);
 }
@@ -197,7 +198,9 @@ void InstallGameHooks() {
     //    replaced by FrameLimiter: it paces to 60 and sets that float to the measured frame period (1/60..1/20 s),
     //    so the game keeps normal speed at 60 fps and when heavy areas run slower. It also keeps the game's
     //    frame-skip mode off (with it, slow frames ran two updates per shown frame).
-    if (rt.config.target_fps > 30) {
+    // Installed at every frame rate (30 included), so the cap can be changed while the game runs (in-game
+    // settings menu): FrameLimiter reads the configured rate every frame.
+    {
         std::string err;
         float* step = reinterpret_cast<float*>(rt.main.ScratchPage());
         *step = 1.0f / 30.0f;
@@ -207,7 +210,8 @@ void InstallGameHooks() {
         if (ok) ok = rt.main.HookFunction(0x70bd90, reinterpret_cast<void*>(&FrameLimiter), &err);
         if (ok) {
             g_game_step = step;
-            LOGI("hooks", "60 fps: own frame limiter, game time step follows the frame time");
+            LOGI("hooks", "frame rate: own frame limiter at %d fps (changeable in game), game time step follows the frame time",
+                 std::clamp(rt.config.target_fps, 30, 60));
         } else {
             LOGW("hooks", "60 fps patches failed (%s): staying at 30 fps", err.c_str());
             rt.main.PatchInstruction(0x66c9cc, 0xBD400108, 0xBD497108, &err);  // undo, if the first ones applied

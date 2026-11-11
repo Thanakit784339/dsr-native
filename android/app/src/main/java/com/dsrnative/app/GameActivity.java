@@ -1,6 +1,8 @@
 package com.dsrnative.app;
 
 import android.Manifest;
+import android.app.AlertDialog;
+import android.app.Dialog;
 import android.app.NativeActivity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
@@ -27,6 +29,88 @@ public class GameActivity extends NativeActivity {
 
     public static int storageAccess() {
         return sStorage;
+    }
+
+    // ---- game folder chosen by the player (when the game is not in Download/DSRNative/game) -----------------
+    static final int REQ_GAME_FOLDER = 4103;
+    // 0 = not asked, 1 = the player is choosing (dialog or picker up), 2 = chosen (takeGameFolder). Read by native.
+    private static volatile int sFolderState = 0;
+    private static volatile String sFolder = null;
+
+    public static int gameFolderState() {
+        return sFolderState;
+    }
+
+    /** The folder the player chose (holding exefs/main), once; null if none yet. */
+    public static String takeGameFolder() {
+        if (sFolderState != 2) return null;
+        String f = sFolder;
+        sFolder = null;
+        sFolderState = 0;
+        return f;
+    }
+
+    /** Called by native code when the game files are nowhere to be found. */
+    public void askGameFolder(final String message) {
+        sFolderState = 1;
+        runOnUiThread(() -> showFolderDialog(message));
+    }
+
+    private void showFolderDialog(String message) {
+        AlertDialog d = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Game files not found")
+                .setMessage(message)
+                .setCancelable(false)
+                .setPositiveButton("Choose folder", (dlg, which) -> pickGameFolder())
+                .setNegativeButton("Exit", (dlg, which) -> finishAndRemoveTask())
+                .create();
+        showImmersive(d);
+    }
+
+    private void pickGameFolder() {
+        try {
+            startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_GAME_FOLDER);
+        } catch (Exception e) {
+            showFolderDialog("No file manager is available to choose a folder. Copy the game files to "
+                    + "Download/DSRNative/game instead, then start the app again.");
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (SettingsMenu.onActivityResult(this, requestCode, resultCode, data)) return;
+        if (requestCode != REQ_GAME_FOLDER) return;
+        Uri uri = resultCode == RESULT_OK && data != null ? data.getData() : null;
+        if (uri == null) {
+            showFolderDialog("No folder was chosen. Choose the folder that holds the game files: the one that "
+                    + "contains the exefs folder and dvdbnd0.bdt.");
+            return;
+        }
+        String path = SettingsMenu.treeToPath(uri);
+        String root = path == null ? null : SettingsMenu.findGameRoot(path);
+        if (root == null) {
+            showFolderDialog((path == null ? "That folder" : path) + " does not hold the game files (no exefs/main "
+                    + "in it).\n\nChoose the folder that contains the exefs folder and dvdbnd0.bdt.");
+            return;
+        }
+        sFolder = root;
+        sFolderState = 2;  // native code picks it up when the activity resumes
+    }
+
+    // ---- dialogs over the full-screen game ------------------------------------------------------------------
+    /** Shows a dialog without bringing back the status and navigation bars. */
+    static void showImmersive(Dialog d) {
+        Window w = d.getWindow();
+        if (w == null) {
+            d.show();
+            return;
+        }
+        // Not focusable while it appears (the bars would show), then focusable for touch and controller input.
+        w.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
+        d.show();
+        hideBars(w, false);
+        w.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
     }
 
     private boolean hasStorageAccess() {
@@ -98,11 +182,14 @@ public class GameActivity extends NativeActivity {
         if (hasFocus) hideSystemBars();
     }
 
-    @SuppressWarnings("deprecation")
     private void hideSystemBars() {
-        Window w = getWindow();
+        hideBars(getWindow(), true);
+    }
+
+    @SuppressWarnings("deprecation")
+    static void hideBars(Window w, boolean underBars) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            w.setDecorFitsSystemWindows(false);
+            if (underBars) w.setDecorFitsSystemWindows(false);
             WindowInsetsController c = w.getInsetsController();
             if (c != null) {
                 c.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());

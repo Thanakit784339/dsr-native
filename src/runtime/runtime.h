@@ -84,6 +84,7 @@ float GameFrameTime();
 // stopped every few frames to wait for its sound).
 void SetMoviePlaying(bool playing);
 int FrameRateNow();  // the configured rate (30..60), or 30 while a movie plays
+bool FrameRateAdjustable();  // the frame rate patches are in: config.target_fps may change while the game runs
 
 // Prints an import binding summary (implemented / unimplemented / data) to the log.
 void LogImportReport(bool list_unimplemented);

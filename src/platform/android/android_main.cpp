@@ -2,7 +2,8 @@
 //
 // Files: everything lives in Download/DSRNative on the phone's shared storage (needs "All files access", asked
 // for on first launch; refused -> the app's private folder Android/data/com.dsrnative.app/files instead):
-//   game/          the extracted game (the folder containing exefs/, dvdbnd0.bdt, ...)
+//   game/          the extracted game (the folder containing exefs/, dvdbnd0.bdt, ...); if it is not there, the
+//                  player picks a folder (system file picker), remembered as `game_dir` in settings.txt
 //   save/ cache/   save data, GPU pipeline cache
 //   settings.txt
 //   drivers/       custom Vulkan drivers (.zip as for AdrenoTools, or a bare .so), chosen with gpu_driver
@@ -12,6 +13,7 @@
 #include <android_native_app_glue.h>
 #include <spawn.h>
 #include <dirent.h>
+#include <pthread.h>
 #include <strings.h>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
@@ -31,6 +33,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <thread>
+#include <chrono>
 
 #include "common/crash.h"
 #include "common/log.h"
@@ -314,6 +317,11 @@ struct TouchSettings {
     bool camera_invert = false;
 } g_touch;
 std::atomic<bool> g_touch_visible{false};  // the on-screen controls show (set by TouchControls.java)
+// Settings menu (com.dsrnative.app.SettingsMenu), opened by holding - and + for a second.
+std::atomic<uint64_t> g_pad_buttons{0};    // the controller's buttons (copy of g_pad.buttons, for other threads)
+std::atomic<uint64_t> g_touch_buttons{0};  // the on-screen buttons
+std::atomic<bool> g_menu_open{false};
+std::string g_custom_game_dir;  // settings.txt `game_dir`: a game folder the player picked
 
 #define TOUCH_HELP                                                                                            \
     "# Touch controls: a stick at the bottom left, the Switch buttons around the edges (LOCK = lock-on, the\n" \
@@ -337,6 +345,39 @@ std::atomic<bool> g_touch_visible{false};  // the on-screen controls show (set b
 #define FACE_BUTTONS_HELP                                                                                    \
     "# face_buttons: label = each button does what its label says on Switch (A is A); position = by\n"      \
     "# position, as on a Switch pad (for Xbox-style controllers whose A sits where the Switch's B is)\n"
+
+// Sets `key = value` in settings.txt: every line for the key is replaced (the last one read wins), or the line is
+// appended. Comments and the other lines are kept.
+bool SaveSetting(const std::string& path, const std::string& key, const std::string& value) {
+    std::vector<std::string> lines;
+    if (FILE* f = fopen(path.c_str(), "r")) {
+        char line[1024];
+        while (fgets(line, sizeof(line), f)) lines.emplace_back(line);
+        fclose(f);
+    }
+    bool done = false;
+    for (std::string& l : lines) {
+        char k[64];
+        if (l.empty() || l[0] == '#' || sscanf(l.c_str(), " %63[a-z_0-9] =", k) != 1 || key != k) continue;
+        if (l.find('=') == std::string::npos) continue;
+        l = key + " = " + value + "\n";
+        done = true;
+    }
+    if (!done) {
+        if (!lines.empty() && !lines.back().empty() && lines.back().back() != '\n') lines.back() += "\n";
+        lines.push_back("\n" + key + " = " + value + "\n");
+    }
+    FILE* w = fopen(path.c_str(), "w");
+    if (!w) {
+        LOGW(kTag, "settings: cannot write %s (%s)", path.c_str(), strerror(errno));
+        return false;
+    }
+    bool ok = true;
+    for (const std::string& l : lines) ok = fputs(l.c_str(), w) >= 0 && ok;
+    ok = fclose(w) == 0 && ok;
+    LOGI(kTag, "settings: %s = %s saved to %s", key.c_str(), value.c_str(), path.c_str());
+    return ok;
+}
 
 // settings.txt beside the game folder: "key = value" lines, '#' comments. Written with defaults if missing.
 void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
@@ -431,6 +472,13 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             } else if (!strcmp(key, "bc_enabler")) {
                 cfg->bc_enabler = v != 0;
                 have_bc_enabler = true;
+            } else if (!strcmp(key, "game_dir")) {
+                std::string val = strchr(line, '=') + 1;
+                while (!val.empty() && (val.back() == '\n' || val.back() == '\r' || val.back() == ' ' || val.back() == '\t'))
+                    val.pop_back();
+                const size_t b = val.find_first_not_of(" \t");
+                g_custom_game_dir = b == std::string::npos ? "" : val.substr(b);
+                while (g_custom_game_dir.size() > 1 && g_custom_game_dir.back() == '/') g_custom_game_dir.pop_back();
             } else if (!strcmp(key, "gpu_driver")) {
                 // The whole rest of the line (file names may contain spaces).
                 std::string val = strchr(line, '=') + 1;
@@ -500,6 +548,7 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
          cfg->profile ? "on" : "off", cfg->gamma, cfg->exposure, cfg->present_mode.c_str(),
          g_face_by_position ? "position" : "label");
     LOGI(kTag, "settings: gpu_driver %s, bc_enabler %d", cfg->gpu_driver.c_str(), int(cfg->bc_enabler));
+    if (!g_custom_game_dir.empty()) LOGI(kTag, "settings: game_dir %s", g_custom_game_dir.c_str());
     LOGI(kTag, "settings: touch controls %s, opacity %.2f, camera speed %.2f%s", g_touch.enabled ? "on" : "off",
          g_touch.opacity, g_touch.camera_speed, g_touch.camera_invert ? ", camera inverted" : "");
     if (!cfg->shader_depth_test) LOGI(kTag, "settings: shader_depth_test off");
@@ -773,11 +822,15 @@ void PrepareGpuDriver(android_app* app, const std::string& base, dsr::RuntimeCon
 
 // ---- touch controls (com.dsrnative.app.TouchControls) -------------------------------------------------------
 void JNICALL TouchNativeState(JNIEnv*, jclass, jint buttons, jfloat lx, jfloat ly, jfloat rx, jfloat ry) {
+    g_touch_buttons = uint64_t(uint32_t(buttons));
     dsr::input::SetTouch(uint64_t(uint32_t(buttons)), lx, ly, rx, g_touch.camera_invert ? -ry : ry);
 }
 void JNICALL TouchNativeVisible(JNIEnv*, jclass, jboolean visible) {
     g_touch_visible = visible != JNI_FALSE;
-    if (!visible) dsr::input::SetTouch(0, 0, 0, 0, 0);
+    if (!visible) {
+        g_touch_buttons = 0;
+        dsr::input::SetTouch(0, 0, 0, 0, 0);
+    }
     LOGI(kTag, "touch controls %s", visible ? "shown" : "hidden");
 }
 jclass g_touch_cls = nullptr;  // global ref
@@ -830,6 +883,195 @@ void StartTouchControls(android_app* app) {
     }
 }
 
+// ---- settings menu (com.dsrnative.app.SettingsMenu) ---------------------------------------------------------
+std::string JString(JNIEnv* env, jstring js) {
+    if (!js) return "";
+    const char* c = env->GetStringUTFChars(js, nullptr);
+    std::string r = c ? c : "";
+    if (c) env->ReleaseStringUTFChars(js, c);
+    return r;
+}
+
+// A setting changed in the menu (already saved to settings.txt by the menu): applied now if it can be, else at the
+// next start. Returns whether it took effect now.
+jboolean JNICALL MenuApply(JNIEnv* env, jclass, jstring jkey, jstring jvalue) {
+    const std::string key = JString(env, jkey), value = JString(env, jvalue);
+    dsr::RuntimeConfig& c = dsr::GetRuntime().config;
+    bool now = false;
+    if (key == "fps") {
+        if (dsr::FrameRateAdjustable()) {
+            c.target_fps = std::clamp(atoi(value.c_str()), 30, 60);
+            now = true;
+        }
+    } else if (key == "face_buttons") {
+        g_face_by_position = value == "position";
+        now = true;
+    } else if (key == "touch_camera_invert") {
+        g_touch.camera_invert = atoi(value.c_str()) != 0;
+        now = true;
+    } else if (key == "touch_controls") {  // the overlay itself is changed by the menu (Java)
+        g_touch.enabled = atoi(value.c_str()) != 0;
+        now = true;
+    } else if (key == "touch_opacity") {
+        g_touch.opacity = std::clamp(float(atof(value.c_str())), 0.1f, 1.0f);
+        now = true;
+    } else if (key == "touch_camera_speed") {
+        g_touch.camera_speed = std::clamp(float(atof(value.c_str())), 0.1f, 10.0f);
+        now = true;
+    } else if (key == "exposure") {
+        const float e = float(atof(value.c_str()));
+        if (e >= 0.25f && e <= 4.0f) {
+            c.exposure = e;
+            now = true;
+        }
+    }
+    LOGI(kTag, "settings menu: %s = %s (%s)", key.c_str(), value.c_str(), now ? "applied now" : "at the next start");
+    return now ? JNI_TRUE : JNI_FALSE;
+}
+
+// The menu opened or closed: the game is held while it shows, and buttons held when it opened are let go (their
+// releases go to the menu).
+void JNICALL MenuOpen(JNIEnv*, jclass, jboolean open) {
+    g_menu_open = open != JNI_FALSE;
+    if (g_menu_open) {
+        g_pad.buttons = 0;
+        g_pad_buttons = 0;
+        dsr::input::SetPad(g_pad);
+        g_touch_buttons = 0;
+        dsr::input::SetTouch(0, 0, 0, 0, 0);
+    }
+    if (g_game_started) dsr::platform::SetPaused(g_menu_open);
+    LOGI(kTag, "settings menu %s", g_menu_open ? "opened (game held)" : "closed");
+}
+
+jclass g_menu_cls = nullptr;  // global ref
+
+// Opens the menu when - and + (controller or on-screen) are held together for a second.
+void MenuWatcher(android_app* app) {
+    pthread_setname_np(pthread_self(), "dsr-menu");
+    JNIEnv* env = nullptr;
+    if (app->activity->vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) return;
+    const jmethodID show = env->GetStaticMethodID(g_menu_cls, "show", "(Landroid/app/Activity;)V");
+    if (!show || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        LOGW(kTag, "settings menu: show() not found");
+        return;
+    }
+    using clock = std::chrono::steady_clock;
+    const uint64_t both = dsr::input::kPlus | dsr::input::kMinus;
+    clock::time_point since{};
+    bool held = false, fired = false;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        const bool now_held = ((g_pad_buttons.load() | g_touch_buttons.load()) & both) == both;
+        if (!now_held) {
+            held = fired = false;
+            continue;
+        }
+        if (!held) {
+            held = true;
+            since = clock::now();
+        }
+        if (!fired && !g_menu_open && clock::now() - since >= std::chrono::milliseconds(1000)) {
+            fired = true;
+            LOGI(kTag, "- and + held for a second: opening the settings menu");
+            env->CallStaticVoidMethod(g_menu_cls, show, app->activity->clazz);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+    }
+}
+
+// Loads SettingsMenu, tells it where things are and starts the watcher (app glue thread, at game start).
+void StartSettingsMenu(android_app* app, const std::string& base, const dsr::RuntimeConfig& cfg) {
+    JNIEnv* env = GlueEnv(app);
+    if (!env) return;
+    jobject activity = app->activity->clazz;
+    jclass act_cls = env->GetObjectClass(activity);
+    jmethodID get_loader = env->GetMethodID(act_cls, "getClassLoader", "()Ljava/lang/ClassLoader;");
+    jobject loader = env->CallObjectMethod(activity, get_loader);
+    jclass loader_cls = env->FindClass("java/lang/ClassLoader");
+    jmethodID load = env->GetMethodID(loader_cls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+    jstring name = env->NewStringUTF("com.dsrnative.app.SettingsMenu");
+    auto cls = static_cast<jclass>(env->CallObjectMethod(loader, load, name));
+    env->DeleteLocalRef(name);
+    if (env->ExceptionCheck() || !cls) {
+        env->ExceptionClear();
+        LOGW(kTag, "settings menu: class not found");
+        return;
+    }
+    const JNINativeMethod methods[] = {
+        {const_cast<char*>("nativeApply"), const_cast<char*>("(Ljava/lang/String;Ljava/lang/String;)Z"),
+         reinterpret_cast<void*>(&MenuApply)},
+        {const_cast<char*>("nativeMenuOpen"), const_cast<char*>("(Z)V"), reinterpret_cast<void*>(&MenuOpen)},
+    };
+    if (env->RegisterNatives(cls, methods, 2) != JNI_OK || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        LOGW(kTag, "settings menu: could not register natives");
+        return;
+    }
+    g_menu_cls = static_cast<jclass>(env->NewGlobalRef(cls));
+    jmethodID configure = env->GetStaticMethodID(
+        cls, "configure", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+    if (configure) {
+        const std::string running = cfg.gpu_driver_lib.empty() ? "system" : cfg.gpu_driver;
+        jstring a = env->NewStringUTF((base + "/settings.txt").c_str());
+        jstring b = env->NewStringUTF((base + "/drivers").c_str());
+        jstring c = env->NewStringUTF(running.c_str());
+        jstring d = env->NewStringUTF(cfg.game_dir.c_str());
+        jstring e = env->NewStringUTF((base + "/game").c_str());
+        env->CallStaticVoidMethod(cls, configure, a, b, c, d, e);
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        return;
+    }
+    std::thread(MenuWatcher, app).detach();
+    LOGI(kTag, "settings menu ready: hold - and + for a second to open it");
+}
+
+// ---- game folder picked by the player (GameActivity) ---------------------------------------------------------
+// GameActivity.gameFolderState(): 0 = not asked, 1 = the player is choosing, 2 = chosen (takeGameFolder()).
+int GameFolderState(android_app* app) {
+    JNIEnv* env = GlueEnv(app);
+    if (!env) return 0;
+    jclass cls = env->GetObjectClass(app->activity->clazz);
+    jmethodID m = env->GetStaticMethodID(cls, "gameFolderState", "()I");
+    int r = 0;
+    if (m && !env->ExceptionCheck()) r = env->CallStaticIntMethod(cls, m);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    return r;
+}
+std::string TakeGameFolder(android_app* app) {
+    JNIEnv* env = GlueEnv(app);
+    if (!env) return "";
+    jclass cls = env->GetObjectClass(app->activity->clazz);
+    jmethodID m = env->GetStaticMethodID(cls, "takeGameFolder", "()Ljava/lang/String;");
+    std::string r;
+    if (m && !env->ExceptionCheck()) r = JString(env, static_cast<jstring>(env->CallStaticObjectMethod(cls, m)));
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    return r;
+}
+// Shows the "game files not found" dialog, whose button opens the system folder picker.
+void AskGameFolder(android_app* app, const std::string& message) {
+    JNIEnv* env = GlueEnv(app);
+    if (!env) return;
+    jclass cls = env->GetObjectClass(app->activity->clazz);
+    jmethodID m = env->GetMethodID(cls, "askGameFolder", "(Ljava/lang/String;)V");
+    if (m && !env->ExceptionCheck()) {
+        jstring js = env->NewStringUTF(message.c_str());
+        env->CallVoidMethod(app->activity->clazz, m, js);
+        env->DeleteLocalRef(js);
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+}
+
 // A controller was used while the touch controls show: hide them.
 void HideTouchControlsForController(android_app* app) {
     if (!g_touch_visible.exchange(false) || !g_touch_cls) return;
@@ -839,6 +1081,17 @@ void HideTouchControlsForController(android_app* app) {
     if (used) env->CallStaticVoidMethod(g_touch_cls, used, app->activity->clazz);
     if (env->ExceptionCheck()) env->ExceptionClear();
 }
+
+bool HasGame(const std::string& dir) { return !dir.empty() && FileExists(dir + "/exefs/main"); }
+
+// Start-up state kept while the player is asked for the game folder (StartGame then runs again on resume).
+struct StartState {
+    bool prepared = false;
+    std::string base, old_dir;
+    dsr::RuntimeConfig cfg;
+    bool reported_missing = false;
+};
+StartState g_start;
 
 void StartGame(android_app* app) {
     if (g_game_started) return;
@@ -850,61 +1103,100 @@ void StartGame(android_app* app) {
         logged = true;
         return;
     }
-    if (g_game_started.exchange(true)) return;
-    const std::string old_dir = app->activity->externalDataPath ? app->activity->externalDataPath : "";
-    std::string base = kSharedDir;
-    if (access == 1) MakeDirs(base);
-    if (access != 1 || !CanWriteIn(base)) {
-        LOGW(kTag, "no access to %s (%s): using the app's private folder %s instead", kSharedDir,
-             access == 1 ? strerror(errno) : "storage access refused", old_dir.c_str());
-        base = old_dir.empty() ? "/sdcard" : old_dir;
-    } else {
-        LOGI(kTag, "app folder: %s", base.c_str());
-        MigrateFromAppFolder(old_dir, base);
+    StartState& st = g_start;
+    dsr::RuntimeConfig& cfg = st.cfg;
+    if (!st.prepared) {
+        st.prepared = true;
+        st.old_dir = app->activity->externalDataPath ? app->activity->externalDataPath : "";
+        st.base = kSharedDir;
+        if (access == 1) MakeDirs(st.base);
+        if (access != 1 || !CanWriteIn(st.base)) {
+            LOGW(kTag, "no access to %s (%s): using the app's private folder %s instead", kSharedDir,
+                 access == 1 ? strerror(errno) : "storage access refused", st.old_dir.c_str());
+            st.base = st.old_dir.empty() ? "/sdcard" : st.old_dir;
+        } else {
+            LOGI(kTag, "app folder: %s", st.base.c_str());
+            MigrateFromAppFolder(st.old_dir, st.base);
+        }
+        cfg.game_dir = st.base + "/game";
+        cfg.save_dir = st.base + "/save";
+        cfg.cache_dir = st.base + "/cache";
+        // On a first launch the app's own folder may not exist yet (Android creates it lazily), and then nothing
+        // below could be written. Create it and everything the user is expected to find in it.
+        MakeDirs(st.base);
+        mkdir(cfg.game_dir.c_str(), 0775);
+        mkdir(cfg.save_dir.c_str(), 0775);
+        mkdir(cfg.cache_dir.c_str(), 0775);
+        LoadSettings(st.base + "/settings.txt", &cfg);
+        if (app->window) {
+            const int ww = ANativeWindow_getWidth(app->window), wh = ANativeWindow_getHeight(app->window);
+            if (ww > 0 && wh > 0) cfg.screen_aspect = float(std::max(ww, wh)) / float(std::min(ww, wh));
+            LOGI(kTag, "screen %dx%d, aspect_ratio %s", ww, wh, cfg.aspect_ratio.c_str());
+        }
+        PrepareGpuDriver(app, st.base, &cfg);
     }
-    dsr::RuntimeConfig cfg;
-    cfg.game_dir = base + "/game";
-    cfg.save_dir = base + "/save";
-    cfg.cache_dir = base + "/cache";
-    // On a first launch the app's own folder may not exist yet (Android creates it lazily), and then nothing
-    // below could be written. Create it and everything the user is expected to find in it.
-    MakeDirs(base);
-    mkdir(cfg.game_dir.c_str(), 0775);
-    mkdir(cfg.save_dir.c_str(), 0775);
-    mkdir(cfg.cache_dir.c_str(), 0775);
-    LoadSettings(base + "/settings.txt", &cfg);
-    if (app->window) {
-        const int ww = ANativeWindow_getWidth(app->window), wh = ANativeWindow_getHeight(app->window);
-        if (ww > 0 && wh > 0) cfg.screen_aspect = float(std::max(ww, wh)) / float(std::min(ww, wh));
-        LOGI(kTag, "screen %dx%d, aspect_ratio %s", ww, wh, cfg.aspect_ratio.c_str());
-    }
-    PrepareGpuDriver(app, base, &cfg);
-    if (!FileExists(cfg.game_dir + "/exefs/main") && base != old_dir && FileExists(old_dir + "/game/exefs/main")) {
+    const std::string& base = st.base;
+    const std::string& old_dir = st.old_dir;
+    // Where the game is: Download/DSRNative/game as always, else the old private folder, else the folder the
+    // player picked before (`game_dir`), else ask for one (system folder picker; asked again whenever none of
+    // these has the game).
+    std::string game;
+    if (HasGame(base + "/game")) {
+        game = base + "/game";
+    } else if (base != old_dir && HasGame(old_dir + "/game")) {
         LOGW(kTag, "game files are still in %s/game: using them from there; move them to %s/game", old_dir.c_str(),
              base.c_str());
-        cfg.game_dir = old_dir + "/game";
+        game = old_dir + "/game";
+    } else if (HasGame(g_custom_game_dir)) {
+        game = g_custom_game_dir;
+        LOGI(kTag, "game files: the folder chosen before, %s", game.c_str());
+    } else {
+        const std::string picked = TakeGameFolder(app);
+        if (HasGame(picked)) {
+            game = picked;
+            g_custom_game_dir = picked;
+            SaveSetting(base + "/settings.txt", "game_dir", picked);
+            LOGI(kTag, "game files: folder chosen by the player, %s (remembered as game_dir)", picked.c_str());
+        } else if (!picked.empty()) {
+            LOGW(kTag, "the chosen folder %s has no exefs/main", picked.c_str());
+        }
     }
-    LOGI(kTag, "game dir: %s", cfg.game_dir.c_str());
-    if (!FileExists(cfg.game_dir + "/exefs/main")) {
-        const std::string note = cfg.game_dir + "/PUT_GAME_FILES_HERE.txt";
-        if (!FileExists(note))
-            if (FILE* w = fopen(note.c_str(), "w")) {
-                fputs("Copy the contents of the extracted Dark Souls Remastered (Switch) folder here: the folder\n"
-                      "that contains exefs/, dvdbnd0.bdt, dvdbnd0.bhd5 and so on, so that this folder holds\n"
-                      "exefs/main directly. Then start the app again.\n"
-                      "Settings are in settings.txt next to this folder.\n",
-                      w);
-                fclose(w);
-            }
-        LOGE(kTag, "game files not found: expected %s/exefs/main", cfg.game_dir.c_str());
-        LOGE(kTag, "copy the extracted game folder (the one containing exefs/ and dvdbnd0.bdt) there, e.g.:");
-        LOGE(kTag, "  adb push DarkSoulsR/. %s/", cfg.game_dir.c_str());
+    if (game.empty()) {
+        if (!st.reported_missing) {
+            st.reported_missing = true;
+            const std::string note = base + "/game/PUT_GAME_FILES_HERE.txt";
+            if (!FileExists(note))
+                if (FILE* w = fopen(note.c_str(), "w")) {
+                    fputs("Copy the contents of the extracted Dark Souls Remastered (Switch) folder here: the folder\n"
+                          "that contains exefs/, dvdbnd0.bdt, dvdbnd0.bhd5 and so on, so that this folder holds\n"
+                          "exefs/main directly. Then start the app again.\n"
+                          "Or choose another folder that holds the game when the app asks for it.\n"
+                          "Settings are in settings.txt next to this folder.\n",
+                          w);
+                    fclose(w);
+                }
+            LOGE(kTag, "game files not found: expected %s/game/exefs/main%s%s", base.c_str(),
+                 g_custom_game_dir.empty() ? "" : " or ", g_custom_game_dir.empty() ? "" : (g_custom_game_dir + "/exefs/main").c_str());
+            LOGE(kTag, "asking for the game folder (the one containing exefs/ and dvdbnd0.bdt)");
+        }
+        if (GameFolderState(app) == 0) {
+            std::string msg = "Dark Souls Remastered was not found in " + base + "/game";
+            if (!g_custom_game_dir.empty()) msg += " or in the folder chosen before (" + g_custom_game_dir + ")";
+            msg += ".\n\nChoose the folder that holds the game files: the one that contains the exefs folder and "
+                   "dvdbnd0.bdt.";
+            AskGameFolder(app, msg);
+        }
         return;
     }
+    if (g_game_started.exchange(true)) return;
+    cfg.game_dir = game;
+    LOGI(kTag, "game dir: %s", cfg.game_dir.c_str());
     StartTouchControls(app);
-    std::thread([cfg] {
+    StartSettingsMenu(app, base, cfg);
+    const dsr::RuntimeConfig run_cfg = cfg;
+    std::thread([run_cfg] {
         std::string err;
-        if (!dsr::LoadGame(cfg, &err)) {
+        if (!dsr::LoadGame(run_cfg, &err)) {
             LOGE(kTag, "LoadGame failed: %s", err.c_str());
             return;
         }
@@ -978,6 +1270,7 @@ int32_t OnInput(android_app* app, AInputEvent* ev) {
             }
         }
         SetPad(g_pad);
+        g_pad_buttons = g_pad.buttons;
         return 1;
     }
     if (type == AINPUT_EVENT_TYPE_MOTION && (AInputEvent_getSource(ev) & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK) {
@@ -1004,6 +1297,7 @@ int32_t OnInput(android_app* app, AInputEvent* ev) {
         set(kUp, hy < -0.5f);
         set(kDown, hy > 0.5f);
         SetPad(g_pad);
+        g_pad_buttons = g_pad.buttons;
         return 1;
     }
     return 0;
@@ -1040,7 +1334,7 @@ void OnCmd(android_app* app, int32_t cmd) {
             StartGame(app);
             break;
         case APP_CMD_RESUME:
-            dsr::platform::SetPaused(false);
+            dsr::platform::SetPaused(g_menu_open.load());  // still held while the settings menu shows
             if (app->window) StartGame(app);  // back from the storage access screen
             break;
         case APP_CMD_GAINED_FOCUS:

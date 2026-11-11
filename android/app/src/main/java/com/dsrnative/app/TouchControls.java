@@ -46,6 +46,48 @@ public final class TouchControls extends View implements InputManager.InputDevic
         });
     }
 
+    /**
+     * Settings menu: turns the controls on or off and changes their opacity and camera stick speed, at once.
+     */
+    public static void applySettings(final Activity activity, final boolean enabled, final float opacity,
+            final float cameraSpeed) {
+        activity.runOnUiThread(() -> {
+            if (!enabled) {
+                if (sView != null) {
+                    TouchControls v = sView;
+                    sView = null;
+                    v.releaseAll();
+                    nativeVisible(false);
+                    InputManager im = (InputManager) activity.getSystemService(Context.INPUT_SERVICE);
+                    if (im != null) im.unregisterInputDeviceListener(v);
+                    try {
+                        activity.getWindowManager().removeView(v);
+                    } catch (Exception e) {
+                        android.util.Log.w("DSRNative", "touch controls: could not remove the overlay", e);
+                    }
+                }
+                return;
+            }
+            if (sView == null) {
+                final TouchControls v = new TouchControls(activity, opacity, cameraSpeed);
+                v.mShown = true;  // turned on by the player: shown even with a controller connected
+                v.addTo(activity, 0);
+                return;
+            }
+            sView.setAlpha(Math.max(0.1f, Math.min(1.0f, opacity)));
+            sView.mCameraSpeed = Math.max(0.1f, Math.min(10f, cameraSpeed));
+            sView.invalidate();
+        });
+    }
+
+    /** The settings menu opened: everything held is let go (its releases go to the menu). */
+    public static void releaseForMenu() {
+        if (sView != null) {
+            sView.releaseAll();
+            sView.invalidate();
+        }
+    }
+
     /** Called by native code when a controller is used while the controls show. */
     public static void controllerUsed(final Activity activity) {
         activity.runOnUiThread(() -> {
@@ -126,7 +168,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
             android.view.Choreographer.getInstance().postFrameCallback(this);
         }
     };
-    private final float mCameraSpeed;
+    private float mCameraSpeed;
 
     // Double tap (to show the controls again).
     private long mLastTapTime;
