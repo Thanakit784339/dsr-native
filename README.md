@@ -56,6 +56,7 @@ I have yet to test later areas in the game so don't expect performance to be ent
 - [ ] Further performance optimizations
 - [ ] Support for more phone gpus and chipsets, specifically Mali GPUs
 - [ ] Render scale / More graphics options
+- [ ] More language options
 
 
 ## Logs
