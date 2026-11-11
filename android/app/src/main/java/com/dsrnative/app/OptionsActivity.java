@@ -159,6 +159,17 @@ public class OptionsActivity extends Activity {
         mScreenOffsetY = labeledSlider(root, "Screen pan Y (manual only): ", -1.0f, 1.0f, 0.05f, 0.00f);
         tip(root, "Only applies when Screen fit = manual. Shifts the image left/right and up/down; 0 = centred.");
 
+        Button calibrate = new Button(this);
+        calibrate.setText("Adjust Screen & Controls…");
+        LinearLayout.LayoutParams calLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        calLp.topMargin = dp(8);
+        calibrate.setLayoutParams(calLp);
+        calibrate.setOnClickListener(v -> startActivity(new Intent(this, DisplayCalibrationActivity.class)));
+        root.addView(calibrate);
+        tip(root, "Opens a full-screen live editor (like PPSSPP's display layout screen) -- drag/pinch the "
+                + "game's picture directly, and drag the on-screen buttons/stick, in real time.");
+
         mPreview = new ScreenFitPreview(this);
         LinearLayout.LayoutParams previewLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
                 dp(140));
@@ -213,6 +224,17 @@ public class OptionsActivity extends Activity {
         root.addView(start);
 
         setContentView(scroll);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // Back from DisplayCalibrationActivity (or the game folder picker): settings.txt may have changed
+        // under us (screen fit/zoom/offset, game_dir), so reload everything this screen shows.
+        if (mPreview != null) {
+            loadCurrentValues();
+            refreshPreview();
+        }
     }
 
     private void requestStorageAccessBestEffort() {
@@ -564,7 +586,11 @@ public class OptionsActivity extends Activity {
             if (vw == 0 || vh == 0) return;
             // The real device screen, scaled down to fit inside this preview box.
             DisplayMetrics dm = getResources().getDisplayMetrics();
-            final float screenAspect = (float) dm.widthPixels / dm.heightPixels;
+            // The game always runs landscape regardless of this (portrait) Options screen's own
+            // orientation, so always represent the device's screen as landscape here, not whatever
+            // orientation this Activity happens to be locked to.
+            final float screenAspect = (float) Math.max(dm.widthPixels, dm.heightPixels)
+                    / Math.min(dm.widthPixels, dm.heightPixels);
             final float boxAspect = (float) vw / vh;
             int sw, sh;
             if (screenAspect > boxAspect) {

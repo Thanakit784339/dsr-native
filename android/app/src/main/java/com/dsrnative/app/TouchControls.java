@@ -14,6 +14,7 @@ import android.os.Looper;
 import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowManager;
 
 import java.util.ArrayList;
@@ -46,9 +47,32 @@ public final class TouchControls extends View implements InputManager.InputDevic
             final boolean enabled) {
         activity.runOnUiThread(() -> {
             if (sView != null || !enabled) return;
-            final TouchControls v = new TouchControls(activity, opacity, cameraSpeed);
+            final TouchControls v = new TouchControls(activity, opacity, cameraSpeed, false);
             v.addTo(activity, 0);
         });
+    }
+
+    /**
+     * For DisplayCalibrationActivity: a layout-editing-only instance with no native library loaded (it's
+     * launched straight from the portrait Options screen, before any game process exists). Starts already
+     * shown and in edit mode (the screen's whole purpose), and never calls nativeState()/nativeVisible() --
+     * see mStandalone below. Caller adds the returned view into their own layout with attachInline().
+     */
+    public static TouchControls createStandalone(Activity activity) {
+        return new TouchControls(activity, 1.0f, 1.0f, true);
+    }
+
+    /** Adds this view as a normal child of `parent`, filling it -- no WindowManager panel needed since,
+     * unlike GameActivity, a plain calibration Activity's content view isn't racing a Vulkan swapchain
+     * surface for the same buffer. */
+    public void attachInline(ViewGroup parent) {
+        parent.addView(this, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+    }
+
+    /** Buttons-mode toggle for DisplayCalibrationActivity's Screen/Buttons mode switch (see onTouchEvent). */
+    public void setTouchEnabled(boolean enabled) {
+        mTouchEnabled = enabled;
     }
 
     /**
@@ -74,7 +98,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
                 return;
             }
             if (sView == null) {
-                final TouchControls v = new TouchControls(activity, opacity, cameraSpeed);
+                final TouchControls v = new TouchControls(activity, opacity, cameraSpeed, false);
                 v.mShown = true;  // turned on by the player: shown even with a controller connected
                 v.addTo(activity, 0);
                 return;
@@ -104,6 +128,10 @@ public final class TouchControls extends View implements InputManager.InputDevic
     private final float mDensity;
     private final Handler mHandler = new Handler(Looper.getMainLooper());
     private boolean mShown = true;
+    // DisplayCalibrationActivity: no game process, no native "dsr" library loaded -- nativeState()/
+    // nativeVisible() must never actually run, or this throws UnsatisfiedLinkError and crashes.
+    private final boolean mStandalone;
+    private boolean mTouchEnabled = true;
 
     private static final int K_BUTTON = 0, K_STICK = 1, K_RSTICK = 2, K_NONE = 3;
 
@@ -183,10 +211,11 @@ public final class TouchControls extends View implements InputManager.InputDevic
     private final SharedPreferences mPrefs;
     private final Map<Integer, float[]> mOverrides = new HashMap<>();  // bit -> {x/u, y/u}
     private static final int STICK_KEY = -1;  // the left stick's base isn't a Button, reuses the same map
+    // Always true for a standalone (calibration) instance, always false otherwise -- see the constructor.
+    // DisplayCalibrationActivity's own real "Done"/"Reset Buttons" buttons replace what used to be an
+    // on-canvas EDIT/DONE/RESET chip here (removed: it duplicated/overlapped that screen's real top bar).
     private boolean mEditMode = false;
     private float mUnit = 1f;
-    // EDIT/DONE and RESET chips, top centre -- fixed positions (not draggable), RESET only tappable in edit mode.
-    private float mEditChipCx, mEditChipCy, mResetChipCx, mChipW, mChipH;
     private static final int K_DRAG = 4, K_DRAG_STICK = 5;
     private final float[] mDragGrabDx = new float[16], mDragGrabDy = new float[16];  // touch point -> centre, px
 
@@ -199,9 +228,10 @@ public final class TouchControls extends View implements InputManager.InputDevic
     private final Paint mText = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF mRect = new RectF();
 
-    private TouchControls(Activity activity, float opacity, float cameraSpeed) {
+    private TouchControls(Activity activity, float opacity, float cameraSpeed, boolean standalone) {
         super(activity);
         mActivity = activity;
+        mStandalone = standalone;
         mCameraSpeed = Math.max(0.1f, Math.min(10f, cameraSpeed));
         mDensity = activity.getResources().getDisplayMetrics().density;
         mPrefs = activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
@@ -229,6 +259,13 @@ public final class TouchControls extends View implements InputManager.InputDevic
         mButtons.add(new Button("L3", L3, true));
         mButtons.add(new Button("LOCK", R3, true));
         for (int i = 0; i < 16; i++) mKind[i] = K_NONE;
+        if (standalone) {
+            // Always visible, already editing -- this screen's only purpose. No controller-hide behavior:
+            // a controller plugged in while calibrating shouldn't make the buttons disappear.
+            mShown = true;
+            mEditMode = true;
+            return;
+        }
         // A controller already connected (or built in, as on handhelds): start hidden.
         if (controllerConnected()) mShown = false;
         InputManager im = (InputManager) activity.getSystemService(Context.INPUT_SERVICE);
@@ -291,7 +328,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
         if (mShown == shown) return;
         mShown = shown;
         releaseAll();
-        nativeVisible(shown);
+        if (!mStandalone) nativeVisible(shown);
         invalidate();
     }
 
@@ -347,7 +384,8 @@ public final class TouchControls extends View implements InputManager.InputDevic
         mPrefs.edit().putFloat(key + "_x", ux).putFloat(key + "_y", uy).apply();
     }
 
-    private void resetLayout() {
+    /** DisplayCalibrationActivity's "Reset Buttons": clears every dragged position back to the default layout. */
+    public void resetButtonLayout() {
         mOverrides.clear();
         mPrefs.edit().clear().apply();
         layout(getWidth(), getHeight());
@@ -388,21 +426,13 @@ public final class TouchControls extends View implements InputManager.InputDevic
         mStickBaseY = stickOverride != null ? stickOverride[1] * u : h - 3.0f * u;
         mText.setTextSize(0.45f * u);
         mStroke.setStrokeWidth(Math.max(2f, 0.05f * u));
-        mChipW = 2.2f * u;
-        mChipH = 0.9f * u;
-        mEditChipCx = w / 2f - 1.3f * u;
-        mEditChipCy = 0.6f * u;
-        mResetChipCx = w / 2f + 1.3f * u;
-    }
-
-    private boolean hitChip(float x, float y, float cx, float cy) {
-        return Math.abs(x - cx) <= mChipW / 2 && Math.abs(y - cy) <= mChipH / 2;
     }
 
     // ---- touch ----------------------------------------------------------------------------------------------
 
     @Override
     public boolean onTouchEvent(MotionEvent e) {
+        if (!mTouchEnabled) return false;  // DisplayCalibrationActivity's Screen/Buttons mode switch
         final int action = e.getActionMasked();
         if (!mShown) {
             if (action == MotionEvent.ACTION_DOWN) checkDoubleTap(e.getX(), e.getY());
@@ -412,17 +442,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
             case MotionEvent.ACTION_DOWN:
             case MotionEvent.ACTION_POINTER_DOWN: {
                 int i = e.getActionIndex();
-                float x = e.getX(i), y = e.getY(i);
-                if (hitChip(x, y, mEditChipCx, mEditChipCy)) {
-                    mEditMode = !mEditMode;
-                    invalidate();
-                    break;
-                }
-                if (mEditMode && hitChip(x, y, mResetChipCx, mEditChipCy)) {
-                    resetLayout();
-                    break;
-                }
-                down(e.getPointerId(i), x, y);
+                down(e.getPointerId(i), e.getX(i), e.getY(i));
                 break;
             }
             case MotionEvent.ACTION_MOVE:
@@ -440,8 +460,9 @@ public final class TouchControls extends View implements InputManager.InputDevic
             default:
                 break;
         }
-        if (mEditMode) nativeState(0, 0, 0, 0, 0);  // never leak phantom presses to the game while editing
-        else sendState();
+        if (mEditMode) {
+            if (!mStandalone) nativeState(0, 0, 0, 0, 0);  // never leak phantom presses to the game while editing
+        } else sendState();
         invalidate();
         return true;
     }
@@ -580,6 +601,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
     }
 
     private void sendState() {
+        if (mStandalone) return;
         int bits = 0;
         for (Button b : mButtons)
             if (b.pressCount > 0) bits |= b.bit;
@@ -611,8 +633,6 @@ public final class TouchControls extends View implements InputManager.InputDevic
     @Override
     protected void onDraw(Canvas c) {
         if (!mShown) return;
-        drawChip(c, mEditChipCx, mEditChipCy, mEditMode ? "DONE" : "EDIT", mEditMode ? 0xFF3A8F3A : 0xFF3A3A3A);
-        if (mEditMode) drawChip(c, mResetChipCx, mEditChipCy, "RESET", 0xFF8F3A3A);
         // Stick (the knob stays inside the ring).
         final float bx = mStickBaseX, by = mStickBaseY;
         mFill.setColor(0x40000000);
@@ -673,18 +693,5 @@ public final class TouchControls extends View implements InputManager.InputDevic
             mText.setTextSize(size);
         }
         if (mEditMode) mStroke.setColor(0xFFFFFFFF);
-    }
-
-    private void drawChip(Canvas c, float cx, float cy, String label, int color) {
-        mFill.setColor(color);
-        mRect.set(cx - mChipW / 2, cy - mChipH / 2, cx + mChipW / 2, cy + mChipH / 2);
-        float r = mChipH * 0.3f;
-        c.drawRoundRect(mRect, r, r, mFill);
-        c.drawRoundRect(mRect, r, r, mStroke);
-        mText.setColor(0xFFFFFFFF);
-        float size = mText.getTextSize();
-        mText.setTextSize(mChipH * 0.45f);
-        c.drawText(label, cx, cy - (mText.descent() + mText.ascent()) / 2, mText);
-        mText.setTextSize(size);
     }
 }

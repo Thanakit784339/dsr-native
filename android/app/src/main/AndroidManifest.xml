@@ -32,6 +32,13 @@
             </intent-filter>
         </activity>
 
+        <!-- Full-screen landscape calibration screen (Options screen's "Adjust Screen & Controls…" button):
+             no native library, no game process. See DisplayCalibrationActivity. -->
+        <activity
+            android:name=".DisplayCalibrationActivity"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape" />
+
         <activity
             android:name=".GameActivity"
             android:exported="false"
