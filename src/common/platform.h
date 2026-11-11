@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 // Small hooks the platform layer provides to the runtime.
 
