@@ -10,28 +10,29 @@ Runs the game's original ARM64 code (`exefs/main`) directly on an ARM64 Android 
 
 ## Status
 
+> [!IMPORTANT]
+> Mail GPU's not fully supported yet.
+
 **Must use v1.0.0 version of Dark Souls: Remastered for Nintendo Switch.**
 
-Very early development. Expect many visual bugs and minor performance issues. No touch controls for now.
+Early development. Expect visual bugs and minor performance issues.
 
-The only test device so far has been an AYN Thor Base model, so I cannot guarantee that this will work on any other device. Should hopefully work however with Snapdragon + Adreno chips.
+Tested with an AYN Thor, a OnePlus 6T, and MoMoPlayer using a 4:3 aspect ratio. Snapdragon chips should be fully supported along with Adreno 6xx, 7xx, and 8xx gpus.
 
-Highly doubt this works on Mali GPUs.
-
-I also haven't tested the v1.0.3 update for the game yet.
+Haven't tested the v1.0.3 update for the game yet.
 
 
 
 ## How does it run?
 
-Tested areas have been the Undead Burg, Firelink Shrine, and the Undead Asylum. **>6GB of RAM Recommended**
+Tested areas have been the Undead Burg, Firelink Shrine, and the Undead Asylum. **>6GB of RAM Recommended** 
 
 > [!IMPORTANT]
 > Expect texture flickering and stuttering upon rendering in new areas. This will most likely happen the first time you load the game. Once loaded there should be no more glitching.
 
 Runs at the Switch's default resolution of 720p. 
 
-The game is mostly playable with a very stable **60FPS** in all of my testing. Temps average around the **60c~** mark, and RAM usage is low. There are however, many minor graphical glitches that will be hopefully ironed out on later releases.
+The game is very playable with a stable **60FPS** on a Snapdragon 8 Gen 2 or equivalent. Your mileage may vary with much older chips. Temps average around the **60c~** mark, and RAM usage is low.
 
 I have yet to test later areas in the game so don't expect performance to be entirely perfect.
 
@@ -43,22 +44,26 @@ I have yet to test later areas in the game so don't expect performance to be ent
 - [x] Fully working audio, including NPC voice lines and sound effects
 - [x] Stable 60FPS (on my test device at least)
 - [x] Mailbox frame presentation for lower input latency
+- [x] On-screen touch controls
+- [x] Experimental different aspect ratio support without stretching game image
+- [x] User-selected game directory
+- [x] Floating GUI (Hold - and + buttons for one full second) with various settings such as FPS cap, aspect ratio, frame presentation, etc..
+- [x] Custom driver support
 
+## Roadmap
 
-## Planned features
-- [ ] On-screen touch controls
 - [ ] Higher quality audio patch
 - [ ] Further performance optimizations
-- [ ] More resolutions
-- [ ] Support for more phone gpus and chipsets
-- [ ] User-selected game directory
+- [ ] Support for more phone gpus and chipsets, specifically Mali GPUs
+- [ ] Render scale / More graphics options
+
 
 ## Logs
 
 Every launch writes a log file to the phone's shared storage:
 
 ```
-Download/DSRNative/dsr_YYYYMMDD_HHMMSS.txt
+Download/DSRNative/logs/dsr_YYYYMMDD_HHMMSS.txt
 ```
 
 It contains device info, every runtime message, and (if the app crashes) a crash report with the
@@ -73,36 +78,39 @@ file is complete even after a crash. The same output also goes to logcat (`adb l
 
 ## Installing game files on the device
 > [!NOTE]
-> Upon first time launch a settings.txt file will also be created with a few changeable settings and their explanations.
+> Upon first time launch a settings.txt file will also be created with a few changeable settings and their explanations. In-game settings via the floating GUI changes this file.
 
 
 > [!IMPORTANT]
 > You must extract the games **romfs** and **exefs** files to play the game. There many ways to do this, but i recommend using Ryujinx (Ryubing) on Windows to obtain this from your own game dump.
 
 
-Install the APK, launch it and give it permission to access files to create the necessary folders, then place the game files inside:
+Install the APK, launch it and give it permission to access files to create the necessary folders, then choose a directory for the game files. The default location is:
 
 ```
 /Downloads/DSRNative/files/game/
 ```
 
-If the **game** folder does not exist, you must create it.
+But you may choose any folder.
 
-Inside the **game** folder must be the extracted **romfs** files, along with the folders **movww**, **movjp**, and **exefs**. You must create the **exefs** folder and place your extracted **exefs** files inside.
+Inside your game folder must be the extracted **romfs** files, along with the folders **movww**, **movjp**, and **exefs**. You must create the **exefs** folder and place your extracted **exefs** files inside.
+
+<img width="270" height="480" alt="Screenshot_20261110_204928_Top" src="https://github.com/user-attachments/assets/1f08d681-820d-40d6-a912-261bbbfcf294" />
+
+Folder structure should look like this.
+
 
 
 ## Known issues
 
->[!NOTE]
->If your A and B inputs seem to be swapped, you must edit the "face_buttons" setting found in /Download/DSRNative/settings.txt from "label" to "position"
 
-
-- [ ] Buggy fogwalls
-- [ ] NPC or player models sometimes disappearing during death animation
-- [ ] Resting at a bonfire screen effect can be glitched
-- [ ] Heavy effects, such as during boss fights, can cause big empty squares on screen
-- [ ] Sometimes NPC's faces can appear buggy
 - [ ] Cutscenes can sometimes still appear glitched
+- [ ] Cutscenes may appear stretched or odd while playing on a different aspect ratio.
+
+
+## Issues
+
+If you encounter any issues, please submit an issue on the repo and attach log files.
 
 
 
