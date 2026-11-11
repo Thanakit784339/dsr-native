@@ -58,3 +58,11 @@ android {
         }
     }
 }
+
+dependencies {
+    // On-screen analog sticks for the touch controls overlay (GameActivity/TouchControls): a mature,
+    // widely-used library instead of hand-rolling joystick drag math. Buttons are plain Android
+    // widgets, no library needed for those. No tagged release exists, so this pins a specific commit
+    // via JitPack (confirmed built successfully at https://jitpack.io/api/builds/com.github.controlwear/virtual-joystick-android).
+    implementation 'com.github.controlwear:virtual-joystick-android:fda1c916b6'
+}

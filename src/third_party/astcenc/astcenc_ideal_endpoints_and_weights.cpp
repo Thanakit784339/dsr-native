@@ -1,0 +1,1839 @@
+// SPDX-License-Identifier: Apache-2.0
+// ----------------------------------------------------------------------------
+// Copyright 2011-2026 Arm Limited
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not
+// use this file except in compliance with the License. You may obtain a copy
+// of the License at:
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// License for the specific language governing permissions and limitations
+// under the License.
+// ----------------------------------------------------------------------------
+
+#if !defined(ASTCENC_DECOMPRESS_ONLY)
+
+/**
+ * @brief Functions for computing color endpoints and texel weights.
+ */
+
+#include <cassert>
+
+#include "astcenc_internal.h"
+#include "astcenc_vecmathlib.h"
+
+/**
+ * @brief Compute the infilled weight for N texel indices in a decimated grid.
+ *
+ * @param di        The weight grid decimation to use.
+ * @param weights   The decimated weight values to use.
+ * @param index     The first texel index to interpolate.
+ *
+ * @return The interpolated weight for the given set of SIMD_WIDTH texels.
+ */
+static vfloat bilinear_infill_vla(
+	const decimation_info& di,
+	const float* weights,
+	unsigned int index
+) {
+	// Load the bilinear filter texel weight indexes in the decimated grid
+	const uint8_t* weight_idx0 = di.texel_weights_tr[0] + index;
+	const uint8_t* weight_idx1 = di.texel_weights_tr[1] + index;
+	const uint8_t* weight_idx2 = di.texel_weights_tr[2] + index;
+	const uint8_t* weight_idx3 = di.texel_weights_tr[3] + index;
+
+	// Load the bilinear filter weights from the decimated grid
+	vgatherf_table wt = vgatherf_load(weights, di.weight_count);
+	vfloat weight_val0 = gatherf(wt, weight_idx0);
+	vfloat weight_val1 = gatherf(wt, weight_idx1);
+	vfloat weight_val2 = gatherf(wt, weight_idx2);
+	vfloat weight_val3 = gatherf(wt, weight_idx3);
+
+	// Load the weight contribution factors for each decimated weight
+	vfloat tex_weight_float0 = loada(di.texel_weight_contribs_float_tr[0] + index);
+	vfloat tex_weight_float1 = loada(di.texel_weight_contribs_float_tr[1] + index);
+	vfloat tex_weight_float2 = loada(di.texel_weight_contribs_float_tr[2] + index);
+	vfloat tex_weight_float3 = loada(di.texel_weight_contribs_float_tr[3] + index);
+
+	// Compute the bilinear interpolation to generate the per-texel weight
+	return (weight_val0 * tex_weight_float0 + weight_val1 * tex_weight_float1) +
+	       (weight_val2 * tex_weight_float2 + weight_val3 * tex_weight_float3);
+}
+
+/**
+ * @brief Compute the infilled weight for N texel indices in a decimated grid.
+ *
+ * This is specialized version which computes only two weights per texel for
+ * encodings that are only decimated in a single axis.
+ *
+ * @param di        The weight grid decimation to use.
+ * @param weights   The decimated weight values to use.
+ * @param index     The first texel index to interpolate.
+ *
+ * @return The interpolated weight for the given set of SIMD_WIDTH texels.
+ */
+static vfloat bilinear_infill_vla_2(
+	const decimation_info& di,
+	const float* weights,
+	unsigned int index
+) {
+	// Load the bilinear filter texel weight indexes in the decimated grid
+	const uint8_t* weight_idx0 = di.texel_weights_tr[0] + index;
+	const uint8_t* weight_idx1 = di.texel_weights_tr[1] + index;
+
+	// Load the bilinear filter weights from the decimated grid
+	vgatherf_table wt = vgatherf_load(weights, di.weight_count);
+	vfloat weight_val0 = gatherf(wt, weight_idx0);
+	vfloat weight_val1 = gatherf(wt, weight_idx1);
+
+	// Load the weight contribution factors for each decimated weight
+	vfloat tex_weight_float0 = loada(di.texel_weight_contribs_float_tr[0] + index);
+	vfloat tex_weight_float1 = loada(di.texel_weight_contribs_float_tr[1] + index);
+
+	// Compute the bilinear interpolation to generate the per-texel weight
+	return (weight_val0 * tex_weight_float0 + weight_val1 * tex_weight_float1);
+}
+
+/**
+ * @brief Compute the ideal endpoints and weights for 1 color component.
+ *
+ * @param      blk         The image block color data to compress.
+ * @param      pi          The partition info for the current trial.
+ * @param[out] ei          The computed ideal endpoints and weights.
+ * @param      component   The color component to compute.
+ */
+static void compute_ideal_colors_and_weights_1_comp(
+	const image_block& blk,
+	const partition_info& pi,
+	endpoints_and_weights& ei,
+	unsigned int component
+) {
+	unsigned int partition_count = pi.partition_count;
+	ei.ep.partition_count = partition_count;
+	promise(partition_count > 0);
+
+	unsigned int texel_count = blk.texel_count;
+	promise(texel_count > 0);
+
+	float error_weight;
+	const float* data_vr = nullptr;
+
+	assert(component < BLOCK_MAX_COMPONENTS);
+	switch (component)
+	{
+	case 0:
+		error_weight = blk.channel_weight.lane<0>();
+		data_vr = blk.data_r;
+		break;
+	case 1:
+		error_weight = blk.channel_weight.lane<1>();
+		data_vr = blk.data_g;
+		break;
+	case 2:
+		error_weight = blk.channel_weight.lane<2>();
+		data_vr = blk.data_b;
+		break;
+	default:
+		assert(component == 3);
+		error_weight = blk.channel_weight.lane<3>();
+		data_vr = blk.data_a;
+		break;
+	}
+
+	vmask4 sep_mask = vint4::lane_id() == vint4(component);
+	bool is_constant_wes { true };
+	float partition0_len_sq { 0.0f };
+
+	for (unsigned int i = 0; i < partition_count; i++)
+	{
+		float lowvalue { 1e10f };
+		float highvalue { -1e10f };
+
+		unsigned int partition_texel_count = pi.partition_texel_count[i];
+		for (unsigned int j = 0; j < partition_texel_count; j++)
+		{
+			unsigned int tix = pi.texels_of_partition[i][j];
+			float value = data_vr[tix];
+			lowvalue = astc::min(value, lowvalue);
+			highvalue = astc::max(value, highvalue);
+		}
+
+		if (highvalue <= lowvalue)
+		{
+			lowvalue = 0.0f;
+			highvalue = 1e-7f;
+		}
+
+		float length = highvalue - lowvalue;
+		float length_squared = length * length;
+		float scale = 1.0f / length;
+
+		if (i == 0)
+		{
+			partition0_len_sq = length_squared;
+		}
+		else
+		{
+			is_constant_wes = is_constant_wes && length_squared == partition0_len_sq;
+		}
+
+		for (unsigned int j = 0; j < partition_texel_count; j++)
+		{
+			unsigned int tix = pi.texels_of_partition[i][j];
+			float value = (data_vr[tix] - lowvalue) * scale;
+			value = astc::clamp1f(value);
+
+			ei.weights[tix] = value;
+			ei.weight_error_scale[tix] = length_squared * error_weight;
+			assert(!astc::isnan(ei.weight_error_scale[tix]));
+		}
+
+		ei.ep.endpt0[i] = select(blk.data_min, vfloat4(lowvalue), sep_mask);
+		ei.ep.endpt1[i] = select(blk.data_max, vfloat4(highvalue), sep_mask);
+	}
+
+	// Zero initialize any SIMD over-fetch
+	size_t texel_count_simd = round_up_to_simd_multiple_vla(texel_count);
+	for (size_t i = texel_count; i < texel_count_simd; i++)
+	{
+		ei.weights[i] = 0.0f;
+		ei.weight_error_scale[i] = 0.0f;
+	}
+
+	ei.is_constant_weight_error_scale = is_constant_wes;
+}
+
+/**
+ * @brief Compute the ideal endpoints and weights for 2 color components.
+ *
+ * @param      blk          The image block color data to compress.
+ * @param      pi           The partition info for the current trial.
+ * @param[out] ei           The computed ideal endpoints and weights.
+ * @param      component1   The first color component to compute.
+ * @param      component2   The second color component to compute.
+ */
+static void compute_ideal_colors_and_weights_2_comp(
+	const image_block& blk,
+	const partition_info& pi,
+	endpoints_and_weights& ei,
+	int component1,
+	int component2
+) {
+	unsigned int partition_count = pi.partition_count;
+	ei.ep.partition_count = partition_count;
+	promise(partition_count > 0);
+
+	unsigned int texel_count = blk.texel_count;
+	promise(texel_count > 0);
+
+	partition_metrics pms[BLOCK_MAX_PARTITIONS];
+
+	float error_weight;
+	const float* data_vr = nullptr;
+	const float* data_vg = nullptr;
+
+	if (component1 == 0 && component2 == 1)
+	{
+		error_weight = hadd_s(blk.channel_weight.swz<0, 1>()) / 2.0f;
+
+		data_vr = blk.data_r;
+		data_vg = blk.data_g;
+	}
+	else if (component1 == 0 && component2 == 2)
+	{
+		error_weight = hadd_s(blk.channel_weight.swz<0, 2>()) / 2.0f;
+
+		data_vr = blk.data_r;
+		data_vg = blk.data_b;
+	}
+	else  // (component1 == 1 && component2 == 2)
+	{
+		assert(component1 == 1 && component2 == 2);
+
+		error_weight = hadd_s(blk.channel_weight.swz<1, 2>()) / 2.0f;
+
+		data_vr = blk.data_g;
+		data_vg = blk.data_b;
+	}
+
+	compute_avgs_and_dirs_2_comp(pi, blk, component1, component2, pms);
+
+	bool is_constant_wes { true };
+	float partition0_len_sq { 0.0f };
+
+	vmask4 comp1_mask = vint4::lane_id() == vint4(component1);
+	vmask4 comp2_mask = vint4::lane_id() == vint4(component2);
+
+	for (unsigned int i = 0; i < partition_count; i++)
+	{
+		vfloat4 dir = pms[i].dir;
+		if (hadd_s(dir) < 0.0f)
+		{
+			dir = vfloat4::zero() - dir;
+		}
+
+		line2 line { pms[i].avg, normalize_safe(dir, unit2()) };
+		float lowparam { 1e10f };
+		float highparam { -1e10f };
+
+		unsigned int partition_texel_count = pi.partition_texel_count[i];
+		for (unsigned int j = 0; j < partition_texel_count; j++)
+		{
+			unsigned int tix = pi.texels_of_partition[i][j];
+			vfloat4 point = vfloat2(data_vr[tix], data_vg[tix]);
+			float param = dot_s(point - line.a, line.b);
+			ei.weights[tix] = param;
+
+			lowparam = astc::min(param, lowparam);
+			highparam = astc::max(param, highparam);
+		}
+
+		// Set to small value to avoid NaNs from zero-length directions in uniform color partitions
+		if (highparam <= lowparam)
+		{
+			lowparam = 0.0f;
+			highparam = 1e-7f;
+		}
+
+		float length = highparam - lowparam;
+		float length_squared = length * length;
+		float scale = 1.0f / length;
+
+		if (i == 0)
+		{
+			partition0_len_sq = length_squared;
+		}
+		else
+		{
+			is_constant_wes = is_constant_wes && length_squared == partition0_len_sq;
+		}
+
+		for (unsigned int j = 0; j < partition_texel_count; j++)
+		{
+			unsigned int tix = pi.texels_of_partition[i][j];
+			float idx = (ei.weights[tix] - lowparam) * scale;
+			idx = astc::clamp1f(idx);
+
+			ei.weights[tix] = idx;
+			ei.weight_error_scale[tix] = length_squared * error_weight;
+			assert(!astc::isnan(ei.weight_error_scale[tix]));
+		}
+
+		vfloat4 lowvalue = line.a + line.b * lowparam;
+		vfloat4 highvalue = line.a + line.b * highparam;
+
+		vfloat4 ep0 = select(blk.data_min, vfloat4(lowvalue.lane<0>()), comp1_mask);
+		vfloat4 ep1 = select(blk.data_max, vfloat4(highvalue.lane<0>()), comp1_mask);
+
+		ei.ep.endpt0[i] = select(ep0, vfloat4(lowvalue.lane<1>()), comp2_mask);
+		ei.ep.endpt1[i] = select(ep1, vfloat4(highvalue.lane<1>()), comp2_mask);
+	}
+
+	// Zero initialize any SIMD over-fetch
+	size_t texel_count_simd = round_up_to_simd_multiple_vla(texel_count);
+	for (size_t i = texel_count; i < texel_count_simd; i++)
+	{
+		ei.weights[i] = 0.0f;
+		ei.weight_error_scale[i] = 0.0f;
+	}
+
+	ei.is_constant_weight_error_scale = is_constant_wes;
+}
+
+/**
+ * @brief Compute the ideal endpoints and weights for 3 color components.
+ *
+ * @param      blk                 The image block color data to compress.
+ * @param      pi                  The partition info for the current trial.
+ * @param[out] ei                  The computed ideal endpoints and weights.
+ * @param      omitted_component   The color component excluded from the calculation.
+ * @param[out] pms                 The computed partition metrics.
+ */
+static void compute_ideal_colors_and_weights_3_comp(
+	const image_block& blk,
+	const partition_info& pi,
+	endpoints_and_weights& ei,
+	unsigned int omitted_component,
+	partition_metrics pms[BLOCK_MAX_PARTITIONS]
+) {
+	unsigned int partition_count = pi.partition_count;
+	ei.ep.partition_count = partition_count;
+	promise(partition_count > 0);
+
+	unsigned int texel_count = blk.texel_count;
+	promise(texel_count > 0);
+
+	float error_weight;
+	const float* data_vr = nullptr;
+	const float* data_vg = nullptr;
+	const float* data_vb = nullptr;
+	if (omitted_component == 0)
+	{
+		error_weight = hadd_s(blk.channel_weight.swz<0, 1, 2>());
+		data_vr = blk.data_g;
+		data_vg = blk.data_b;
+		data_vb = blk.data_a;
+	}
+	else if (omitted_component == 1)
+	{
+		error_weight = hadd_s(blk.channel_weight.swz<0, 2, 3>());
+		data_vr = blk.data_r;
+		data_vg = blk.data_b;
+		data_vb = blk.data_a;
+	}
+	else if (omitted_component == 2)
+	{
+		error_weight = hadd_s(blk.channel_weight.swz<0, 1, 3>());
+		data_vr = blk.data_r;
+		data_vg = blk.data_g;
+		data_vb = blk.data_a;
+	}
+	else
+	{
+		assert(omitted_component == 3);
+
+		error_weight = hadd_s(blk.channel_weight.swz<0, 1, 2>());
+		data_vr = blk.data_r;
+		data_vg = blk.data_g;
+		data_vb = blk.data_b;
+	}
+
+	error_weight = error_weight * (1.0f / 3.0f);
+
+	if (omitted_component == 3)
+	{
+		compute_avgs_and_dirs_3_comp_rgb(pi, blk, pms);
+	}
+	else
+	{
+		compute_avgs_and_dirs_3_comp(pi, blk, omitted_component, pms);
+	}
+
+	bool is_constant_wes { true };
+	float partition0_len_sq { 0.0f };
+
+	for (unsigned int i = 0; i < partition_count; i++)
+	{
+		vfloat4 dir = pms[i].dir;
+		if (hadd_rgb_s(dir) < 0.0f)
+		{
+			dir = vfloat4::zero() - dir;
+		}
+
+		line3 line { pms[i].avg, normalize_safe(dir, unit3()) };
+		float lowparam { 1e10f };
+		float highparam { -1e10f };
+
+		unsigned int partition_texel_count = pi.partition_texel_count[i];
+		for (unsigned int j = 0; j < partition_texel_count; j++)
+		{
+			unsigned int tix = pi.texels_of_partition[i][j];
+			vfloat4 point = vfloat3(data_vr[tix], data_vg[tix], data_vb[tix]);
+			float param = dot3_s(point - line.a, line.b);
+			ei.weights[tix] = param;
+
+			lowparam = astc::min(param, lowparam);
+			highparam = astc::max(param, highparam);
+		}
+
+		// Set to small value to avoid NaNs from zero-length directions in uniform color partitions
+		if (highparam <= lowparam)
+		{
+			lowparam = 0.0f;
+			highparam = 1e-7f;
+		}
+
+		float length = highparam - lowparam;
+		float length_squared = length * length;
+		float scale = 1.0f / length;
+
+		if (i == 0)
+		{
+			partition0_len_sq = length_squared;
+		}
+		else
+		{
+			is_constant_wes = is_constant_wes && length_squared == partition0_len_sq;
+		}
+
+		for (unsigned int j = 0; j < partition_texel_count; j++)
+		{
+			unsigned int tix = pi.texels_of_partition[i][j];
+			float idx = (ei.weights[tix] - lowparam) * scale;
+			idx = astc::clamp1f(idx);
+
+			ei.weights[tix] = idx;
+			ei.weight_error_scale[tix] = length_squared * error_weight;
+			assert(!astc::isnan(ei.weight_error_scale[tix]));
+		}
+
+		vfloat4 ep0 = line.a + line.b * lowparam;
+		vfloat4 ep1 = line.a + line.b * highparam;
+
+		vfloat4 bmin = blk.data_min;
+		vfloat4 bmax = blk.data_max;
+
+		assert(omitted_component < BLOCK_MAX_COMPONENTS);
+		switch (omitted_component)
+		{
+			case 0:
+				ei.ep.endpt0[i] = vfloat4(bmin.lane<0>(), ep0.lane<0>(), ep0.lane<1>(), ep0.lane<2>());
+				ei.ep.endpt1[i] = vfloat4(bmax.lane<0>(), ep1.lane<0>(), ep1.lane<1>(), ep1.lane<2>());
+				break;
+			case 1:
+				ei.ep.endpt0[i] = vfloat4(ep0.lane<0>(), bmin.lane<1>(), ep0.lane<1>(), ep0.lane<2>());
+				ei.ep.endpt1[i] = vfloat4(ep1.lane<0>(), bmax.lane<1>(), ep1.lane<1>(), ep1.lane<2>());
+				break;
+			case 2:
+				ei.ep.endpt0[i] = vfloat4(ep0.lane<0>(), ep0.lane<1>(), bmin.lane<2>(), ep0.lane<2>());
+				ei.ep.endpt1[i] = vfloat4(ep1.lane<0>(), ep1.lane<1>(), bmax.lane<2>(), ep1.lane<2>());
+				break;
+			default:
+				ei.ep.endpt0[i] = vfloat4(ep0.lane<0>(), ep0.lane<1>(), ep0.lane<2>(), bmin.lane<3>());
+				ei.ep.endpt1[i] = vfloat4(ep1.lane<0>(), ep1.lane<1>(), ep1.lane<2>(), bmax.lane<3>());
+				break;
+		}
+	}
+
+	// Zero initialize any SIMD over-fetch
+	size_t texel_count_simd = round_up_to_simd_multiple_vla(texel_count);
+	for (size_t i = texel_count; i < texel_count_simd; i++)
+	{
+		ei.weights[i] = 0.0f;
+		ei.weight_error_scale[i] = 0.0f;
+	}
+
+	ei.is_constant_weight_error_scale = is_constant_wes;
+}
+
+/**
+ * @brief Compute the ideal endpoints and weights for 4 color components.
+ *
+ * @param      blk           The image block color data to compress.
+ * @param      pi            The partition info for the current trial.
+ * @param[out] ei            The computed ideal endpoints and weights.
+ * @param[out] rgb_metrics   The RGB partition metrics, only initialized for grayscale RGB.
+ */
+static void compute_ideal_colors_and_weights_4_comp(
+	const image_block& blk,
+	const partition_info& pi,
+	endpoints_and_weights& ei,
+	partition_metrics rgb_metrics[BLOCK_MAX_PARTITIONS]
+) {
+	const float error_weight = hadd_s(blk.channel_weight) / 4.0f;
+
+	unsigned int partition_count = pi.partition_count;
+
+	unsigned int texel_count = blk.texel_count;
+	promise(texel_count > 0);
+	promise(partition_count > 0);
+
+	partition_metrics pms[BLOCK_MAX_PARTITIONS];
+
+	compute_avgs_and_dirs_4_comp(pi, blk, pms, rgb_metrics);
+
+	bool is_constant_wes { true };
+	float partition0_len_sq { 0.0f };
+
+	for (unsigned int i = 0; i < partition_count; i++)
+	{
+		vfloat4 dir = pms[i].dir;
+		if (hadd_rgb_s(dir) < 0.0f)
+		{
+			dir = vfloat4::zero() - dir;
+		}
+
+		line4 line { pms[i].avg, normalize_safe(dir, unit4()) };
+		float lowparam { 1e10f };
+		float highparam { -1e10f };
+
+		unsigned int partition_texel_count = pi.partition_texel_count[i];
+		for (unsigned int j = 0; j < partition_texel_count; j++)
+		{
+			unsigned int tix = pi.texels_of_partition[i][j];
+			vfloat4 point = blk.texel(tix);
+			float param = dot_s(point - line.a, line.b);
+			ei.weights[tix] = param;
+
+			lowparam = astc::min(param, lowparam);
+			highparam = astc::max(param, highparam);
+		}
+
+		// Set to small value to avoid NaNs from zero-length directions in uniform color partitions
+		if (highparam <= lowparam)
+		{
+			lowparam = 0.0f;
+			highparam = 1e-7f;
+		}
+
+		float length = highparam - lowparam;
+		float length_squared = length * length;
+		float scale = 1.0f / length;
+
+		if (i == 0)
+		{
+			partition0_len_sq = length_squared;
+		}
+		else
+		{
+			is_constant_wes = is_constant_wes && length_squared == partition0_len_sq;
+		}
+
+		ei.ep.endpt0[i] = line.a + line.b * lowparam;
+		ei.ep.endpt1[i] = line.a + line.b * highparam;
+
+		for (unsigned int j = 0; j < partition_texel_count; j++)
+		{
+			unsigned int tix = pi.texels_of_partition[i][j];
+			float idx = (ei.weights[tix] - lowparam) * scale;
+			idx = astc::clamp1f(idx);
+
+			ei.weights[tix] = idx;
+			ei.weight_error_scale[tix] = length_squared * error_weight;
+			assert(!astc::isnan(ei.weight_error_scale[tix]));
+		}
+	}
+
+	// Zero initialize any SIMD over-fetch
+	size_t texel_count_simd = round_up_to_simd_multiple_vla(texel_count);
+	for (size_t i = texel_count; i < texel_count_simd; i++)
+	{
+		ei.weights[i] = 0.0f;
+		ei.weight_error_scale[i] = 0.0f;
+	}
+
+	ei.is_constant_weight_error_scale = is_constant_wes;
+}
+
+/* See header for documentation. */
+bool compute_ideal_colors_and_weights_1plane(
+	const image_block& blk,
+	const partition_info& pi,
+	endpoints_and_weights& ei,
+	partition_metrics rgb_metrics[BLOCK_MAX_PARTITIONS]
+) {
+	bool uses_alpha = !blk.is_constant_channel(3);
+
+	if (uses_alpha)
+	{
+		compute_ideal_colors_and_weights_4_comp(blk, pi, ei, rgb_metrics);
+		return blk.grayscale;
+	}
+
+	compute_ideal_colors_and_weights_3_comp(blk, pi, ei, 3, rgb_metrics);
+	return true;
+}
+
+/* See header for documentation. */
+void compute_ideal_colors_and_weights_2planes(
+	const block_size_descriptor& bsd,
+	const image_block& blk,
+	unsigned int plane2_component,
+	endpoints_and_weights& ei1,
+	endpoints_and_weights& ei2
+) {
+	const auto& pi = bsd.get_partition_info(1, 0);
+	bool uses_alpha = !blk.is_constant_channel(3);
+	partition_metrics pms[BLOCK_MAX_PARTITIONS];
+
+	assert(plane2_component < BLOCK_MAX_COMPONENTS);
+	switch (plane2_component)
+	{
+	case 0:  // Separate weights for red
+		if (uses_alpha)
+		{
+			compute_ideal_colors_and_weights_3_comp(blk, pi, ei1, 0, pms);
+		}
+		else
+		{
+			compute_ideal_colors_and_weights_2_comp(blk, pi, ei1, 1, 2);
+		}
+		compute_ideal_colors_and_weights_1_comp(blk, pi, ei2, 0);
+		break;
+
+	case 1:  // Separate weights for green
+		if (uses_alpha)
+		{
+			compute_ideal_colors_and_weights_3_comp(blk, pi, ei1, 1, pms);
+		}
+		else
+		{
+			compute_ideal_colors_and_weights_2_comp(blk, pi, ei1, 0, 2);
+		}
+		compute_ideal_colors_and_weights_1_comp(blk, pi, ei2, 1);
+		break;
+
+	case 2:  // Separate weights for blue
+		if (uses_alpha)
+		{
+			compute_ideal_colors_and_weights_3_comp(blk, pi, ei1, 2, pms);
+		}
+		else
+		{
+			compute_ideal_colors_and_weights_2_comp(blk, pi, ei1, 0, 1);
+		}
+		compute_ideal_colors_and_weights_1_comp(blk, pi, ei2, 2);
+		break;
+
+	default:  // Separate weights for alpha
+		assert(uses_alpha);
+		compute_ideal_colors_and_weights_3_comp(blk, pi, ei1, 3, pms);
+		compute_ideal_colors_and_weights_1_comp(blk, pi, ei2, 3);
+		break;
+	}
+}
+
+/* See header for documentation. */
+float compute_error_of_weight_set_1plane(
+	const endpoints_and_weights& eai,
+	const decimation_info& di,
+	const float* dec_weight_quant_uvalue
+) {
+	vfloatacc error_summav = vfloatacc::zero();
+	unsigned int texel_count = di.texel_count;
+	promise(texel_count > 0);
+
+	// Process SIMD-width chunks, safe to over-fetch - the extra space is zero initialized
+	if (di.max_texel_weight_count > 2)
+	{
+		for (unsigned int i = 0; i < texel_count; i += ASTCENC_SIMD_WIDTH)
+		{
+			// Compute the bilinear interpolation of the decimated weight grid
+			vfloat current_values = bilinear_infill_vla(di, dec_weight_quant_uvalue, i);
+
+			// Compute the error between the computed value and the ideal weight
+			vfloat actual_values = loada(eai.weights + i);
+			vfloat diff = current_values - actual_values;
+			vfloat significance = loada(eai.weight_error_scale + i);
+			vfloat error = diff * diff * significance;
+
+			haccumulate(error_summav, error);
+		}
+	}
+	else if (di.max_texel_weight_count > 1)
+	{
+		for (unsigned int i = 0; i < texel_count; i += ASTCENC_SIMD_WIDTH)
+		{
+			// Compute the bilinear interpolation of the decimated weight grid
+			vfloat current_values = bilinear_infill_vla_2(di, dec_weight_quant_uvalue, i);
+
+			// Compute the error between the computed value and the ideal weight
+			vfloat actual_values = loada(eai.weights + i);
+			vfloat diff = current_values - actual_values;
+			vfloat significance = loada(eai.weight_error_scale + i);
+			vfloat error = diff * diff * significance;
+
+			haccumulate(error_summav, error);
+		}
+	}
+	else
+	{
+		for (unsigned int i = 0; i < texel_count; i += ASTCENC_SIMD_WIDTH)
+		{
+			// Load the weight set directly, without interpolation
+			vfloat current_values = loada(dec_weight_quant_uvalue + i);
+
+			// Compute the error between the computed value and the ideal weight
+			vfloat actual_values = loada(eai.weights + i);
+			vfloat diff = current_values - actual_values;
+			vfloat significance = loada(eai.weight_error_scale + i);
+			vfloat error = diff * diff * significance;
+
+			haccumulate(error_summav, error);
+		}
+	}
+
+	// Resolve the final scalar accumulator sum
+	return hadd_s(error_summav);
+}
+
+/* See header for documentation. */
+float compute_error_of_weight_set_2planes(
+	const endpoints_and_weights& eai1,
+	const endpoints_and_weights& eai2,
+	const decimation_info& di,
+	const float* dec_weight_quant_uvalue_plane1,
+	const float* dec_weight_quant_uvalue_plane2
+) {
+	vfloatacc error_summav = vfloatacc::zero();
+	unsigned int texel_count = di.texel_count;
+	promise(texel_count > 0);
+
+	// Process SIMD-width chunks, safe to over-fetch - the extra space is zero initialized
+	if (di.max_texel_weight_count > 2)
+	{
+		for (unsigned int i = 0; i < texel_count; i += ASTCENC_SIMD_WIDTH)
+		{
+			// Plane 1
+			// Compute the bilinear interpolation of the decimated weight grid
+			vfloat current_values1 = bilinear_infill_vla(di, dec_weight_quant_uvalue_plane1, i);
+
+			// Compute the error between the computed value and the ideal weight
+			vfloat actual_values1 = loada(eai1.weights + i);
+			vfloat diff = current_values1 - actual_values1;
+			vfloat error1 = diff * diff * loada(eai1.weight_error_scale + i);
+
+			// Plane 2
+			// Compute the bilinear interpolation of the decimated weight grid
+			vfloat current_values2 = bilinear_infill_vla(di, dec_weight_quant_uvalue_plane2, i);
+
+			// Compute the error between the computed value and the ideal weight
+			vfloat actual_values2 = loada(eai2.weights + i);
+			diff = current_values2 - actual_values2;
+			vfloat error2 = diff * diff * loada(eai2.weight_error_scale + i);
+
+			haccumulate(error_summav, error1 + error2);
+		}
+	}
+	else if (di.max_texel_weight_count > 1)
+	{
+		for (unsigned int i = 0; i < texel_count; i += ASTCENC_SIMD_WIDTH)
+		{
+			// Plane 1
+			// Compute the bilinear interpolation of the decimated weight grid
+			vfloat current_values1 = bilinear_infill_vla_2(di, dec_weight_quant_uvalue_plane1, i);
+
+			// Compute the error between the computed value and the ideal weight
+			vfloat actual_values1 = loada(eai1.weights + i);
+			vfloat diff = current_values1 - actual_values1;
+			vfloat error1 = diff * diff * loada(eai1.weight_error_scale + i);
+
+			// Plane 2
+			// Compute the bilinear interpolation of the decimated weight grid
+			vfloat current_values2 = bilinear_infill_vla_2(di, dec_weight_quant_uvalue_plane2, i);
+
+			// Compute the error between the computed value and the ideal weight
+			vfloat actual_values2 = loada(eai2.weights + i);
+			diff = current_values2 - actual_values2;
+			vfloat error2 = diff * diff * loada(eai2.weight_error_scale + i);
+
+			haccumulate(error_summav, error1 + error2);
+		}
+	}
+	else
+	{
+		for (unsigned int i = 0; i < texel_count; i += ASTCENC_SIMD_WIDTH)
+		{
+			// Plane 1
+			// Load the weight set directly, without interpolation
+			vfloat current_values1 = loada(dec_weight_quant_uvalue_plane1 + i);
+
+			// Compute the error between the computed value and the ideal weight
+			vfloat actual_values1 = loada(eai1.weights + i);
+			vfloat diff = current_values1 - actual_values1;
+			vfloat error1 = diff * diff * loada(eai1.weight_error_scale + i);
+
+			// Plane 2
+			// Load the weight set directly, without interpolation
+			vfloat current_values2 = loada(dec_weight_quant_uvalue_plane2 + i);
+
+			// Compute the error between the computed value and the ideal weight
+			vfloat actual_values2 = loada(eai2.weights + i);
+			diff = current_values2 - actual_values2;
+			vfloat error2 = diff * diff * loada(eai2.weight_error_scale + i);
+
+			haccumulate(error_summav, error1 + error2);
+		}
+	}
+
+	// Resolve the final scalar accumulator sum
+	return hadd_s(error_summav);
+}
+
+/* See header for documentation. */
+void compute_ideal_weights_for_decimation(
+	const endpoints_and_weights& ei,
+	const decimation_info& di,
+	float* dec_weight_ideal_value
+) {
+	unsigned int texel_count = di.texel_count;
+	unsigned int weight_count = di.weight_count;
+	bool is_direct = texel_count == weight_count;
+	promise(texel_count > 0);
+	promise(weight_count > 0);
+
+	// Copy weights directly for a 1:1 mapping, including the zeroed SIMD padding
+	if (is_direct)
+	{
+		for (unsigned int i = 0; i < texel_count; i += ASTCENC_SIMD_WIDTH)
+		{
+			vfloat weight(ei.weights + i);
+			storea(weight, dec_weight_ideal_value + i);
+		}
+
+		return;
+	}
+
+	// Otherwise compute an estimate and perform single refinement iteration
+
+	// Compute an initial average for each decimated weight
+	bool constant_wes = ei.is_constant_weight_error_scale;
+	vfloat weight_error_scale(ei.weight_error_scale[0]);
+	vgatherf_table wtab = vgatherf_load(ei.weights, texel_count);
+	vgatherf_table etab = wtab;
+	if (!constant_wes)
+	{
+		etab = vgatherf_load(ei.weight_error_scale, texel_count);
+	}
+
+	// Full SIMD loads are safe because decimation table tails are initialized
+	for (unsigned int i = 0; i < weight_count; i += ASTCENC_SIMD_WIDTH)
+	{
+		// Start with a small value to avoid div-by-zero later
+		vfloat weight_weight(1e-10f);
+		vfloat initial_weight = vfloat::zero();
+
+		// Accumulate error weighting of all the texels using this weight
+		vint weight_texel_count(di.weight_texel_count + i);
+		unsigned int max_texel_count = hmax_s(weight_texel_count);
+		promise(max_texel_count > 0);
+
+		for (unsigned int j = 0; j < max_texel_count; j++)
+		{
+			const uint8_t* texel = di.weight_texels_tr[j] + i;
+			vfloat weight = loada(di.weights_texel_contribs_tr[j] + i);
+
+			if (!constant_wes)
+			{
+				weight_error_scale = gatherf(etab, texel);
+			}
+
+			vfloat contrib_weight = weight * weight_error_scale;
+
+			weight_weight += contrib_weight;
+			initial_weight += gatherf(wtab, texel) * contrib_weight;
+		}
+
+		storea(initial_weight / weight_weight, dec_weight_ideal_value + i);
+	}
+
+	// Populate the interpolated weight grid based on the initial average
+	// Process full SIMD vectors; the zeroed tail makes excess lanes safe
+	ASTCENC_ALIGNAS float infilled_weight_diffs[BLOCK_MAX_TEXELS];
+	if (di.max_texel_weight_count <= 2)
+	{
+		for (unsigned int i = 0; i < texel_count; i += ASTCENC_SIMD_WIDTH)
+		{
+			vfloat weight = bilinear_infill_vla_2(di, dec_weight_ideal_value, i);
+			storea(weight - loada(ei.weights + i), infilled_weight_diffs + i);
+		}
+	}
+	else
+	{
+		for (unsigned int i = 0; i < texel_count; i += ASTCENC_SIMD_WIDTH)
+		{
+			vfloat weight = bilinear_infill_vla(di, dec_weight_ideal_value, i);
+			storea(weight - loada(ei.weights + i), infilled_weight_diffs + i);
+		}
+	}
+
+	// Perform a single iteration of refinement
+	// Empirically determined step size; larger values don't help but smaller drops image quality
+	constexpr float stepsize = 0.25f;
+	constexpr float chd_scale = -WEIGHTS_TEXEL_SUM;
+
+	vgatherf_table dtab = vgatherf_load(infilled_weight_diffs, texel_count);
+
+	for (unsigned int i = 0; i < weight_count; i += ASTCENC_SIMD_WIDTH)
+	{
+		vfloat weight_val = loada(dec_weight_ideal_value + i);
+
+		// Accumulate error weighting of all the texels using this weight
+		// Start with a small value to avoid div-by-zero later
+		vfloat error_change0(1e-10f);
+		vfloat error_change1(0.0f);
+
+		// Accumulate error weighting of all the texels using this weight
+		vint weight_texel_count(di.weight_texel_count + i);
+		unsigned int max_texel_count = hmax_s(weight_texel_count);
+		promise(max_texel_count > 0);
+
+		for (unsigned int j = 0; j < max_texel_count; j++)
+		{
+			const uint8_t* texel = di.weight_texels_tr[j] + i;
+			vfloat contrib_weight = loada(di.weights_texel_contribs_tr[j] + i);
+
+			if (!constant_wes)
+			{
+				weight_error_scale = gatherf(etab, texel);
+			}
+
+			vfloat scale = weight_error_scale * contrib_weight;
+			vfloat weight_diff = gatherf(dtab, texel);
+
+			error_change0 += contrib_weight * scale;
+			error_change1 += weight_diff * scale;
+		}
+
+		vfloat step = (error_change1 * chd_scale) / error_change0;
+		step = clamp(-stepsize, stepsize, step);
+
+		// Update the weight, allowing negative values
+		storea(weight_val + step, dec_weight_ideal_value + i);
+	}
+}
+
+/* See header for documentation. */
+void compute_quantized_weights_for_decimation(
+	const decimation_info& di,
+	float low_bound,
+	float high_bound,
+	const float* dec_weight_ideal_value,
+	float* weight_set_out,
+	uint8_t* quantized_weight_set,
+	quant_method quant_level
+) {
+	int weight_count = di.weight_count;
+	promise(weight_count > 0);
+	const quant_and_transfer_table& qat = quant_and_xfer_tables[quant_level];
+
+	// The available quant levels, stored with a minus 1 bias
+	static const float quant_levels_m1[12] {
+		1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 7.0f, 9.0f, 11.0f, 15.0f, 19.0f, 23.0f, 31.0f
+	};
+
+	vint steps_m1(get_quant_level(quant_level) - 1);
+	float quant_level_m1 = quant_levels_m1[quant_level];
+
+	// Quantize the weight set using both the specified low/high bounds and standard 0..1 bounds
+
+	// TODO: Oddity to investigate; triggered by test in issue #265
+	if (high_bound <= low_bound)
+	{
+		low_bound = 0.0f;
+		high_bound = 1.0f;
+	}
+
+	float rscale = high_bound - low_bound;
+	float scale = 1.0f / rscale;
+
+	float scaled_low_bound = low_bound * scale;
+	rscale *= 1.0f / 64.0f;
+
+	vfloat scalev(scale);
+	vfloat scaled_low_boundv(scaled_low_bound);
+	vfloat quant_level_m1v(quant_level_m1);
+	vfloat rscalev(rscale);
+	vfloat low_boundv(low_bound);
+
+	// This runs to the rounded-up SIMD size, which is safe as the loop tail is filled with known
+	// safe data in compute_ideal_weights_for_decimation and arrays are always 64 elements
+	if (get_quant_level(quant_level) <= 16)
+	{
+		vtable_16x8 table;
+		vtable_prepare(table, qat.quant_to_unquant);
+
+		for (int i = 0; i < weight_count; i += ASTCENC_SIMD_WIDTH)
+		{
+			vfloat ix = loada(dec_weight_ideal_value + i) * scalev - scaled_low_boundv;
+			ix = clampzo(ix);
+
+			// Look up the two closest indexes and return the one that was closest
+			vfloat ix1 = ix * quant_level_m1v;
+
+			vint weightl = float_to_int(ix1);
+			vint weighth = min(weightl + vint(1), steps_m1);
+
+			vint ixli = vtable_lookup_32bit(table, weightl);
+			vint ixhi = vtable_lookup_32bit(table, weighth);
+
+			vfloat ixl = int_to_float(ixli);
+			vfloat ixh = int_to_float(ixhi);
+
+			vmask mask = (ixl + ixh) < (vfloat(128.0f) * ix);
+			vint weight = select(ixli, ixhi, mask);
+			ixl = select(ixl, ixh, mask);
+
+			// Invert the weight-scaling that was done initially
+			storea(ixl * rscalev + low_boundv, weight_set_out + i);
+			pack_and_store_low_bytes(weight, quantized_weight_set + i);
+		}
+	}
+	else
+	{
+		vtable_32x8 table;
+		vtable_prepare(table, qat.quant_to_unquant);
+
+		for (int i = 0; i < weight_count; i += ASTCENC_SIMD_WIDTH)
+		{
+			vfloat ix = loada(dec_weight_ideal_value + i) * scalev - scaled_low_boundv;
+			ix = clampzo(ix);
+
+			// Look up the two closest indexes and return the one that was closest
+			vfloat ix1 = ix * quant_level_m1v;
+
+			vint weightl = float_to_int(ix1);
+			vint weighth = min(weightl + vint(1), steps_m1);
+
+			vint ixli = vtable_lookup_32bit(table, weightl);
+			vint ixhi = vtable_lookup_32bit(table, weighth);
+
+			vfloat ixl = int_to_float(ixli);
+			vfloat ixh = int_to_float(ixhi);
+
+			vmask mask = (ixl + ixh) < (vfloat(128.0f) * ix);
+			vint weight = select(ixli, ixhi, mask);
+			ixl = select(ixl, ixh, mask);
+
+			// Invert the weight-scaling that was done initially
+			storea(ixl * rscalev + low_boundv, weight_set_out + i);
+			pack_and_store_low_bytes(weight, quantized_weight_set + i);
+		}
+	}
+}
+
+/**
+ * @brief Compute the RGB + offset for a HDR endpoint mode #7.
+ *
+ * Since the matrix needed has a regular structure we can simplify the inverse calculation. This
+ * gives us ~24 multiplications vs. 96 for a generic inverse.
+ *
+ *  mat[0] = vfloat4(rgba_ws.x,      0.0f,      0.0f, wght_ws.x);
+ *  mat[1] = vfloat4(     0.0f, rgba_ws.y,      0.0f, wght_ws.y);
+ *  mat[2] = vfloat4(     0.0f,      0.0f, rgba_ws.z, wght_ws.z);
+ *  mat[3] = vfloat4(wght_ws.x, wght_ws.y, wght_ws.z,      psum);
+ *  mat = invert(mat);
+ *
+ * @param rgba_weight_sum     Sum of partition component error weights.
+ * @param weight_weight_sum   Sum of partition component error weights * texel weight.
+ * @param rgbq_sum            Sum of partition component error weights * texel weight * color data.
+ * @param psum                Sum of RGB color weights * texel weight^2.
+ */
+static inline vfloat4 compute_rgbo_vector(
+	vfloat4 rgba_weight_sum,
+	vfloat4 weight_weight_sum,
+	vfloat4 rgbq_sum,
+	float psum
+) {
+	float X = rgba_weight_sum.lane<0>();
+	float Y = rgba_weight_sum.lane<1>();
+	float Z = rgba_weight_sum.lane<2>();
+	float P = weight_weight_sum.lane<0>();
+	float Q = weight_weight_sum.lane<1>();
+	float R = weight_weight_sum.lane<2>();
+	float S = psum;
+
+	float PP = P * P;
+	float QQ = Q * Q;
+	float RR = R * R;
+
+	float SZmRR = S * Z - RR;
+	float DT = SZmRR * Y - Z * QQ;
+	float YP = Y * P;
+	float QX = Q * X;
+	float YX = Y * X;
+	float mZYP = -Z * YP;
+	float mZQX = -Z * QX;
+	float mRYX = -R * YX;
+	float ZQP = Z * Q * P;
+	float RYP = R * YP;
+	float RQX = R * QX;
+
+	// Compute the reciprocal of matrix determinant
+	float rdet = 1.0f / (DT * X + mZYP * P);
+
+	// Actually compute the adjugate, and then apply 1/det separately
+	vfloat4 mat0(DT, ZQP, RYP, mZYP);
+	vfloat4 mat1(ZQP, SZmRR * X - Z * PP, RQX, mZQX);
+	vfloat4 mat2(RYP, RQX, (S * Y - QQ) * X - Y * PP, mRYX);
+	vfloat4 mat3(mZYP, mZQX, mRYX, Z * YX);
+	vfloat4 vect = rgbq_sum * rdet;
+
+	return vfloat4(dot_s(mat0, vect),
+	               dot_s(mat1, vect),
+	               dot_s(mat2, vect),
+	               dot_s(mat3, vect));
+}
+
+/**
+ * @brief Undecimate unquantized endpoint-refit weights into an aligned texel array.
+ *
+ * @param      di      The weight-grid decimation.
+ * @param      quant   The unquantized integer grid weights, with SIMD padding.
+ * @param[out] texel   The normalized per-texel weights, with SIMD padding.
+ */
+static void unpack_refit_weights(
+	const decimation_info& di,
+	const uint8_t* quant,
+	float* texel
+) {
+	ASTCENC_ALIGNAS float dec[BLOCK_MAX_WEIGHTS];
+	for (unsigned int i = 0; i < di.weight_count; i += ASTCENC_SIMD_WIDTH)
+	{
+		storea(int_to_float(vint(quant + i)) * vfloat(1.0f / 64.0f), dec + i);
+	}
+
+	for (unsigned int i = 0; i < di.texel_count; i += ASTCENC_SIMD_WIDTH)
+	{
+		vfloat weight;
+		if (di.max_texel_weight_count == 1)
+		{
+			weight = loada(dec + i);
+		}
+		else if (di.max_texel_weight_count <= 2)
+		{
+			weight = bilinear_infill_vla_2(di, dec, i);
+		}
+		else
+		{
+			weight = bilinear_infill_vla(di, dec, i);
+		}
+
+		storea(weight, texel + i);
+	}
+}
+
+/**
+ * @brief Refit R/A endpoints without solving duplicate RGB components.
+ *
+ * Fixed positive channel weights cancel from each independent least-squares solve.
+ * Singular systems retain the incoming endpoints; constant weights use the mean.
+ * Fitted R is replicated into RGB for the endpoint encoders, including RGB-scale.
+ *
+ * @param         blk            The L+A image block.
+ * @param         pi             The partitioning to refit.
+ * @param         weights_r      The normalized per-texel R weights.
+ * @param         weights_a      The normalized per-texel A weights.
+ * @param[in,out] ep             The endpoints to refine.
+ * @param[out]    rgbs_vectors   The RGB-scale endpoint representation for each partition.
+ */
+static void recompute_ideal_colors_ra(
+	const image_block& blk,
+	const partition_info& pi,
+	const float* weights_r,
+	const float* weights_a,
+	endpoints& ep,
+	vfloat4 rgbs_vectors[BLOCK_MAX_PARTITIONS]
+) {
+	for (unsigned int partition = 0; partition < pi.partition_count; partition++)
+	{
+		unsigned int count = pi.partition_texel_count[partition];
+		promise(count > 0);
+
+		// Pack R/A into two lanes; fixed channel weights cancel from each endpoint solve
+		vfloat4 color_sum = vfloat4::zero();
+		vfloat4 weight_sum = vfloat4::zero();
+		vfloat4 weight_squared_sum = vfloat4::zero();
+		vfloat4 color_vec_y = vfloat4::zero();
+
+		vfloat4 wmin(1.0f);
+		vfloat4 wmax(0.0f);
+
+		float rmin = 1e10f;
+		float rmax = 0.0f;
+
+		for (unsigned int j = 0; j < count; j++)
+		{
+			unsigned int tix = pi.texels_of_partition[partition][j];
+			vfloat4 color = vfloat2(blk.data_r[tix], blk.data_a[tix]);
+			vfloat4 weight = vfloat2(weights_r[tix], weights_a[tix]);
+
+			// Accumulate sum(c), sum(w), sum(w*w), and sum(w*c)
+			color_sum += color;
+			weight_sum += weight;
+			weight_squared_sum += weight * weight;
+			color_vec_y += weight * color;
+
+			wmin = min(wmin, weight);
+			wmax = max(wmax, weight);
+			rmin = astc::min(rmin, color.lane<0>());
+			rmax = astc::max(rmax, color.lane<0>());
+		}
+
+		// For c = (1-w)*ep0 + w*ep1, form the same normal equations as the general refit
+		vfloat4 left_sum = vfloat4(static_cast<float>(count)) - 2.0f * weight_sum + weight_squared_sum;
+		vfloat4 middle_sum = weight_sum - weight_squared_sum;
+		vfloat4 right_sum = weight_squared_sum;
+		vfloat4 color_vec_x = color_sum - color_vec_y;
+
+		// Reject ill-conditioned systems using the same relative determinant test
+		vfloat4 color_det1 = left_sum * right_sum - middle_sum * middle_sum;
+		vfloat4 color_mss1 = left_sum * left_sum + 2.0f * middle_sum * middle_sum + right_sum * right_sum;
+		vmask4 det_mask = abs(color_det1) > color_mss1 * 1e-4f;
+
+		// Avoid division by zero in rejected systems and unused SIMD lanes
+		vfloat4 color_rdet1 = 1.0f / select(vfloat4(1.0f), color_det1, det_mask);
+
+		// Solve the 2x2 system for both endpoints, as in the general refit
+		vfloat4 fit0 = (right_sum * color_vec_x - middle_sum * color_vec_y) * color_rdet1;
+		vfloat4 fit1 = (left_sum * color_vec_y - middle_sum * color_vec_x) * color_rdet1;
+		vmask4 full_mask = det_mask & (fit0 == fit0) & (fit1 == fit1);
+
+		vmask4 constant = wmin >= wmax * 0.999f;
+		vfloat4 avg = color_sum / static_cast<float>(count);
+
+		// Keep the incoming endpoints when the analytic fit is invalid
+		vfloat4 ep0 = select(ep.endpt0[partition].swz<0, 3>(), fit0, full_mask);
+		vfloat4 ep1 = select(ep.endpt1[partition].swz<0, 3>(), fit1, full_mask);
+
+		// Equal weights cannot determine endpoint separation; use the mean for both colors
+		ep0 = select(ep0, avg, constant & (avg == avg));
+		ep1 = select(ep1, avg, constant & (avg == avg));
+
+		// Restore the duplicated RGB components for the endpoint encoders
+		ep.endpt0[partition] = ep0.swz<0, 0, 0, 1>();
+		ep.endpt1[partition] = ep1.swz<0, 0, 0, 1>();
+
+		// Initialize RGB-scale endpoints from the observed R range
+		float scale = astc::clamp1f(rmin / astc::max(rmax, 1e-10f));
+		if (constant.lane<0>())
+		{
+			scale = 1.0f;
+		}
+		else if (full_mask.lane<0>() && fit0.lane<0>() < fit1.lane<0>())
+		{
+			// For R=G=B, the RGB projection and scale solve reduce to the fitted R endpoints
+			rmax = fit1.lane<0>();
+			scale = fit0.lane<0>() / astc::max(rmax, 1e-10f);
+		}
+
+		rgbs_vectors[partition] = vfloat4(rmax, rmax, rmax, scale);
+	}
+}
+
+/* See header for documentation. */
+void recompute_ideal_colors_1plane(
+	const image_block& blk,
+	const partition_info& pi,
+	const decimation_info& di,
+	const uint8_t* dec_weights_uquant,
+	endpoints& ep,
+	vfloat4 rgbs_vectors[BLOCK_MAX_PARTITIONS],
+	vfloat4 rgbo_vectors[BLOCK_MAX_PARTITIONS]
+) {
+	if (blk.is_la_block())
+	{
+		ASTCENC_ALIGNAS float weights[BLOCK_MAX_TEXELS];
+		unpack_refit_weights(di, dec_weights_uquant, weights);
+		recompute_ideal_colors_ra(blk, pi, weights, weights, ep, rgbs_vectors);
+		return;
+	}
+
+	unsigned int weight_count = di.weight_count;
+	unsigned int total_texel_count = blk.texel_count;
+	unsigned int partition_count = pi.partition_count;
+
+	promise(weight_count > 0);
+	promise(total_texel_count > 0);
+	promise(partition_count > 0);
+
+	ASTCENC_ALIGNAS float dec_weight[BLOCK_MAX_WEIGHTS];
+	for (unsigned int i = 0; i < weight_count; i += ASTCENC_SIMD_WIDTH)
+	{
+		vint unquant_value(dec_weights_uquant + i);
+		vfloat unquant_valuef = int_to_float(unquant_value) * vfloat(1.0f / 64.0f);
+		storea(unquant_valuef, dec_weight + i);
+	}
+
+	ASTCENC_ALIGNAS float undec_weight[BLOCK_MAX_TEXELS];
+	float* undec_weight_ref;
+	if (di.max_texel_weight_count == 1)
+	{
+		undec_weight_ref = dec_weight;
+	}
+	else if (di.max_texel_weight_count <= 2)
+	{
+		for (unsigned int i = 0; i < total_texel_count; i += ASTCENC_SIMD_WIDTH)
+		{
+			vfloat weight = bilinear_infill_vla_2(di, dec_weight, i);
+			storea(weight, undec_weight + i);
+		}
+
+		undec_weight_ref = undec_weight;
+	}
+	else
+	{
+		for (unsigned int i = 0; i < total_texel_count; i += ASTCENC_SIMD_WIDTH)
+		{
+			vfloat weight = bilinear_infill_vla(di, dec_weight, i);
+			storea(weight, undec_weight + i);
+		}
+
+		undec_weight_ref = undec_weight;
+	}
+
+	vfloat4 rgba_sum(blk.data_mean * static_cast<float>(blk.texel_count));
+
+	for (unsigned int i = 0; i < partition_count; i++)
+	{
+		unsigned int texel_count = pi.partition_texel_count[i];
+		const uint8_t *texel_indexes = pi.texels_of_partition[i];
+
+		// Only compute a partition mean if more than one partition
+		if (partition_count > 1)
+		{
+			rgba_sum = vfloat4::zero();
+			promise(texel_count > 0);
+			for (unsigned int j = 0; j < texel_count; j++)
+			{
+				unsigned int tix = texel_indexes[j];
+				rgba_sum += blk.texel(tix);
+			}
+		}
+
+		// Compute weighted color sums and the mean RGB direction for RGB-scale fitting
+		rgba_sum = rgba_sum * blk.channel_weight;
+		vfloat4 rgba_weight_sum = max(blk.channel_weight * static_cast<float>(texel_count), 1e-17f);
+		vfloat4 scale_dir = normalize((rgba_sum / rgba_weight_sum).swz<0, 1, 2>());
+
+		float scale_max = 0.0f;
+		float scale_min = 1e10f;
+
+		float wmin1 = 1.0f;
+		float wmax1 = 0.0f;
+
+		float weight_sum_s = 0.0f;
+		float right_sum_s = 0.0f;
+
+		vfloat4 color_vec_y = vfloat4::zero();
+
+		vfloat4 scale_vec = vfloat4::zero();
+
+		vfloat4 color_weight = blk.channel_weight;
+		float ls_weight = hadd_rgb_s(color_weight);
+
+		for (unsigned int j = 0; j < texel_count; j++)
+		{
+			unsigned int tix = texel_indexes[j];
+			vfloat4 rgba = blk.texel(tix);
+
+			float idx0 = undec_weight_ref[tix];
+
+			float om_idx0 = 1.0f - idx0;
+			wmin1 = astc::min(idx0, wmin1);
+			wmax1 = astc::max(idx0, wmax1);
+
+			// Record the observed range along the RGB-scale direction
+			float scale = dot3_s(scale_dir, rgba);
+			scale_min = astc::min(scale, scale_min);
+			scale_max = astc::max(scale, scale_max);
+
+			// Accumulate sum(w), sum(w*w), and sum(w*c) for the endpoint solve
+			weight_sum_s += idx0;
+			right_sum_s += idx0 * idx0;
+
+			vfloat4 color_idx(idx0);
+			vfloat4 cwprod = rgba;
+			vfloat4 cwiprod = cwprod * color_idx;
+
+			color_vec_y += cwiprod;
+
+			// Accumulate the right-hand side of the RGB-scale normal equations
+			scale_vec += vfloat2(om_idx0, idx0) * (scale * ls_weight);
+		}
+
+		// For c = (1-w)*ep0 + w*ep1, form the normal-equation matrix terms
+		float left_sum_s = static_cast<float>(texel_count) - 2.0f * weight_sum_s + right_sum_s;
+		float middle_sum_s = weight_sum_s - right_sum_s;
+		float weight_weight_sum_s = weight_sum_s + 1e-17f;
+
+		// Apply the color and RGB-scale weights to their respective matrix terms
+		vfloat4 left_sum   = vfloat4(left_sum_s) * color_weight;
+		vfloat4 middle_sum = vfloat4(middle_sum_s) * color_weight;
+		vfloat4 right_sum  = vfloat4(right_sum_s) * color_weight;
+		vfloat4 lmrs_sum   = vfloat3(left_sum_s, middle_sum_s, right_sum_s) * ls_weight;
+
+		// The color right-hand sides are sum(w*c) and sum((1-w)*c)
+		color_vec_y = color_vec_y * color_weight;
+		vfloat4 color_vec_x = rgba_sum - color_vec_y;
+
+		// Initialize RGB-scale endpoints from the observed projected RGB range
+		float scalediv = scale_min / astc::max(scale_max, 1e-10f);
+		scalediv = astc::clamp1f(scalediv);
+
+		vfloat4 sds = scale_dir * scale_max;
+
+		rgbs_vectors[i] = vfloat4(sds.lane<0>(), sds.lane<1>(), sds.lane<2>(), scalediv);
+
+		if (wmin1 >= wmax1 * 0.999f)
+		{
+			// Equal weights cannot determine endpoint separation; use the mean for both colors
+			vfloat4 avg = (color_vec_x + color_vec_y) / rgba_weight_sum;
+
+			vmask4 notnan_mask = avg == avg;
+			ep.endpt0[i] = select(ep.endpt0[i], avg, notnan_mask);
+			ep.endpt1[i] = select(ep.endpt1[i], avg, notnan_mask);
+
+			rgbs_vectors[i] = vfloat4(sds.lane<0>(), sds.lane<1>(), sds.lane<2>(), 1.0f);
+		}
+		else
+		{
+			// Compute determinants and reciprocals for the color and RGB-scale systems
+			vfloat4 color_det1 = (left_sum * right_sum) - (middle_sum * middle_sum);
+			vfloat4 color_rdet1 = 1.0f / color_det1;
+
+			float ls_det1  = (lmrs_sum.lane<0>() * lmrs_sum.lane<2>()) - (lmrs_sum.lane<1>() * lmrs_sum.lane<1>());
+			float ls_rdet1 = 1.0f / ls_det1;
+
+			// Squared matrix norms set relative thresholds for rejecting ill-conditioned fits
+			vfloat4 color_mss1 = (left_sum * left_sum)
+			                   + (2.0f * middle_sum * middle_sum)
+			                   + (right_sum * right_sum);
+
+			float ls_mss1 = (lmrs_sum.lane<0>() * lmrs_sum.lane<0>())
+			              + (2.0f * lmrs_sum.lane<1>() * lmrs_sum.lane<1>())
+			              + (lmrs_sum.lane<2>() * lmrs_sum.lane<2>());
+
+			// Solve the 2x2 system for both endpoints
+			vfloat4 ep0 = (right_sum * color_vec_x - middle_sum * color_vec_y) * color_rdet1;
+			vfloat4 ep1 = (left_sum * color_vec_y - middle_sum * color_vec_x) * color_rdet1;
+
+			// Reject ill-conditioned or NaN fits using the relative determinant test
+			vmask4 det_mask = abs(color_det1) > (color_mss1 * 1e-4f);
+			vmask4 notnan_mask = (ep0 == ep0) & (ep1 == ep1);
+			vmask4 full_mask = det_mask & notnan_mask;
+
+			// Keep the incoming endpoints when the analytic fit is invalid
+			ep.endpt0[i] = select(ep.endpt0[i], ep0, full_mask);
+			ep.endpt1[i] = select(ep.endpt1[i], ep1, full_mask);
+
+			// Solve the same system for endpoint magnitudes along the RGB-scale direction
+			float scale_ep0 = (lmrs_sum.lane<2>() * scale_vec.lane<0>() - lmrs_sum.lane<1>() * scale_vec.lane<1>()) * ls_rdet1;
+			float scale_ep1 = (lmrs_sum.lane<0>() * scale_vec.lane<1>() - lmrs_sum.lane<1>() * scale_vec.lane<0>()) * ls_rdet1;
+
+			// Keep the default scale endpoints unless the analytic fit is valid and increasing
+			if (fabsf(ls_det1) > (ls_mss1 * 1e-4f) && scale_ep0 == scale_ep0 && scale_ep1 == scale_ep1 && scale_ep0 < scale_ep1)
+			{
+				float scalediv2 = scale_ep0 / scale_ep1;
+				vfloat4 sdsm = scale_dir * scale_ep1;
+				rgbs_vectors[i] = vfloat4(sdsm.lane<0>(), sdsm.lane<1>(), sdsm.lane<2>(), scalediv2);
+			}
+		}
+
+		// Calculations specific to mode #7, the HDR RGB-scale mode - skip if known LDR
+		if (blk.rgb_lns[0] || blk.alpha_lns[0])
+		{
+			vfloat4 weight_weight_sum = vfloat4(weight_weight_sum_s) * color_weight;
+			float psum = right_sum_s * hadd_rgb_s(color_weight);
+
+			vfloat4 rgbq_sum = color_vec_x + color_vec_y;
+			rgbq_sum.set_lane<3>(hadd_rgb_s(color_vec_y));
+
+			vfloat4 rgbovec = compute_rgbo_vector(rgba_weight_sum, weight_weight_sum, rgbq_sum, psum);
+			rgbo_vectors[i] = rgbovec;
+
+			// Fall back to an endpoint-based estimate if the matrix is singular
+			if (astc::isnan(dot_s(rgbovec, rgbovec)))
+			{
+				vfloat4 v0 = ep.endpt0[i];
+				vfloat4 v1 = ep.endpt1[i];
+
+				float avgdif = hadd_rgb_s(v1 - v0) * (1.0f / 3.0f);
+				avgdif = astc::max(avgdif, 0.0f);
+
+				vfloat4 avg = (v0 + v1) * 0.5f;
+				vfloat4 ep0 = avg - vfloat4(avgdif) * 0.5f;
+				rgbo_vectors[i] = vfloat4(ep0.lane<0>(), ep0.lane<1>(), ep0.lane<2>(), avgdif);
+			}
+		}
+	}
+}
+
+/* See header for documentation. */
+void recompute_ideal_colors_2planes(
+	const image_block& blk,
+	const block_size_descriptor& bsd,
+	const decimation_info& di,
+	const uint8_t* dec_weights_uquant_plane1,
+	const uint8_t* dec_weights_uquant_plane2,
+	endpoints& ep,
+	vfloat4& rgbs_vector,
+	vfloat4& rgbo_vector,
+	int plane2_component
+) {
+	if (blk.is_la_block())
+	{
+		ASTCENC_ALIGNAS float weights1[BLOCK_MAX_TEXELS];
+		ASTCENC_ALIGNAS float weights2[BLOCK_MAX_TEXELS];
+		unpack_refit_weights(di, dec_weights_uquant_plane1, weights1);
+		unpack_refit_weights(di, dec_weights_uquant_plane2, weights2);
+
+		// Select the weight plane for each active channel
+		const float* weights_r = weights1;
+		const float* weights_a = weights1;
+		if (plane2_component == 0)
+		{
+			weights_r = weights2;
+		}
+		else if (plane2_component == 3)
+		{
+			weights_a = weights2;
+		}
+
+		recompute_ideal_colors_ra(blk, bsd.get_partition_info(1, 0), weights_r, weights_a,
+		                          ep, &rgbs_vector);
+		return;
+	}
+
+	unsigned int weight_count = di.weight_count;
+	unsigned int total_texel_count = blk.texel_count;
+
+	promise(total_texel_count > 0);
+	promise(weight_count > 0);
+
+	ASTCENC_ALIGNAS float dec_weight_plane1[BLOCK_MAX_WEIGHTS_2PLANE];
+	ASTCENC_ALIGNAS float dec_weight_plane2[BLOCK_MAX_WEIGHTS_2PLANE];
+
+	assert(weight_count <= BLOCK_MAX_WEIGHTS_2PLANE);
+
+	for (unsigned int i = 0; i < weight_count; i += ASTCENC_SIMD_WIDTH)
+	{
+		vint unquant_value1(dec_weights_uquant_plane1 + i);
+		vfloat unquant_value1f = int_to_float(unquant_value1) * vfloat(1.0f / 64.0f);
+		storea(unquant_value1f, dec_weight_plane1 + i);
+
+		vint unquant_value2(dec_weights_uquant_plane2 + i);
+		vfloat unquant_value2f = int_to_float(unquant_value2) * vfloat(1.0f / 64.0f);
+		storea(unquant_value2f, dec_weight_plane2 + i);
+	}
+
+	ASTCENC_ALIGNAS float undec_weight_plane1[BLOCK_MAX_TEXELS];
+	ASTCENC_ALIGNAS float undec_weight_plane2[BLOCK_MAX_TEXELS];
+
+	float* undec_weight_plane1_ref;
+	float* undec_weight_plane2_ref;
+
+	if (di.max_texel_weight_count == 1)
+	{
+		undec_weight_plane1_ref = dec_weight_plane1;
+		undec_weight_plane2_ref = dec_weight_plane2;
+	}
+	else if (di.max_texel_weight_count <= 2)
+	{
+		for (unsigned int i = 0; i < total_texel_count; i += ASTCENC_SIMD_WIDTH)
+		{
+			vfloat weight = bilinear_infill_vla_2(di, dec_weight_plane1, i);
+			storea(weight, undec_weight_plane1 + i);
+
+			weight = bilinear_infill_vla_2(di, dec_weight_plane2, i);
+			storea(weight, undec_weight_plane2 + i);
+		}
+
+		undec_weight_plane1_ref = undec_weight_plane1;
+		undec_weight_plane2_ref = undec_weight_plane2;
+	}
+	else
+	{
+		for (unsigned int i = 0; i < total_texel_count; i += ASTCENC_SIMD_WIDTH)
+		{
+			vfloat weight = bilinear_infill_vla(di, dec_weight_plane1, i);
+			storea(weight, undec_weight_plane1 + i);
+
+			weight = bilinear_infill_vla(di, dec_weight_plane2, i);
+			storea(weight, undec_weight_plane2 + i);
+		}
+
+		undec_weight_plane1_ref = undec_weight_plane1;
+		undec_weight_plane2_ref = undec_weight_plane2;
+	}
+
+	unsigned int texel_count = bsd.texel_count;
+	vfloat4 rgba_weight_sum = max(blk.channel_weight * static_cast<float>(texel_count), 1e-17f);
+	vfloat4 scale_dir = normalize(blk.data_mean.swz<0, 1, 2>());
+
+	float scale_max = 0.0f;
+	float scale_min = 1e10f;
+
+	float wmin1 = 1.0f;
+	float wmax1 = 0.0f;
+
+	float wmin2 = 1.0f;
+	float wmax2 = 0.0f;
+
+	float left1_sum_s = 0.0f;
+	float middle1_sum_s = 0.0f;
+	float right1_sum_s = 0.0f;
+
+	float left2_sum_s = 0.0f;
+	float middle2_sum_s = 0.0f;
+	float right2_sum_s = 0.0f;
+
+	vfloat4 color_vec_x = vfloat4::zero();
+	vfloat4 color_vec_y = vfloat4::zero();
+
+	vfloat4 scale_vec = vfloat4::zero();
+
+	vfloat4 weight_weight_sum = vfloat4(1e-17f);
+
+	vmask4 p2_mask = vint4::lane_id() == vint4(plane2_component);
+	vfloat4 color_weight = blk.channel_weight;
+	float ls_weight = hadd_rgb_s(color_weight);
+
+	for (unsigned int j = 0; j < texel_count; j++)
+	{
+		vfloat4 rgba = blk.texel(j);
+
+		float idx0 = undec_weight_plane1_ref[j];
+
+		float om_idx0 = 1.0f - idx0;
+		wmin1 = astc::min(idx0, wmin1);
+		wmax1 = astc::max(idx0, wmax1);
+
+		float scale = dot3_s(scale_dir, rgba);
+		scale_min = astc::min(scale, scale_min);
+		scale_max = astc::max(scale, scale_max);
+
+		left1_sum_s   += om_idx0 * om_idx0;
+		middle1_sum_s += om_idx0 * idx0;
+		right1_sum_s  += idx0 * idx0;
+
+		float idx1 = undec_weight_plane2_ref[j];
+
+		float om_idx1 = 1.0f - idx1;
+		wmin2 = astc::min(idx1, wmin2);
+		wmax2 = astc::max(idx1, wmax2);
+
+		left2_sum_s   += om_idx1 * om_idx1;
+		middle2_sum_s += om_idx1 * idx1;
+		right2_sum_s  += idx1 * idx1;
+
+		vfloat4 color_idx = select(vfloat4(idx0), vfloat4(idx1), p2_mask);
+
+		vfloat4 cwprod = rgba;
+		vfloat4 cwiprod = cwprod * color_idx;
+
+		color_vec_y += cwiprod;
+		color_vec_x += cwprod - cwiprod;
+
+		scale_vec += vfloat2(om_idx0, idx0) * (ls_weight * scale);
+		weight_weight_sum += color_idx;
+	}
+
+	vfloat4 left1_sum   = vfloat4(left1_sum_s) * color_weight;
+	vfloat4 middle1_sum = vfloat4(middle1_sum_s) * color_weight;
+	vfloat4 right1_sum  = vfloat4(right1_sum_s) * color_weight;
+	vfloat4 lmrs_sum    = vfloat3(left1_sum_s, middle1_sum_s, right1_sum_s) * ls_weight;
+
+	vfloat4 left2_sum   = vfloat4(left2_sum_s) * color_weight;
+	vfloat4 middle2_sum = vfloat4(middle2_sum_s) * color_weight;
+	vfloat4 right2_sum  = vfloat4(right2_sum_s) * color_weight;
+
+	color_vec_x = color_vec_x * color_weight;
+	color_vec_y = color_vec_y * color_weight;
+
+	// Initialize the luminance and scale vectors with a reasonable default
+	float scalediv = scale_min / astc::max(scale_max, 1e-10f);
+	scalediv = astc::clamp1f(scalediv);
+
+	vfloat4 sds = scale_dir * scale_max;
+
+	rgbs_vector = vfloat4(sds.lane<0>(), sds.lane<1>(), sds.lane<2>(), scalediv);
+
+	if (wmin1 >= wmax1 * 0.999f)
+	{
+		// Use the partition's average color for both endpoints when all weights are equal
+		vfloat4 avg = (color_vec_x + color_vec_y) / rgba_weight_sum;
+
+		vmask4 p1_mask = vint4::lane_id() != vint4(plane2_component);
+		vmask4 notnan_mask = avg == avg;
+		vmask4 full_mask = p1_mask & notnan_mask;
+
+		ep.endpt0[0] = select(ep.endpt0[0], avg, full_mask);
+		ep.endpt1[0] = select(ep.endpt1[0], avg, full_mask);
+
+		rgbs_vector = vfloat4(sds.lane<0>(), sds.lane<1>(), sds.lane<2>(), 1.0f);
+	}
+	else
+	{
+		// Solve for ideal endpoints using the texel weights and colors
+		vfloat4 color_det1 = (left1_sum * right1_sum) - (middle1_sum * middle1_sum);
+		vfloat4 color_rdet1 = 1.0f / color_det1;
+
+		float ls_det1  = (lmrs_sum.lane<0>() * lmrs_sum.lane<2>()) - (lmrs_sum.lane<1>() * lmrs_sum.lane<1>());
+		float ls_rdet1 = 1.0f / ls_det1;
+
+		vfloat4 color_mss1 = (left1_sum * left1_sum)
+		                   + (2.0f * middle1_sum * middle1_sum)
+		                   + (right1_sum * right1_sum);
+
+		float ls_mss1 = (lmrs_sum.lane<0>() * lmrs_sum.lane<0>())
+		              + (2.0f * lmrs_sum.lane<1>() * lmrs_sum.lane<1>())
+		              + (lmrs_sum.lane<2>() * lmrs_sum.lane<2>());
+
+		vfloat4 ep0 = (right1_sum * color_vec_x - middle1_sum * color_vec_y) * color_rdet1;
+		vfloat4 ep1 = (left1_sum * color_vec_y - middle1_sum * color_vec_x) * color_rdet1;
+
+		float scale_ep0 = (lmrs_sum.lane<2>() * scale_vec.lane<0>() - lmrs_sum.lane<1>() * scale_vec.lane<1>()) * ls_rdet1;
+		float scale_ep1 = (lmrs_sum.lane<0>() * scale_vec.lane<1>() - lmrs_sum.lane<1>() * scale_vec.lane<0>()) * ls_rdet1;
+
+		vmask4 p1_mask = vint4::lane_id() != vint4(plane2_component);
+		vmask4 det_mask = abs(color_det1) > (color_mss1 * 1e-4f);
+		vmask4 notnan_mask = (ep0 == ep0) & (ep1 == ep1);
+		vmask4 full_mask = p1_mask & det_mask & notnan_mask;
+
+		ep.endpt0[0] = select(ep.endpt0[0], ep0, full_mask);
+		ep.endpt1[0] = select(ep.endpt1[0], ep1, full_mask);
+
+		if (fabsf(ls_det1) > (ls_mss1 * 1e-4f) && scale_ep0 == scale_ep0 && scale_ep1 == scale_ep1 && scale_ep0 < scale_ep1)
+		{
+			float scalediv2 = scale_ep0 / scale_ep1;
+			vfloat4 sdsm = scale_dir * scale_ep1;
+			rgbs_vector = vfloat4(sdsm.lane<0>(), sdsm.lane<1>(), sdsm.lane<2>(), scalediv2);
+		}
+	}
+
+	if (wmin2 >= wmax2 * 0.999f)
+	{
+		// Use the partition's average color for both endpoints when all weights are equal
+		vfloat4 avg = (color_vec_x + color_vec_y) / rgba_weight_sum;
+
+		vmask4 notnan_mask = avg == avg;
+		vmask4 full_mask = p2_mask & notnan_mask;
+
+		ep.endpt0[0] = select(ep.endpt0[0], avg, full_mask);
+		ep.endpt1[0] = select(ep.endpt1[0], avg, full_mask);
+	}
+	else
+	{
+		// Solve for ideal endpoints using the texel weights and colors
+		vfloat4 color_det2 = (left2_sum * right2_sum) - (middle2_sum * middle2_sum);
+		vfloat4 color_rdet2 = 1.0f / color_det2;
+
+		vfloat4 color_mss2 = (left2_sum * left2_sum)
+		                   + (2.0f * middle2_sum * middle2_sum)
+		                   + (right2_sum * right2_sum);
+
+		vfloat4 ep0 = (right2_sum * color_vec_x - middle2_sum * color_vec_y) * color_rdet2;
+		vfloat4 ep1 = (left2_sum * color_vec_y - middle2_sum * color_vec_x) * color_rdet2;
+
+		vmask4 det_mask = abs(color_det2) > (color_mss2 * 1e-4f);
+		vmask4 notnan_mask = (ep0 == ep0) & (ep1 == ep1);
+		vmask4 full_mask = p2_mask & det_mask & notnan_mask;
+
+		ep.endpt0[0] = select(ep.endpt0[0], ep0, full_mask);
+		ep.endpt1[0] = select(ep.endpt1[0], ep1, full_mask);
+	}
+
+	// Calculations specific to mode #7, the HDR RGB-scale mode - skip if known LDR
+	if (blk.rgb_lns[0] || blk.alpha_lns[0])
+	{
+		weight_weight_sum = weight_weight_sum * color_weight;
+		float psum = dot3_s(select(right1_sum, right2_sum, p2_mask), color_weight);
+
+		vfloat4 rgbq_sum = color_vec_x + color_vec_y;
+		rgbq_sum.set_lane<3>(hadd_rgb_s(color_vec_y));
+
+		rgbo_vector = compute_rgbo_vector(rgba_weight_sum, weight_weight_sum, rgbq_sum, psum);
+
+		// Fall back to an endpoint-based estimate if the matrix is singular
+		if (astc::isnan(dot_s(rgbo_vector, rgbo_vector)))
+		{
+			vfloat4 v0 = ep.endpt0[0];
+			vfloat4 v1 = ep.endpt1[0];
+
+			float avgdif = hadd_rgb_s(v1 - v0) * (1.0f / 3.0f);
+			avgdif = astc::max(avgdif, 0.0f);
+
+			vfloat4 avg = (v0 + v1) * 0.5f;
+			vfloat4 ep0 = avg - vfloat4(avgdif) * 0.5f;
+
+			rgbo_vector = vfloat4(ep0.lane<0>(), ep0.lane<1>(), ep0.lane<2>(), avgdif);
+		}
+	}
+}
+
+#endif

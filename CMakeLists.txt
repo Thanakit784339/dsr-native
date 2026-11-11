@@ -24,7 +24,8 @@ file(GLOB_RECURSE DSR_CORE_SOURCES CONFIGURE_DEPENDS
     src/loader/*.cpp
     src/arch/*.cpp
     src/hle/*.cpp
-    src/runtime/*.cpp)
+    src/runtime/*.cpp
+    src/third_party/astcenc/*.cpp)
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" OR ANDROID_ABI STREQUAL "arm64-v8a")
     list(APPEND DSR_CORE_SOURCES src/arch/arm64/abi.S)
@@ -36,6 +37,11 @@ target_include_directories(dsrcore PUBLIC src third_party/spirv)
 target_compile_options(dsrcore PRIVATE
     -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-cast-function-type
     $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>)
+# astcenc's "none" (portable scalar) ISA: avoids NEON-intrinsics correctness risk for a first cut; it only
+# runs once per newly-seen BC texture (cached to disk after, see Upload() in vk_backend.cpp), so the slower
+# encode isn't on the hot path. Harmless no-op defines for every other file in dsrcore.
+target_compile_definitions(dsrcore PRIVATE
+    ASTCENC_NEON=0 ASTCENC_SVE=0 ASTCENC_SSE=0 ASTCENC_AVX=0 ASTCENC_POPCNT=0 ASTCENC_F16C=0)
 if(ANDROID)
     # The Android Gradle plugin builds its debug variant with CMAKE_BUILD_TYPE=Debug (-O0). The emulator must
     # be optimised whatever the variant: these come after the build type's flags, so they win.

@@ -26,10 +26,12 @@
 #include <thread>
 #include <deque>
 #include <condition_variable>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
 #include <string>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -49,10 +51,24 @@
 #include "hle/nvn/state.h"
 #include "hle/video.h"
 
+// Software BC1/BC2/BC3/BC7 decoder: used only when the GPU reports no native support for the
+// format (Mali has none at all). Public-domain, single header, no dependencies.
+#define BCDEC_IMPLEMENTATION
+#include "third_party/bcdec.h"
+
+// ASTC encoder (Arm, Apache 2.0): re-compresses a BC-sourced texture to ASTC_6x6 instead of uploading it
+// as raw RGBA8 (see Image::sw_transcode_astc). Used only once per distinct texture -- see the on-disk
+// cache in Upload() -- so its "none" (portable scalar) ISA build is fine; this is never on a hot path.
+#include "third_party/astcenc/astcenc.h"
+
 namespace dsr::hle::nvn {
 namespace {
 constexpr const char* kTag = "vulkan";
-constexpr VkDeviceSize kStreamSize = 48ull << 20;  // per slot (four slots)
+// Set once per upload_workers_ thread at spawn (see StartUploadWorkers()): astcenc_compress_image()
+// needs a stable, distinct index per concurrently-calling thread, 0..(thread count the context was
+// created with - 1).
+thread_local int g_upload_worker_index = 0;
+constexpr VkDeviceSize kStreamSize = 96ull << 20;  // per slot (four slots)
 constexpr VkDeviceSize kMaxUniformRange = 65536;
 constexpr uint32_t kCbufBase = 3;      // NVN uniform-buffer binding b is read by shaders as c[b + 3]
 constexpr uint32_t kCompilerConstants = 1;  // c[1]: literal constants from the shader's control section
@@ -93,6 +109,15 @@ VkFormat SrgbTwin(VkFormat f) {
 }
 
 // NVN format -> candidate Vulkan formats for images, best first.
+// BC format candidates: native BC first, then (settings.txt astc_transcode, off by default -- see
+// RuntimeConfig::astc_transcode for why) ASTC_6x6, then the RGBA8 fallback last. Gating the candidate
+// itself, not just whether Upload() acts on it, matters: PickFormat() would otherwise still choose
+// ASTC_6x6 whenever the driver supports it, leaving CreateImage() building an ASTC-formatted VkImage
+// that Upload()'s now-disabled transcode path never actually fills correctly.
+std::vector<VkFormat> BcCandidates(VkFormat bc, VkFormat astc, VkFormat rgba8) {
+    if (dsr::GetRuntime().config.astc_transcode) return {bc, astc, rgba8};
+    return {bc, rgba8};
+}
 std::vector<VkFormat> ImageCandidates(int f) {
     switch (f) {
         case 1: return {VK_FORMAT_R8_UNORM};
@@ -147,20 +172,26 @@ std::vector<VkFormat> ImageCandidates(int f) {
         case 62: return {VK_FORMAT_A2B10G10R10_UINT_PACK32};
         case 63: return {VK_FORMAT_B10G11R11_UFLOAT_PACK32};
         case 64: return {VK_FORMAT_E5B9G9R9_UFLOAT_PACK32};
-        case 65: return {VK_FORMAT_BC1_RGB_UNORM_BLOCK};
-        case 66: return {VK_FORMAT_BC1_RGBA_UNORM_BLOCK};
-        case 67: return {VK_FORMAT_BC2_UNORM_BLOCK};
-        case 68: return {VK_FORMAT_BC3_UNORM_BLOCK};
-        case 69: return {VK_FORMAT_BC1_RGB_SRGB_BLOCK};
-        case 70: return {VK_FORMAT_BC1_RGBA_SRGB_BLOCK};
-        case 71: return {VK_FORMAT_BC2_SRGB_BLOCK};
-        case 72: return {VK_FORMAT_BC3_SRGB_BLOCK};
+        // BC1/2/3/7 fall back to plain RGBA8 (CPU-decoded in Upload, see sw_decode_bc) on GPUs that
+        // report no native BC support at all (e.g. Mali, which has none). BC4/5/6H have no fallback
+        // yet -- normal/HDR maps using them will still show as blank on such GPUs.
+        // ASTC_6x6 sits between the native BC format and the RGBA8 fallback: on a GPU with no BC support
+        // but with ASTC (most Mali chips), it's a real compressed upload instead of inflating every BC
+        // texture to raw RGBA8 (4-8x the original bytes -- see Image::sw_transcode_astc in CreateImage()).
+        case 65: return BcCandidates(VK_FORMAT_BC1_RGB_UNORM_BLOCK, VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_FORMAT_R8G8B8A8_UNORM);
+        case 66: return BcCandidates(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_FORMAT_R8G8B8A8_UNORM);
+        case 67: return BcCandidates(VK_FORMAT_BC2_UNORM_BLOCK, VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_FORMAT_R8G8B8A8_UNORM);
+        case 68: return BcCandidates(VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_FORMAT_R8G8B8A8_UNORM);
+        case 69: return BcCandidates(VK_FORMAT_BC1_RGB_SRGB_BLOCK, VK_FORMAT_ASTC_4x4_SRGB_BLOCK, VK_FORMAT_R8G8B8A8_SRGB);
+        case 70: return BcCandidates(VK_FORMAT_BC1_RGBA_SRGB_BLOCK, VK_FORMAT_ASTC_4x4_SRGB_BLOCK, VK_FORMAT_R8G8B8A8_SRGB);
+        case 71: return BcCandidates(VK_FORMAT_BC2_SRGB_BLOCK, VK_FORMAT_ASTC_4x4_SRGB_BLOCK, VK_FORMAT_R8G8B8A8_SRGB);
+        case 72: return BcCandidates(VK_FORMAT_BC3_SRGB_BLOCK, VK_FORMAT_ASTC_4x4_SRGB_BLOCK, VK_FORMAT_R8G8B8A8_SRGB);
         case 73: return {VK_FORMAT_BC4_UNORM_BLOCK};
         case 74: return {VK_FORMAT_BC4_SNORM_BLOCK};
         case 75: return {VK_FORMAT_BC5_UNORM_BLOCK};
         case 76: return {VK_FORMAT_BC5_SNORM_BLOCK};
-        case 77: return {VK_FORMAT_BC7_UNORM_BLOCK};
-        case 78: return {VK_FORMAT_BC7_SRGB_BLOCK};
+        case 77: return BcCandidates(VK_FORMAT_BC7_UNORM_BLOCK, VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_FORMAT_R8G8B8A8_UNORM);
+        case 78: return BcCandidates(VK_FORMAT_BC7_SRGB_BLOCK, VK_FORMAT_ASTC_4x4_SRGB_BLOCK, VK_FORMAT_R8G8B8A8_SRGB);
         case 79: return {VK_FORMAT_BC6H_SFLOAT_BLOCK};
         case 80: return {VK_FORMAT_BC6H_UFLOAT_BLOCK};
         // RGBX: RGBA storage with alpha ignored (sampled as 1, see IgnoresAlpha).
@@ -326,6 +357,25 @@ struct Image {
     VkFormatFeatureFlags features = 0;
     bool written = false;  // has the GPU (or an upload) put anything in it
     bool uploaded = false;
+    // nvn_format is a BC1/2/3/7 format but the GPU has no native support for it (PickFormat fell
+    // back to plain RGBA8): Upload() decodes blocks on the CPU instead of copying them as-is.
+    bool sw_decode_bc = false;
+    // nvn_format is BC1/2/3/7 and the GPU has no native BC support, but DOES support ASTC: Upload()
+    // decodes BC on the CPU same as sw_decode_bc, then re-encodes to ASTC_6x6 (cached to disk after the
+    // first time) instead of uploading raw RGBA8 -- the point is GPU upload/storage bandwidth, which BC's
+    // plain-RGBA8 fallback makes *worse* (RGBA8 is 4-8x the original compressed size). See Upload().
+    bool sw_transcode_astc = false;
+    // 1.0 unless this is a shadow-map-shaped depth target (square, >=1024) that CreateImage chose to
+    // allocate smaller than the game asked for, to save fill-rate/bandwidth on this GPU: 0.5 means the
+    // real image is half the size the game thinks it is. DynamicState() scales the game's own viewport
+    // by this before it's applied, or NDC would only map onto one corner of the real (smaller) image
+    // instead of filling it -- scissor needs no equivalent fix, it already clamps to the real extent.
+    float res_scale = 1.0f;
+    // >0: this many of the game's own top mip levels were never allocated -- Vulkan level 0 is the game's
+    // level `mip_skip`. Cuts real upload bandwidth (a mip chain's top level is ~75% of its total bytes) on
+    // big sampled textures during a streaming burst, at the cost of a softer look up close. See
+    // ComputeImageParams() and Upload()'s level loop (which reads the game's own, unskipped layout).
+    int mip_skip = 0;
     // Contents came from game memory (not rendered by the GPU): re-uploaded when the game rewrites the
     // memory. Checked via a sparse hash: after an unchanged check the next one comes twice as many command
     // lists later (up to kMaxCheckInterval); a change, or an explicit MarkTextureDirty, resets that.
@@ -387,6 +437,14 @@ struct DrawState {
 class VulkanBackend final : public Backend {
 public:
     const char* Name() const override { return "vulkan"; }
+
+    // Fires as early as this object exists -- CreatePlatformBackend(), well before EnsureDevice() or any
+    // game code runs -- not just from EnsureDevice() (tried first): astcenc_context_alloc() (see
+    // StartAstcEncoder()) has no Vulkan/GPU dependency at all, so device setup was never the right thing
+    // to wait for. The ~1 s gap EnsureDevice() gave it wasn't enough in practice (confirmed by log: still
+    // hit "not ready" on the very first BC texture); starting here instead of there is pure head start,
+    // no downside, and directly reduces how often EncodeAstc6x6() has to fall back for that reason.
+    VulkanBackend() { std::thread([this] { StartAstcEncoder(UploadWorkerCount()); }).detach(); }
 
     struct MsTimer {
         double& total;
@@ -643,7 +701,9 @@ public:
         geo_lo_ = UINTPTR_MAX;
         geo_hi_ = 0;
         StartPrehash();
+        PrefetchNewTextures(cmds);
         ExecuteCommands(cmds, 0);
+        DropUnclaimedPrefetches();
         if (capture_active_) CaptureEndOfPass();
         if (recording_) WriteBackSmallTargets();
         if (recording_) {
@@ -1645,7 +1705,18 @@ private:
         auto it = images_.find(t.addr);
         if (it == images_.end()) return nullptr;
         Image& img = it->second;
-        if (img.nvn_format != t.tex.format || img.width != t.tex.width || img.height != t.tex.height) {
+        // A texture CreateImage() deliberately allocated smaller than the game's own declared size
+        // (res_scale != 1: the shadow-map and render_scale cases; mip_skip > 0: texture_mip_skip) keeps
+        // matching here at that smaller size, not the game's -- otherwise this always looks like "memory
+        // reused for a new texture" and gets destroyed and recreated on every single lookup, never staying
+        // around long enough to be drawn into or (for the window texture) ever found again by Present().
+        int want_w = std::max(1, t.tex.width >> img.mip_skip);
+        int want_h = std::max(1, t.tex.height >> img.mip_skip);
+        if (img.res_scale != 1.0f) {
+            want_w = std::max(1, int(want_w * img.res_scale));
+            want_h = std::max(1, int(want_h * img.res_scale));
+        }
+        if (img.nvn_format != t.tex.format || img.width != want_w || img.height != want_h) {
             const uint64_t key = t.addr ^ (uint64_t(t.tex.format) << 48) ^ (uint64_t(img.nvn_format) << 56);
             if (mismatch_logged_.size() < 24 && mismatch_logged_.insert(key).second)
                 LOGW(kTag, "memory @%llx used as fmt %d %dx%d but holds an image of fmt %d %dx%d%s (replaced)",
@@ -1714,84 +1785,235 @@ private:
         return img;
     }
 
-    Image* CreateImage(const TexRef& t) {
-        VkFormatFeatureFlags feats = 0;
-        VkFormat vf = PickFormat(t.tex.format, &feats);
-        if (vf == VK_FORMAT_UNDEFINED) {
-            if (unknown_formats_.insert(t.tex.format).second)
-                LOGW(kTag, "first texture with unsupported NVN format %d: %dx%dx%d, target %d, %d levels", t.tex.format,
-                     t.tex.width, t.tex.height, t.tex.depth, t.tex.target, t.tex.levels);
-            return nullptr;
+    // BC1/2/3/7 formats (both UNORM and SRGB variants): the ones Upload() knows how to CPU-decode.
+    static bool IsDecodableBc(int nvn_format) {
+        switch (nvn_format) {
+            case 65: case 66: case 67: case 68: case 69: case 70: case 71: case 72: case 77: case 78:
+                return true;
+            default:
+                return false;
         }
-        auto old = images_.find(t.addr);
-        if (old != images_.end()) {
-            DestroyImage(old->second);  // retired: destroyed once the GPU is done with it
-            images_.erase(old);
+    }
+
+    // Everything CreateImage() needs to decide before touching Vulkan: pure computation, no driver calls,
+    // no `images_` access -- safe to run from the prefetch scan (see PrefetchImage()) or inline here.
+    struct ImageParams {
+        VkFormat vf = VK_FORMAT_UNDEFINED, twin = VK_FORMAT_UNDEFINED;
+        VkFormatFeatureFlags feats = 0;
+        int width = 0, height = 0, depth = 1, levels = 1, layers = 1;
+        VkImageType type = VK_IMAGE_TYPE_2D;
+        VkImageAspectFlags aspect = 0;
+        bool sw_decode_bc = false;
+        bool sw_transcode_astc = false;
+        float res_scale = 1.0f;
+        int mip_skip = 0;
+        bool cube_compatible = false;
+        VkImageUsageFlags usage = 0;
+    };
+    std::optional<ImageParams> ComputeImageParams(const TexRef& t) {
+        ImageParams p;
+        p.vf = PickFormat(t.tex.format, &p.feats);
+        if (p.vf == VK_FORMAT_UNDEFINED) {
+            if (unknown_formats_.insert(t.tex.format).second)
+                LOGW(kTag, "first texture with unsupported NVN format %d: %dx%dx%d, target %d, %d levels",
+                     t.tex.format, t.tex.width, t.tex.height, t.tex.depth, t.tex.target, t.tex.levels);
+            return std::nullopt;
         }
         const TextureLayout layout = ComputeLayout(t.tex);
-        Image img;
-        img.nvn_format = t.tex.format;
-        img.target = t.tex.target;
-        img.addr = t.addr;
-        img.tex = t.tex;
-        img.vk_format = vf;
-        img.width = t.tex.width;
-        img.height = t.tex.height;
-        img.levels = std::max(1, std::min(t.tex.levels, int(layout.levels.size())));
-        img.layers = std::max(1, layout.layers);
-        img.depth = t.tex.target == kTarget3D ? std::max(1, t.tex.depth) : 1;
-        img.aspect = AspectOf(t.tex.format);
-        img.features = feats;
-        img.type = t.tex.target == kTarget3D ? VK_IMAGE_TYPE_3D
-                   : (t.tex.target == kTarget1D || t.tex.target == kTarget1DArray) ? VK_IMAGE_TYPE_1D
-                                                                                    : VK_IMAGE_TYPE_2D;
+        p.width = t.tex.width;
+        p.height = t.tex.height;
+        // texture_mip_skip (settings.txt): a mip chain's top level is ~75% of its total bytes, so not
+        // allocating it on big, multi-level sampled textures cuts real upload bandwidth hard during a
+        // streaming burst (see Upload()) -- at the cost of a visibly softer look up close, standing for as
+        // long as that texture stays loaded (there's no later "upgrade to full quality" step here). Render
+        // targets (depth, the window frame) are never multi-level, so this only ever touches game textures.
+        if (dsr::GetRuntime().config.texture_mip_skip > 0 && layout.levels.size() > 1 && t.tex.width >= 256 &&
+            t.tex.height >= 256) {
+            p.mip_skip = std::min(int(layout.levels.size()) - 1, dsr::GetRuntime().config.texture_mip_skip);
+            p.width = int(layout.levels[size_t(p.mip_skip)].width);
+            p.height = int(layout.levels[size_t(p.mip_skip)].height);
+            if (mip_skipped_logged_.insert(t.tex.width).second)
+                LOGI(kTag, "big texture %dx%d, %zu levels: skipping the top %d -> starting at %dx%d", t.tex.width,
+                     t.tex.height, layout.levels.size(), p.mip_skip, p.width, p.height);
+        }
+        // Experimental: shadow maps are square depth targets, distinct from the real (non-square)
+        // 1280x720-ish screen depth buffer. Halving a large one saves real fill-rate/bandwidth on this
+        // GPU at the cost of shadow softness -- DynamicState() below keeps the game's viewport mapped
+        // onto the full (smaller) image via res_scale, rather than just cropping into one corner of it.
+        if (IsDepthFormat(t.tex.format) && p.width == p.height && p.width >= 512) {
+            p.res_scale = 0.5f;
+            p.width /= 2;
+            p.height /= 2;
+            if (shadow_scaled_logged_.insert(t.tex.width).second)
+                LOGI(kTag, "shadow-shaped depth target %dx%d -> rendering at %dx%d instead", t.tex.width,
+                     t.tex.height, p.width, p.height);
+        }
+        // render_scale (settings.txt): the game's own presentable frame, found by matching the texture's
+        // storage address against everything registered via nvnWindowBuilderSetTextures. Present() already
+        // blit-scales its source onto the swapchain at whatever size it is (see Present()/PresentSlot()), so
+        // shrinking only this one texture needs no further change there -- just the viewport fix below.
+        const float rscale = dsr::GetRuntime().config.render_scale;
+        if (rscale < 1.0f && !IsDepthFormat(t.tex.format) && dsr::hle::nvn::IsWindowTextureAddr(t.addr)) {
+            p.res_scale = rscale;
+            p.width = std::max(1, int(p.width * rscale));
+            p.height = std::max(1, int(p.height * rscale));
+            if (window_scaled_logged_.insert(t.tex.width).second)
+                LOGI(kTag, "window frame %dx%d -> rendering at %dx%d (render_scale %.2f)", t.tex.width, t.tex.height,
+                     p.width, p.height, rscale);
+        }
+        p.levels = std::max(1, std::min(t.tex.levels, int(layout.levels.size())) - p.mip_skip);
+        p.layers = std::max(1, layout.layers);
+        p.depth = t.tex.target == kTarget3D ? std::max(1, t.tex.depth) : 1;
+        p.aspect = AspectOf(t.tex.format);
+        p.sw_decode_bc = IsDecodableBc(t.tex.format) && (p.vf == VK_FORMAT_R8G8B8A8_UNORM || p.vf == VK_FORMAT_R8G8B8A8_SRGB);
+        p.sw_transcode_astc =
+            IsDecodableBc(t.tex.format) && (p.vf == VK_FORMAT_ASTC_4x4_UNORM_BLOCK || p.vf == VK_FORMAT_ASTC_4x4_SRGB_BLOCK);
+        if (p.sw_decode_bc && bc_decode_logged_.insert(t.tex.format).second)
+            LOGI(kTag, "NVN format %d (BC) has no native GPU support: decoding on the CPU instead", t.tex.format);
+        if (p.sw_transcode_astc && astc_transcode_logged_.insert(t.tex.format).second)
+            LOGI(kTag, "NVN format %d (BC) has no native GPU support: transcoding to ASTC_%ux%u instead", t.tex.format,
+                 kAstcBlock, kAstcBlock);
+        // A large texture's ASTC encode (CPU, see Upload()/EncodeAstc6x6()) can take hundreds of ms up to
+        // multiple seconds the first time it's seen -- that stalls this slot's whole frame submission
+        // (QueueUpload blocks on it), seen on-device as loading-screen/credit content frozen or missing
+        // for that stall's duration. Below this pixel count the cost is small enough not to matter; above
+        // it, RGBA8's plain decode (sw_decode_bc, proven stable before ASTC existed) is the better trade.
+        constexpr int kAstcMaxPixels = 512 * 512;
+        if (p.sw_transcode_astc && size_t(p.width) * size_t(p.height) > size_t(kAstcMaxPixels)) {
+            const VkFormat rgba8 = p.vf == VK_FORMAT_ASTC_4x4_SRGB_BLOCK ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+            VkFormatProperties fp;
+            vkGetPhysicalDeviceFormatProperties(phys_, rgba8, &fp);
+            p.vf = rgba8;
+            p.feats = fp.optimalTilingFeatures;
+            p.sw_transcode_astc = false;
+            p.sw_decode_bc = true;
+            if (astc_size_capped_logged_.insert(t.tex.format).second)
+                LOGI(kTag, "NVN format %d (BC): too large for ASTC transcode (%dx%d > %dx%d) -- RGBA8 instead",
+                     t.tex.format, p.width, p.height, 512, 512);
+        }
+        p.type = t.tex.target == kTarget3D ? VK_IMAGE_TYPE_3D
+                 : (t.tex.target == kTarget1D || t.tex.target == kTarget1DArray) ? VK_IMAGE_TYPE_1D
+                                                                                  : VK_IMAGE_TYPE_2D;
+        p.cube_compatible = (t.tex.target == kTargetCubemap || t.tex.target == kTargetCubemapArray) &&
+                             p.layers % 6 == 0 && p.width == p.height;
+        p.twin = SrgbTwin(p.vf);
+        p.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (p.feats & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) p.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        if (IsDepthFormat(t.tex.format)) p.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        else if (p.feats & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) p.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        return p;
+    }
+    // The actual driver calls: pure device-level work, no shared app state touched -- safe to call from a
+    // worker thread (see PrefetchImage()) as well as inline in CreateImage().
+    bool CreateRawImage(const ImageParams& p, VkImage* out_image, VkDeviceMemory* out_memory) {
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ci.imageType = img.type;
-        ci.format = vf;
-        ci.extent = {uint32_t(img.width), uint32_t(img.type == VK_IMAGE_TYPE_1D ? 1 : img.height), uint32_t(img.depth)};
-        ci.mipLevels = uint32_t(img.levels);
-        ci.arrayLayers = uint32_t(img.layers);
+        ci.imageType = p.type;
+        ci.format = p.vf;
+        ci.extent = {uint32_t(p.width), uint32_t(p.type == VK_IMAGE_TYPE_1D ? 1 : p.height), uint32_t(p.depth)};
+        ci.mipLevels = uint32_t(p.levels);
+        ci.arrayLayers = uint32_t(p.layers);
         ci.samples = VK_SAMPLE_COUNT_1_BIT;
         ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-        if ((t.tex.target == kTargetCubemap || t.tex.target == kTargetCubemapArray) && img.layers % 6 == 0 &&
-            img.width == img.height)
-            ci.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-        ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        if (feats & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-        if (IsDepthFormat(t.tex.format))
-            ci.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-        else if (feats & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)
-            ci.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        if (p.cube_compatible) ci.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+        ci.usage = p.usage;
         ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         // Formats with an sRGB/linear counterpart may be viewed as either (NVN texture views): mutable, with the
         // pair listed so the driver can keep its compression.
-        VkFormat pair[2] = {vf, SrgbTwin(vf)};
+        VkFormat pair[2] = {p.vf, p.twin};
         VkImageFormatListCreateInfo fl{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
         if (pair[1] != VK_FORMAT_UNDEFINED) {
             ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
             fl.viewFormatCount = 2;
             fl.pViewFormats = pair;
             ci.pNext = &fl;
-            img.twin = pair[1];
         }
-        if (vkCreateImage(device_, &ci, nullptr, &img.image) != VK_SUCCESS) {
-            LogOnce("image", "vkCreateImage failed for %dx%d format %d", img.width, img.height, img.nvn_format);
-            return nullptr;
-        }
+        if (vkCreateImage(device_, &ci, nullptr, out_image) != VK_SUCCESS) return false;
         VkMemoryRequirements req;
-        vkGetImageMemoryRequirements(device_, img.image, &req);
+        vkGetImageMemoryRequirements(device_, *out_image, &req);
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         ai.allocationSize = req.size;
         ai.memoryTypeIndex = FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (vkAllocateMemory(device_, &ai, nullptr, &img.memory) != VK_SUCCESS) {
-            vkDestroyImage(device_, img.image, nullptr);
-            LogOnce("memory", "out of GPU memory for %dx%d format %d", img.width, img.height, img.nvn_format);
-            return nullptr;
+        if (vkAllocateMemory(device_, &ai, nullptr, out_memory) != VK_SUCCESS) {
+            vkDestroyImage(device_, *out_image, nullptr);
+            *out_image = VK_NULL_HANDLE;
+            return false;
         }
-        vkBindImageMemory(device_, img.image, img.memory, 0);
+        vkBindImageMemory(device_, *out_image, *out_memory, 0);
+        return true;
+    }
+    Image* CreateImage(const TexRef& t) {
+        auto old = images_.find(t.addr);
+        if (old != images_.end()) {
+            DestroyImage(old->second);  // retired: destroyed once the GPU is done with it
+            images_.erase(old);
+        }
+        // A scan at the start of this list may already have this one created, or creating, off-thread
+        // (see Execute()/PrefetchNewTextures()) -- in which case skip straight to using it.
+        std::shared_ptr<PrefetchTicket> tk = TakePrefetchTicket(t.addr);
+        // This address was reused for a different texture after the scan ran (rare, but exactly the same
+        // memory-reuse pattern FindImage() already watches for): the ticket's image is the wrong shape for
+        // what's actually needed now. Drop it and fall through to the normal synchronous path below.
+        if (tk && tk->ok &&
+            (tk->tex.format != t.tex.format || tk->tex.width != t.tex.width || tk->tex.height != t.tex.height ||
+             tk->tex.depth != t.tex.depth || tk->tex.levels != t.tex.levels || tk->tex.target != t.tex.target)) {
+            vkDestroyImage(device_, tk->image, nullptr);
+            vkFreeMemory(device_, tk->memory, nullptr);
+            tk = nullptr;
+        }
+        ImageParams p;
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        if (tk) {
+            if (!tk->ok) return nullptr;
+            p = tk->params;
+            image = tk->image;
+            memory = tk->memory;
+        } else {
+            auto params = ComputeImageParams(t);
+            if (!params) return nullptr;
+            p = *params;
+            if (!CreateRawImage(p, &image, &memory)) {
+                LogOnce("image", "vkCreateImage/vkAllocateMemory failed for %dx%d format %d", p.width, p.height,
+                        t.tex.format);
+                return nullptr;
+            }
+        }
+        Image img;
+        img.nvn_format = t.tex.format;
+        img.target = t.tex.target;
+        img.addr = t.addr;
+        img.tex = t.tex;
+        img.vk_format = p.vf;
+        img.twin = p.twin;
+        img.width = p.width;
+        img.height = p.height;
+        img.res_scale = p.res_scale;
+        img.mip_skip = p.mip_skip;
+        img.levels = p.levels;
+        img.layers = p.layers;
+        img.depth = p.depth;
+        img.aspect = p.aspect;
+        img.features = p.feats;
+        img.sw_decode_bc = p.sw_decode_bc;
+        img.sw_transcode_astc = p.sw_transcode_astc;
+        img.type = p.type;
+        img.image = image;
+        img.memory = memory;
+        if (img.sw_decode_bc || img.sw_transcode_astc) {
+            // Until Upload() runs, a fresh image's contents are undefined -- on this driver that
+            // showed as a glaring white flash for a frame or more while the first decode catches up.
+            // One clear to a neutral mid-grey (same cost as any other clear this renderer already
+            // issues, nowhere near the cost of the decode itself) makes that gap unobtrusive instead.
+            Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VkClearColorValue grey{{0.5f, 0.5f, 0.5f, 1.0f}};
+            VkImageSubresourceRange range{img.aspect, 0, uint32_t(img.levels), 0, uint32_t(img.layers)};
+            Rec([image = img.image, grey, range](VkCommandBuffer cb) {
+                vkCmdClearColorImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &grey, 1, &range);
+            });
+        }
         if (images_created_++ < 48)
             LOGI(kTag, "image %dx%d%s NVN format %d (target %d, %d levels, %d layers) -> Vulkan format %d", img.width,
-                 img.height, img.depth > 1 ? "x3D" : "", img.nvn_format, img.target, img.levels, img.layers, vf);
+                 img.height, img.depth > 1 ? "x3D" : "", img.nvn_format, img.target, img.levels, img.layers, p.vf);
         return &(images_[t.addr] = img);
     }
 
@@ -1858,8 +2080,67 @@ private:
         return h;
     }
 
+    // Decodes one level's worth of BC1/2/3/7 blocks (already deswizzled into tightly packed rows at
+    // `comp`) into tightly packed RGBA8 texels at `out`. Edge blocks that overhang the level's real
+    // width/height are clipped so `out` never gets written past its width*height*4*depth bytes.
+    static void DecodeBcLevel(int nvn_format, const uint8_t* comp, uint8_t* out, const LevelLayout& l) {
+        const int blocks_x = (l.width + 3) / 4, blocks_y = (l.height + 3) / 4;
+        const size_t bytes_per_block = (nvn_format == 65 || nvn_format == 66 || nvn_format == 69 ||
+                                         nvn_format == 70) ? 8 : 16;  // BC1 blocks are 8 bytes, BC2/3/7 are 16
+        const size_t slice_comp = size_t(l.row_bytes) * l.rows;
+        const size_t out_row = size_t(l.width) * 4;
+        const size_t slice_out = out_row * size_t(l.height);
+        uint8_t tile[4 * 4 * 4];  // one decoded 4x4 RGBA8 block, pitch 16
+        for (int z = 0; z < l.depth; z++) {
+            const uint8_t* cslice = comp + size_t(z) * slice_comp;
+            uint8_t* oslice = out + size_t(z) * slice_out;
+            for (int by = 0; by < blocks_y; by++) {
+                for (int bx = 0; bx < blocks_x; bx++) {
+                    const uint8_t* block = cslice + (size_t(by) * blocks_x + size_t(bx)) * bytes_per_block;
+                    switch (nvn_format) {
+                        case 65: case 66: case 69: case 70: bcdec_bc1(block, tile, 16); break;
+                        case 67: case 71: bcdec_bc2(block, tile, 16); break;
+                        case 68: case 72: bcdec_bc3(block, tile, 16); break;
+                        case 77: case 78: bcdec_bc7(block, tile, 16); break;
+                        default: memset(tile, 0xFF, sizeof(tile)); break;
+                    }
+                    const int px0 = bx * 4, py0 = by * 4;
+                    const int cw = std::min(4, l.width - px0), ch = std::min(4, l.height - py0);
+                    for (int ty = 0; ty < ch; ty++)
+                        memcpy(oslice + size_t(py0 + ty) * out_row + size_t(px0) * 4, tile + size_t(ty) * 16,
+                               size_t(cw) * 4);
+                }
+            }
+        }
+    }
+
     // Fills a sampled texture from game memory: deswizzle each level/layer into the stream, then copy.
     void Upload(Image& img, const TexRef& t) {
+        if (img.sw_transcode_astc && !astc_init_done_.load(std::memory_order_acquire)) {
+            // astcenc still starting up (rare, only right after launch -- see the ctor kickoff).
+            // Don't mark uploaded: GetImage()'s existing !img->uploaded check retries this same
+            // texture next frame, which for UI/font atlases is ~16ms later, not a permanent blank.
+            astc_not_ready_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (img.sw_transcode_astc) {
+            // Mitigation for an on-device SIGSEGV inside the GPU driver (not our code -- PC/LR land in an
+            // unsymbolized library, same fault address across multiple otherwise-unrelated fixes) that
+            // only shows up during a texture-streaming burst (world load): recording many ASTC-format
+            // vkCmdCopyBufferToImage calls for newly-created images back to back, fast, seems to be what
+            // triggers it. Capping how many NEW ASTC images get uploaded per draw list spreads that
+            // burst out over more lists/frames instead -- same safe skip-and-retry as astc_init_done_
+            // above (GetImage()'s !img->uploaded check retries next time this texture is sampled).
+            if (list_counter_ != astc_throttle_list_) {
+                astc_throttle_list_ = list_counter_;
+                astc_uploads_this_list_ = 0;
+            }
+            if (astc_uploads_this_list_ >= kAstcMaxUploadsPerList) {
+                astc_throttled_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            astc_uploads_this_list_++;
+        }
         img.uploaded = true;
         img.cpu_source = true;
         img.sample_hash = SampleHash(t);
@@ -1873,11 +2154,19 @@ private:
             return;
         }
         const FormatInfo fi = GetFormatInfo(t.tex.format);
+        const bool decode = img.sw_decode_bc;
+        const bool transcode_astc = img.sw_transcode_astc;
         size_t needed = 0;
         for (int layer = 0; layer < img.layers; layer++)
             for (int lv = 0; lv < img.levels; lv++) {
-                const LevelLayout& l = layout.levels[size_t(lv)];
-                needed += size_t(l.row_bytes) * l.rows * l.depth + 16;
+                const LevelLayout& l = layout.levels[size_t(lv + img.mip_skip)];
+                // Decoded output is plain RGBA8 texels (4 bytes each), not compressed blocks; ASTC transcode
+                // output is ASTC_6x6 blocks (real compression, smaller than the source BC bytes' row_bytes
+                // most of the time -- see Image::sw_transcode_astc).
+                const size_t n = transcode_astc  ? AstcBlockBytes(l.width, l.height)
+                                  : decode        ? size_t(l.width) * l.height * l.depth * 4
+                                                  : size_t(l.row_bytes) * l.rows * l.depth;
+                needed += n + 16;
             }
         if (needed > kStreamSize - kMaxUniformRange) {
             LogOnce("upload-size", "texture too large to upload in one go (%zu bytes)", needed);
@@ -1887,21 +2176,52 @@ private:
         EndRendering();
         if (StreamRemaining() < needed + 1024) Flush();
         std::vector<VkBufferImageCopy> regions;
+        // The actual byte-shuffling (deswizzle, then BC decode if needed) happens on a worker thread --
+        // only the stream offsets are decided here, synchronously, so `regions` can be built in order.
+        struct LevelJob {
+            const uint8_t* src;
+            uint8_t* dst;
+            LevelLayout l;
+            uint8_t mode;  // 0 copy/deswizzle only, 1 BC->RGBA8 decode, 2 BC->ASTC_6x6 transcode
+        };
+        std::vector<LevelJob> jobs;
         const uint8_t* base = reinterpret_cast<const uint8_t*>(t.addr);
         for (int layer = 0; layer < img.layers; layer++) {
             for (int lv = 0; lv < img.levels; lv++) {
-                const LevelLayout& l = layout.levels[size_t(lv)];
-                const size_t n = size_t(l.row_bytes) * l.rows * l.depth;
-                VkDeviceSize off = StreamAlloc(n, 16);
+                // `layer`/`lv + img.mip_skip` indexes the game's own (unskipped) mip chain; `lv` alone is
+                // the Vulkan image's own (possibly shorter) one -- see ComputeImageParams()'s mip_skip.
+                const LevelLayout& l = layout.levels[size_t(lv + img.mip_skip)];
                 const uint8_t* src = base + size_t(layer) * layout.layer_stride + l.offset;
-                if (layout.linear)
-                    memcpy(stream_ptr_ + off, src, n);
-                else
-                    DeswizzleLevel(stream_ptr_ + off, src, l);
                 VkBufferImageCopy r{};
-                r.bufferOffset = off;
-                r.bufferRowLength = uint32_t(l.row_bytes / fi.bytes_per_block * fi.block_w);
-                r.bufferImageHeight = uint32_t(l.rows * fi.block_h);
+                if (!decode && !transcode_astc) {
+                    const size_t n = size_t(l.row_bytes) * l.rows * l.depth;
+                    VkDeviceSize off = StreamAlloc(n, 16);
+                    jobs.push_back({src, stream_ptr_ + off, l, 0});
+                    r.bufferOffset = off;
+                    r.bufferRowLength = uint32_t(l.row_bytes / fi.bytes_per_block * fi.block_w);
+                    r.bufferImageHeight = uint32_t(l.rows * fi.block_h);
+                } else if (decode) {
+                    const size_t out_n = size_t(l.width) * l.height * l.depth * 4;
+                    VkDeviceSize off = StreamAlloc(out_n, 16);
+                    jobs.push_back({src, stream_ptr_ + off, l, 1});
+                    r.bufferOffset = off;
+                    r.bufferRowLength = uint32_t(l.width);
+                    r.bufferImageHeight = uint32_t(l.height);
+                } else {
+                    const size_t out_n = AstcBlockBytes(l.width, l.height);
+                    VkDeviceSize off = StreamAlloc(out_n, 16);
+                    jobs.push_back({src, stream_ptr_ + off, l, 2});
+                    r.bufferOffset = off;
+                    // For a block-compressed format, bufferRowLength/bufferImageHeight must be a multiple
+                    // of the block dimensions (Vulkan spec) -- not the raw pixel size, which for most
+                    // levels isn't itself a multiple of 6 (e.g. 1024, 342...). AstcBlockBytes() already
+                    // rounds the same way when sizing the buffer; this must match it exactly, or the
+                    // driver computes a stride that doesn't agree with what's actually there and reads
+                    // outside this texture's region -- confirmed on-device as a real SIGSEGV, not a
+                    // theoretical one.
+                    r.bufferRowLength = uint32_t((l.width + kAstcBlock - 1) / kAstcBlock * kAstcBlock);
+                    r.bufferImageHeight = uint32_t((l.height + kAstcBlock - 1) / kAstcBlock * kAstcBlock);
+                }
                 r.imageSubresource = {img.aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT ? img.aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT
                                                                                  : img.aspect,
                                       uint32_t(lv), uint32_t(layer), 1};
@@ -1910,11 +2230,72 @@ private:
                 regions.push_back(r);
             }
         }
-        Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        Rec([regions = std::move(regions), buf = stream_, image = img.image](VkCommandBuffer cb) {
-            vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()),
-                                   regions.data());
+        const bool linear = layout.linear;
+        const int nvn_format = t.tex.format;
+        const bool astc_srgb = img.vk_format == VK_FORMAT_ASTC_4x4_SRGB_BLOCK;
+        QueueUpload(slot_, [this, jobs = std::move(jobs), linear, nvn_format, astc_srgb] {
+            for (const LevelJob& j : jobs) {
+                if (j.mode == 0) {
+                    if (linear)
+                        memcpy(j.dst, j.src, size_t(j.l.row_bytes) * j.l.rows * j.l.depth);
+                    else
+                        DeswizzleLevel(j.dst, j.src, j.l);
+                    continue;
+                }
+                // Get the raw BC blocks into a scratch buffer first (same deswizzle as always), then
+                // decode them block-by-block into plain RGBA8 texels.
+                const size_t comp_n = size_t(j.l.row_bytes) * j.l.rows * j.l.depth;
+                std::vector<uint8_t> bc_scratch(comp_n);
+                if (linear)
+                    memcpy(bc_scratch.data(), j.src, comp_n);
+                else
+                    DeswizzleLevel(bc_scratch.data(), j.src, j.l);
+                if (j.mode == 1) {
+                    DecodeBcLevel(nvn_format, bc_scratch.data(), j.dst, j.l);
+                    continue;
+                }
+                // mode 2: decode to a local RGBA8 buffer, then re-encode that to ASTC_6x6 (cached to disk
+                // by content -- see EncodeAstc6x6()) instead of uploading the decoded bytes directly.
+                std::vector<uint8_t> rgba(size_t(j.l.width) * j.l.height * j.l.depth * 4);
+                DecodeBcLevel(nvn_format, bc_scratch.data(), rgba.data(), j.l);
+                std::vector<uint8_t> astc;
+                if (EncodeAstc6x6(rgba.data(), j.l.width, j.l.height, astc_srgb, &astc))
+                    memcpy(j.dst, astc.data(), astc.size());
+                else
+                    memset(j.dst, 0, AstcBlockBytes(j.l.width, j.l.height));  // ASTC unavailable: blank, not garbage
+            }
         });
+        Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        // ASTC: one vkCmdCopyBufferToImage call per level/layer instead of batching every region into one
+        // call. Diagnostic split while root-causing the on-device SIGSEGV inside the driver during this
+        // exact call for large multi-level ASTC textures (same crash PC every time, survived a real,
+        // confirmed-correct bufferRowLength/bufferImageHeight fix) -- multi-region compressed-format
+        // copies are a known class of driver bug on some Mali/driver versions; this not fixing it rules
+        // that specific theory out rather than leaving it unconfirmed. Native BC/RGBA8 paths (proven
+        // stable for hours before ASTC existed) are untouched -- still one batched call, as before.
+        if (transcode_astc) {
+            const int dbg_w = img.width, dbg_h = img.height, dbg_levels = img.levels;
+            Rec([regions = std::move(regions), buf = stream_, image = img.image, dbg_w, dbg_h,
+                 dbg_levels](VkCommandBuffer cb) {
+                // Debug-only (astc_transcode is off by default): this is the exact call that crashed
+                // on-device every time so far -- logged right before it runs, flushed before any crash,
+                // so the next repro gives us the real failing parameters instead of guessing from
+                // whatever log line happened to be last.
+                LOGI(kTag, "astc copy: image %dx%d, %d levels, %zu regions (first: %dx%d+%d,%d rowLen=%u imgH=%u "
+                     "off=%llu)",
+                     dbg_w, dbg_h, dbg_levels, regions.size(), regions[0].imageExtent.width,
+                     regions[0].imageExtent.height, regions[0].imageOffset.x, regions[0].imageOffset.y,
+                     regions[0].bufferRowLength, regions[0].bufferImageHeight,
+                     (unsigned long long)regions[0].bufferOffset);
+                for (const VkBufferImageCopy& r : regions)
+                    vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+            });
+        } else {
+            Rec([regions = std::move(regions), buf = stream_, image = img.image](VkCommandBuffer cb) {
+                vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()),
+                                       regions.data());
+            });
+        }
         img.written = true;
         uploads_++;
         if (img.width == 256 && img.height == 1 && fi.bytes_per_block == 16 && GuestRangeValid(t.addr, 4096)) {
@@ -2000,8 +2381,10 @@ private:
                 break;
             default: type = array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D; break;
         }
-        // A texture view registered with the texture picks the first level/layer (and counts).
-        const uint32_t base_level = ref ? SubLevel(img, ref->level) : 0;
+        // A texture view registered with the texture picks the first level/layer (and counts). `ref->level`
+        // is in the game's own (unskipped) numbering; img.mip_skip levels of it were never allocated, so
+        // shift down by that many before clamping into what the Vulkan image actually has.
+        const uint32_t base_level = ref ? SubLevel(img, ref->level - img.mip_skip) : 0;
         uint32_t levels = uint32_t(img.levels) - base_level;
         if (ref && ref->view_levels > 0) levels = std::min<uint32_t>(levels, uint32_t(ref->view_levels));
         uint32_t base_layer = 0;
@@ -2059,7 +2442,8 @@ private:
         ci.maxLod = (s.min_filter <= 1) ? 0.25f : std::max(ci.minLod, std::min(s.lod_max, 16.0f));
         if (filterable && features_.samplerAnisotropy && s.max_anisotropy > 1.0f) {
             ci.anisotropyEnable = VK_TRUE;
-            ci.maxAnisotropy = std::min(s.max_anisotropy, props_.limits.maxSamplerAnisotropy);
+            ci.maxAnisotropy = std::min({s.max_anisotropy, props_.limits.maxSamplerAnisotropy,
+                                         dsr::GetRuntime().config.max_anisotropy});
         }
         if (shadow) {
             ci.compareEnable = VK_TRUE;
@@ -2359,6 +2743,10 @@ private:
     // Recorder: ends slot i's command buffer and submits it (its fence always gets signalled).
     void SubmitSlot(int i, VkSemaphore wait, VkSemaphore signal) {
         Slot& sl = slots_[i];
+        // Any Upload() for this slot that farmed its deswizzle/decode out to upload_workers_ must have
+        // landed in the stream buffer before the GPU is told to read it.
+        for (int n = 0; sl.pending_uploads.load(std::memory_order_acquire) != 0; n++)
+            (n & 1023) == 1023 ? std::this_thread::yield() : CpuRelax();
         if (sl.ts) vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sl.ts, 1);
         vkEndCommandBuffer(cmd_);
         VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -2490,9 +2878,29 @@ private:
         ReapRetired();
     }
 
+    // Stages that use an image in `layout`. A layout transition only has to hold back THESE stages of the
+    // commands after it (the destination scope), not ALL_COMMANDS: on a tile-based GPU (Mali) a barrier
+    // whose destination includes the vertex stage makes the next pass's vertex/tiler work wait for the
+    // previous pass's fragment work, which is what lets the two overlap otherwise. (Source stays
+    // ALL_COMMANDS: every writer is still waited for, so this only narrows what waits, never what's safe.)
+    static VkPipelineStageFlags StagesUsing(VkImageLayout layout) {
+        switch (layout) {
+            case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: return VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+                return VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+            case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+            case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: return VK_PIPELINE_STAGE_TRANSFER_BIT;
+            case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+                return VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            default: return VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        }
+    }
     void RawBarrier(VkImage image, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to,
                     uint32_t levels = 1, uint32_t layers = 1) {
         barriers_++;
+        const VkPipelineStageFlags dst_stages =
+            dsr::GetRuntime().config.mali_barriers ? StagesUsing(to) : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -2502,9 +2910,8 @@ private:
         b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.image = image;
         b.subresourceRange = {aspect, 0, levels, 0, layers};
-        Rec([b](VkCommandBuffer cb) {
-            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
-                                 nullptr, 1, &b);
+        Rec([b, dst_stages](VkCommandBuffer cb) {
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, dst_stages, 0, 0, nullptr, 0, nullptr, 1, &b);
         });
     }
     void Transition(Image& img, VkImageLayout to) {
@@ -3302,6 +3709,25 @@ private:
         bool dynamic;
         uint32_t dyn_offset;
     };
+    // Per-(shader stage, texture slot) memo of the last resolved view/samplers -- see the "textures" phase
+    // in Draw(). Reset once per list (tex_slot_cache_list_), not invalidated any other way: the Image*
+    // it stores is only ever compared against a freshly-resolved one from this same call, never read back
+    // across a GetImage() call that was skipped, so it can't go stale.
+    struct SlotTexCache {
+        const Image* img = nullptr;
+        shader::TexDim dim = shader::TexDim::None;
+        bool array_flag = false;
+        uint8_t swz[4] = {};
+        bool has_ref = false;
+        TexRef ref;
+        VkImageView view = VK_NULL_HANDLE;
+        bool have_plain = false, have_shadow = false;
+        SamplerObj plain_src, shadow_src;
+        bool plain_filterable = false, shadow_filterable = false;
+        VkSampler plain_sampler = VK_NULL_HANDLE, shadow_sampler = VK_NULL_HANDLE;
+    };
+    SlotTexCache tex_slot_cache_[2][32];
+    uint64_t tex_slot_cache_list_ = ~0ull;
     std::vector<TexWrite> scratch_tex_writes_;
     std::vector<UboWrite> scratch_ubo_writes_;
     std::vector<Image*> scratch_colors_;
@@ -3380,6 +3806,17 @@ private:
         // ---- textures (uploads and layout changes happen outside rendering) ---------------------------------
         std::vector<TexWrite>& tex_writes = scratch_tex_writes_;  // members: no allocation per draw
         tex_writes.clear();
+        // Static geometry keeps rebinding the same texture+sampler to the same (stage, slot) draw after
+        // draw within a list (a world mesh's material doesn't change between its own triangles); skip
+        // SampledView()/Sampler()'s hash+lookup below when every input is byte-identical to last time for
+        // that slot. Reset once per list, not per draw -- see Upload()'s astc_throttle_list_ for the same
+        // pattern. Images themselves are NEVER cached here: GetImage() below always runs fresh, so its own
+        // FindImage() keeps catching "this address now holds a different texture" exactly as before.
+        if (tex_slot_cache_list_ != list_counter_) {
+            for (auto& row : tex_slot_cache_)
+                for (SlotTexCache& c : row) c = SlotTexCache{};
+            tex_slot_cache_list_ = list_counter_;
+        }
         for (int stage = 0; stage < 2; stage++) {
             const shader::ShaderInfo& info = stage == 0 ? vs->info : fs->info;
             for (uint32_t slot = 0; slot < 32; slot++) {
@@ -3442,36 +3879,78 @@ private:
                     }
                     draw_images_.push_back({int(stage), int(slot), img});
                 }
-                VkImageView view = SampledView(*img, info.texture_dim[slot], info.texture_array[slot], swz,
-                                               bt.valid ? &bt.texture : nullptr);
-                if (!view) {
-                    char k[160];
-                    snprintf(k, sizeof(k), "view: shader %s%d dim %d array %d | image type %d %dx%dx%d layers %d fmt %d",
-                             stage ? "fs" : "vs", int(slot), int(info.texture_dim[slot]), int(info.texture_array[slot]),
-                             int(img->type), img->width, img->height, img->depth, img->layers, img->nvn_format);
-                    if (view_mismatch_logged_.size() < 16 && view_mismatch_logged_.insert(k).second)
-                        LOGW(kTag, "texture view does not match the shader: %s (target %d, view layers %d, layer %d)", k,
-                             bt.texture.tex.target, bt.texture.view_layers, bt.texture.layer);
-                    // The game binds a placeholder of another dimension (a 16x16 black 2D texture where the shader
-                    // samples a cube map); the hardware samples it anyway. A black stand-in of the right dimension
-                    // keeps the draw (it was skipped: objects went missing).
-                    img = Fallback(info.texture_dim[slot], info.texture_array[slot], true);
-                    if (img && img->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-                        EndRendering();
-                        Transition(*img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                SlotTexCache& slot_cache = tex_slot_cache_[stage][slot];
+                const bool ref_matches = slot_cache.has_ref == bt.valid &&
+                                         (!bt.valid || memcmp(&slot_cache.ref, &bt.texture, sizeof(TexRef)) == 0);
+                const bool view_hit = slot_cache.img == img && slot_cache.dim == info.texture_dim[slot] &&
+                                      slot_cache.array_flag == info.texture_array[slot] &&
+                                      memcmp(slot_cache.swz, swz, 4) == 0 && ref_matches;
+                VkImageView view;
+                if (view_hit) {
+                    view = slot_cache.view;
+                } else {
+                    view = SampledView(*img, info.texture_dim[slot], info.texture_array[slot], swz,
+                                       bt.valid ? &bt.texture : nullptr);
+                    if (!view) {
+                        char k[160];
+                        snprintf(k, sizeof(k), "view: shader %s%d dim %d array %d | image type %d %dx%dx%d layers %d fmt %d",
+                                 stage ? "fs" : "vs", int(slot), int(info.texture_dim[slot]), int(info.texture_array[slot]),
+                                 int(img->type), img->width, img->height, img->depth, img->layers, img->nvn_format);
+                        if (view_mismatch_logged_.size() < 16 && view_mismatch_logged_.insert(k).second)
+                            LOGW(kTag, "texture view does not match the shader: %s (target %d, view layers %d, layer %d)", k,
+                                 bt.texture.tex.target, bt.texture.view_layers, bt.texture.layer);
+                        // The game binds a placeholder of another dimension (a 16x16 black 2D texture where the shader
+                        // samples a cube map); the hardware samples it anyway. A black stand-in of the right dimension
+                        // keeps the draw (it was skipped: objects went missing).
+                        img = Fallback(info.texture_dim[slot], info.texture_array[slot], true);
+                        if (img && img->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+                            EndRendering();
+                            Transition(*img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        }
+                        view = img ? SampledView(*img, info.texture_dim[slot], info.texture_array[slot], swz, nullptr) : VK_NULL_HANDLE;
+                        if (!view) return Skip("texture view does not match the shader");
+                        view_standins_++;
                     }
-                    view = img ? SampledView(*img, info.texture_dim[slot], info.texture_array[slot], swz, nullptr) : VK_NULL_HANDLE;
-                    if (!view) return Skip("texture view does not match the shader");
-                    view_standins_++;
+                    slot_cache.img = img;
+                    slot_cache.dim = info.texture_dim[slot];
+                    slot_cache.array_flag = info.texture_array[slot];
+                    memcpy(slot_cache.swz, swz, 4);
+                    slot_cache.has_ref = bt.valid;
+                    if (bt.valid) slot_cache.ref = bt.texture;
+                    slot_cache.view = view;
+                    // A changed view invalidates any previously cached samplers too: Filterable(*img) can
+                    // differ for a new img, and the cache's plain/shadow state might belong to the image
+                    // Fallback() just replaced above.
+                    slot_cache.have_plain = slot_cache.have_shadow = false;
                 }
-                if (plain)
-                    tex_writes.push_back({uint32_t(stage), 32 + slot,
-                                          {Sampler(bt.sampler, false, Filterable(*img)), view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
-                if (shadow)
-                    tex_writes.push_back({uint32_t(stage), 64 + slot,  // point-sampled: the shader filters (2x2 PCF)
-                                          {Sampler(bt.sampler, true, info.texture_dim[slot] != shader::TexDim::D2 &&
-                                                                         Filterable(*img)),
-                                           view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+                if (plain) {
+                    const bool filt = Filterable(*img);
+                    VkSampler smp;
+                    if (view_hit && slot_cache.have_plain && slot_cache.plain_src == bt.sampler && slot_cache.plain_filterable == filt) {
+                        smp = slot_cache.plain_sampler;
+                    } else {
+                        smp = Sampler(bt.sampler, false, filt);
+                        slot_cache.have_plain = true;
+                        slot_cache.plain_src = bt.sampler;
+                        slot_cache.plain_filterable = filt;
+                        slot_cache.plain_sampler = smp;
+                    }
+                    tex_writes.push_back({uint32_t(stage), 32 + slot, {smp, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+                }
+                if (shadow) {  // point-sampled: the shader filters (2x2 PCF)
+                    const bool filt = info.texture_dim[slot] != shader::TexDim::D2 && Filterable(*img);
+                    VkSampler smp;
+                    if (view_hit && slot_cache.have_shadow && slot_cache.shadow_src == bt.sampler && slot_cache.shadow_filterable == filt) {
+                        smp = slot_cache.shadow_sampler;
+                    } else {
+                        smp = Sampler(bt.sampler, true, filt);
+                        slot_cache.have_shadow = true;
+                        slot_cache.shadow_src = bt.sampler;
+                        slot_cache.shadow_filterable = filt;
+                        slot_cache.shadow_sampler = smp;
+                    }
+                    tex_writes.push_back({uint32_t(stage), 64 + slot, {smp, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+                }
             }
         }
 
@@ -3810,7 +4289,7 @@ private:
         d.layout = layout;
         d.set_layouts[0] = vsl;
         d.set_layouts[1] = fsl;
-        DynamicState(extent, modes, &d.dyn);
+        DynamicState(extent, modes, depth, colors.empty() ? nullptr : colors[0], &d.dyn);
         d.push[0] = st_.alpha_ref;
         d.indexed = use_indices;
         d.index_buf = fast ? index_buf : stream_;
@@ -4140,7 +4619,8 @@ private:
     }
 
     // Viewport, scissor, blend constants and stencil values of the draw (render thread).
-    void DynamicState(VkExtent2D extent, const DeviceModes& modes, DynState* out) {
+    void DynamicState(VkExtent2D extent, const DeviceModes& modes, const Image* depth, const Image* color0,
+                       DynState* out) {
         // Y direction. In NVN's upper-left origin mode (Direct3D style), clip-space +Y is the top of the target
         // (row 0); in Vulkan it is the bottom. A negative-height viewport makes the two agree, so images land in
         // memory the way the game expects, and front faces keep their winding as seen on screen. Without it,
@@ -4155,6 +4635,18 @@ private:
             vy = st_.viewport[1];
             vw = st_.viewport[2];
             vh = st_.viewport[3];
+            // The game set this viewport assuming its own (larger) idea of the target's size; without
+            // rescaling, NDC would only map onto one corner of the real (smaller) image. depth and color0
+            // are never both downscaled at once in practice (shadow-map vs. window-frame scaling are
+            // mutually exclusive targets), so whichever one is set here is the one that applies.
+            const float rs = (depth && depth->res_scale != 1.0f) ? depth->res_scale
+                              : (color0 && color0->res_scale != 1.0f) ? color0->res_scale : 1.0f;
+            if (rs != 1.0f) {
+                vx *= rs;
+                vy *= rs;
+                vw *= rs;
+                vh *= rs;
+            }
         }
         // Logged while few have been seen (the game uses ~10, so a cap alone kept this running on every draw:
         // ~6% of the render thread formatting floats).
@@ -4298,6 +4790,299 @@ private:
         if (j.result != VK_SUCCESS) j.pipeline = VK_NULL_HANDLE;
         j.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         j.done.store(true, std::memory_order_release);
+    }
+
+    // Background texture deswizzle/decode: a zone load needs hundreds of textures realised at once (see
+    // Upload()), and doing that one at a time on whichever thread is recording left every other CPU core
+    // idle during the stall. Jobs write into their slot's already-reserved stream-buffer offsets (disjoint
+    // ranges, no locking needed for the writes themselves); SubmitSlot() waits for a slot's count to reach
+    // zero before submitting, so nothing races the GPU reading that buffer.
+    std::mutex upload_mutex_;
+    std::condition_variable upload_cv_;
+    std::deque<std::function<void()>> upload_queue_;
+    std::vector<std::thread> upload_workers_;
+    // Shared with the early astcenc_context_alloc() kickoff in EnsureDevice() -- both need to agree on the
+    // same thread count (the context is sized once, up front, for exactly this many concurrent callers).
+    static int UploadWorkerCount() {
+        const unsigned hw = std::thread::hardware_concurrency();
+        // During the bursts this pool exists for, the game/render/recorder threads are usually themselves
+        // stalled waiting on it rather than doing useful work, so there's less reason to reserve cores for
+        // them than the name of this comment used to suggest.
+        return std::clamp(int(hw) - 1, 1, 6);
+    }
+    void StartUploadWorkers() {
+        if (!upload_workers_.empty()) return;
+        const int n = UploadWorkerCount();
+        for (int i = 0; i < n; i++)
+            upload_workers_.emplace_back([this, i] {
+                g_upload_worker_index = i;
+                for (;;) {
+                    std::function<void()> job;
+                    {
+                        std::unique_lock<std::mutex> lk(upload_mutex_);
+                        upload_cv_.wait(lk, [&] { return !upload_queue_.empty(); });
+                        job = std::move(upload_queue_.front());
+                        upload_queue_.pop_front();
+                    }
+                    job();
+                }
+            });
+        for (auto& t : upload_workers_) t.detach();
+    }
+    // Puts `job` on the shared pool with no slot bookkeeping (see QueueUpload() / PrefetchImage() for the
+    // two things that actually use it).
+    void QueueJob(std::function<void()> job) {
+        StartUploadWorkers();
+        std::lock_guard<std::mutex> lk(upload_mutex_);
+        upload_queue_.push_back(std::move(job));
+        upload_cv_.notify_one();
+    }
+    // Queues `job` (the actual deswizzle/decode byte-writing for one texture) against slot `i`.
+    void QueueUpload(int i, std::function<void()> job) {
+        slots_[i].pending_uploads.fetch_add(1, std::memory_order_relaxed);
+        Slot* sl = &slots_[i];
+        QueueJob([sl, job = std::move(job)] {
+            job();
+            sl->pending_uploads.fetch_sub(1, std::memory_order_release);
+        });
+    }
+
+    // ---- ASTC transcode (see Image::sw_transcode_astc) ---------------------------------------------------
+    // One context per colour profile (astcenc bakes sRGB vs. linear into the context, not the call), sized
+    // to upload_workers_'s thread count so each worker can call astcenc_compress_image() concurrently with
+    // its own g_upload_worker_index as the required thread_index.
+    // Written once under astc_init_mutex_ by whichever thread finishes StartAstcEncoder() (now kicked off
+    // early from EnsureDevice(), not lazily from the recorder thread -- see there), read without the mutex
+    // by every upload worker that reaches EncodeAstc6x6(): atomic so a worker on another core is
+    // guaranteed to see the written pointer once it's set, not a stale/torn value.
+    std::atomic<astcenc_context*> astc_ctx_unorm_{nullptr};
+    std::atomic<astcenc_context*> astc_ctx_srgb_{nullptr};
+    std::mutex astc_init_mutex_;
+    // Updated from upload_workers_ threads (EncodeAstc6x6()), reported/reset every 10 s alongside the
+    // other upload stats (see the "last 10 s" report) -- so cache effectiveness and encode cost are
+    // visible without needing a separate debug build.
+    std::atomic<uint64_t> astc_cache_hits_{0}, astc_encoded_{0}, astc_failed_{0};
+    std::atomic<uint64_t> astc_not_ready_{0};  // Upload() skipped this frame, astcenc still starting up
+    // Only ever touched from Upload(), which only ever runs on the recorder thread -- plain ints, like
+    // list_counter_ itself, not atomics (see the throttle in Upload()). Was 4 while chasing an on-device
+    // SIGSEGV at ASTC_6x6 -- during a real world-load burst that throttled 15191 of ~17000 upload
+    // attempts in one 10 s window, which is why the world stayed untextured (grey placeholder) for a
+    // visible stretch: not a texture bug, a self-inflicted backlog. Switching the block size to 4x4
+    // apparently fixed the crash outright (clean run, no SIGSEGV), so this is just a generous safety
+    // margin now, not the primary mitigation -- raise or drop entirely if 4x4 keeps proving stable.
+    static constexpr int kAstcMaxUploadsPerList = 64;
+    uint64_t astc_throttle_list_ = 0;
+    int astc_uploads_this_list_ = 0;
+    std::atomic<uint64_t> astc_throttled_{0};  // Upload() skipped this frame, per-list ASTC cap hit
+    std::atomic<uint64_t> astc_encode_us_{0};       // total microseconds actually inside astcenc_compress_image
+    std::atomic<int64_t> astc_bytes_saved_{0};      // vs. the RGBA8 this would otherwise have uploaded
+    // 4x4 (8.0 bits/pixel, vs 6x6's 3.56): testing whether the on-device Mali driver SIGSEGV (same PC/LR
+    // every crash, reproducible within a minute of launch) is specific to the less-common 6x6 block size
+    // or an ASTC-wide defect -- 4x4 is the overwhelmingly most used/best-tested size on Android drivers.
+    static constexpr unsigned kAstcBlock = 4;
+    // Bumped whenever the preset passed to astcenc_config_init() changes (see StartAstcEncoder()), so a
+    // preset change can't silently keep serving bytes encoded under the old preset from disk cache --
+    // this bit the "try MEDIUM instead of FASTEST" test, where stale FASTEST-encoded files kept being
+    // reused for already-seen textures while only newly-seen ones got the new preset.
+    static constexpr const char* kAstcPresetTag = "fastest";
+    // Set once StartAstcEncoder() has made its one attempt (success or failure both count, see
+    // EncodeAstc6x6()): lets a worker tell "still starting up, wait" apart from "tried and it doesn't
+    // work here, stop waiting and fall back now."
+    std::atomic<bool> astc_init_done_{false};
+    void StartAstcEncoder(int thread_count) {
+        std::lock_guard<std::mutex> lk(astc_init_mutex_);
+        if (astc_init_done_.load(std::memory_order_relaxed)) return;
+        for (int srgb = 0; srgb < 2; srgb++) {
+            astcenc_config cfg{};
+            // FASTEST was byte-perfect on astcenc's own CPU decoder (see the standalone roundtrip test),
+            // so the black-screen/missing-UI bug was never the encode bitstream. MEDIUM was tried as a
+            // probe for a Mali hardware-decode mode sensitivity and ruled out differently than expected:
+            // it made a real texture (the 2048x1024 credit/logo image) take ~2.9 SECONDS to encode on
+            // this phone's CPU, which stalls that upload slot's whole frame submission (QueueUpload
+            // blocks on it) -- that alone explains "black screen for the credit screen's full duration",
+            // no hardware-decode bug required. Back to FASTEST (332 ms worst case seen, not 2900+ ms);
+            // the real fix for big textures is the pixel-count cutoff in ComputeImageParams(), which
+            // routes anything large enough to matter straight to RGBA8 instead of paying any encode cost.
+            astcenc_error e = astcenc_config_init(srgb ? ASTCENC_PRF_LDR_SRGB : ASTCENC_PRF_LDR, kAstcBlock, kAstcBlock,
+                                                   1, ASTCENC_PRE_FASTEST, 0, &cfg);
+            astcenc_context* ctx = nullptr;
+            if (e == ASTCENC_SUCCESS)
+                e = astcenc_context_alloc(&cfg, size_t(thread_count), &ctx, nullptr);
+            if (e != ASTCENC_SUCCESS) {
+                LOGW(kTag, "astcenc_context_alloc (%s) failed: %d -- ASTC transcode disabled, falling back to RGBA8",
+                     srgb ? "sRGB" : "linear", int(e));
+                continue;
+            }
+            (srgb ? astc_ctx_srgb_ : astc_ctx_unorm_).store(ctx, std::memory_order_relaxed);
+        }
+        astc_init_done_.store(true, std::memory_order_release);
+    }
+    static size_t AstcBlockBytes(int w, int h) {
+        return size_t((w + kAstcBlock - 1) / kAstcBlock) * size_t((h + kAstcBlock - 1) / kAstcBlock) * 16;
+    }
+    // Disk cache path for one level's worth of already-encoded ASTC bytes, keyed by the exact bytes being
+    // transcoded (content-addressed: a game texture's storage address gets reused for different textures
+    // as it streams, so the address itself is not a stable key -- see FindImage()'s same concern).
+    std::string AstcCachePath(const uint8_t* rgba, size_t rgba_bytes, int w, int h) {
+        const std::string& dir = dsr::GetRuntime().config.cache_dir;
+        if (dir.empty()) return {};
+        uint64_t h64 = 1469598103934665603ull;
+        for (size_t i = 0; i < rgba_bytes; i++) h64 = (h64 ^ rgba[i]) * 1099511628211ull;
+        char name[80];
+        snprintf(name, sizeof(name), "/astc%ux%u_%s_%dx%d_%016llx.bin", kAstcBlock, kAstcBlock, kAstcPresetTag, w, h,
+                 (unsigned long long)h64);
+        return dir + "/astc" + name;
+    }
+    // Encodes one level's RGBA8 pixels to ASTC_6x6 into `out` (resized to fit), using the disk cache if
+    // this exact content was already transcoded (by this run or an earlier one). False if ASTC isn't
+    // available on this device at all (StartAstcEncoder failed) -- caller falls back to plain RGBA8.
+    bool EncodeAstc6x6(const uint8_t* rgba, int w, int h, bool srgb, std::vector<uint8_t>* out) {
+        // Waiting here (tried first) only moves the stall from the recorder thread to an upload worker --
+        // SubmitSlot() still blocks on pending_uploads either way, so the freeze came right back. Never
+        // block on astcenc readiness at all: if it's not done yet, this is exactly an encode failure
+        // (blank this one texture, same as any other -- see below). EnsureDevice()'s early kickoff makes
+        // this rare and brief; the disk cache means the *next* time this exact texture is touched -- a
+        // UI/font element gets touched constantly -- astcenc is certainly ready by then, so it self-heals
+        // within a frame or two instead of a multi-second freeze.
+        if (!astc_init_done_.load(std::memory_order_acquire)) return false;
+        astcenc_context* ctx = (srgb ? astc_ctx_srgb_ : astc_ctx_unorm_).load(std::memory_order_relaxed);
+        if (!ctx) return false;
+        const size_t rgba_bytes = size_t(w) * h * 4;
+        const size_t astc_bytes = AstcBlockBytes(w, h);
+        out->resize(astc_bytes);
+        const std::string cache = AstcCachePath(rgba, rgba_bytes, w, h);
+        if (!cache.empty()) {
+            if (FILE* f = fopen(cache.c_str(), "rb")) {
+                const size_t n = fread(out->data(), 1, astc_bytes, f);
+                fclose(f);
+                if (n == astc_bytes) {
+                    astc_cache_hits_.fetch_add(1, std::memory_order_relaxed);
+                    astc_bytes_saved_.fetch_add(int64_t(rgba_bytes) - int64_t(astc_bytes), std::memory_order_relaxed);
+                    return true;  // short read: stale/partial file, fall through and re-encode
+                }
+            }
+        }
+        astcenc_image img{};
+        img.dim_x = unsigned(w);
+        img.dim_y = unsigned(h);
+        img.dim_z = 1;
+        img.data_type = ASTCENC_TYPE_U8;
+        void* slices[1] = {const_cast<uint8_t*>(rgba)};
+        img.data = slices;
+        astcenc_swizzle swz{ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A};
+        const auto t0 = std::chrono::steady_clock::now();
+        const astcenc_error e =
+            astcenc_compress_image(ctx, &img, &swz, out->data(), astc_bytes, size_t(g_upload_worker_index));
+        astc_encode_us_.fetch_add(
+            uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count()),
+            std::memory_order_relaxed);
+        if (e != ASTCENC_SUCCESS) {
+            astc_failed_.fetch_add(1, std::memory_order_relaxed);
+            LogOnce("astc", "astcenc_compress_image failed: %d", int(e));
+            return false;
+        }
+        astc_encoded_.fetch_add(1, std::memory_order_relaxed);
+        astc_bytes_saved_.fetch_add(int64_t(rgba_bytes) - int64_t(astc_bytes), std::memory_order_relaxed);
+        if (!cache.empty()) {
+            // Off the upload path entirely: this job is gated behind SubmitSlot()'s pending_uploads
+            // spin-wait (see QueueUpload()), so anything synchronous here stalls the whole render
+            // pipeline for as long as the write takes -- which on Android storage is not bounded to
+            // milliseconds. Same lesson SavePipelineCache() already learned (see its own comment) for
+            // exactly this reason. `out` is already filled and returned to the caller for upload
+            // immediately; the disk write is best-effort and never blocks that. QueueJob (not
+            // QueueUpload): a burst can have hundreds of these at once, and QueueJob reuses the fixed-size
+            // upload_workers_ pool instead of spawning a raw thread per texture; it also never touches
+            // pending_uploads, so queueing it here can't create the same stall through a different door.
+            QueueJob([cache, bytes = *out] {
+                if (FILE* f = fopen((cache + ".tmp").c_str(), "wb")) {
+                    fwrite(bytes.data(), 1, bytes.size(), f);
+                    fclose(f);
+                    rename((cache + ".tmp").c_str(), cache.c_str());  // atomic: a half-written file never gets read
+                }
+            });
+        }
+        return true;
+    }
+
+    // ---- prefetch: creating the raw Vulkan image/memory for brand-new textures off the recorder thread --
+    // (see Execute()'s scan and CreateImage()). `images_` itself is still touched only by the recorder
+    // thread -- a ticket carries just the device-level objects and the params used to build them, nothing
+    // that aliases the shared image cache, so no new locking is needed there.
+    struct PrefetchTicket {
+        std::atomic<bool> done{false};
+        bool ok = false;
+        TextureState tex;  // exactly what the ticket was built for -- see CreateImage()'s use of it
+        ImageParams params;
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+    };
+    std::mutex prefetch_mutex_;
+    std::unordered_map<uint64_t, std::shared_ptr<PrefetchTicket>> prefetch_tickets_;
+    void PrefetchImage(const TexRef& t) {
+        auto params = ComputeImageParams(t);
+        if (!params) return;
+        auto tk = std::make_shared<PrefetchTicket>();
+        tk->tex = t.tex;
+        tk->params = *params;
+        {
+            std::lock_guard<std::mutex> lk(prefetch_mutex_);
+            prefetch_tickets_[t.addr] = tk;
+        }
+        QueueJob([this, tk] {
+            tk->ok = CreateRawImage(tk->params, &tk->image, &tk->memory);
+            tk->done.store(true, std::memory_order_release);
+        });
+    }
+    // Claims and waits for addr's ticket, if any (erasing it either way: a ticket is only ever good for the
+    // list it was scanned in). nullptr if there wasn't one.
+    std::shared_ptr<PrefetchTicket> TakePrefetchTicket(uint64_t addr) {
+        std::shared_ptr<PrefetchTicket> tk;
+        {
+            std::lock_guard<std::mutex> lk(prefetch_mutex_);
+            auto it = prefetch_tickets_.find(addr);
+            if (it == prefetch_tickets_.end()) return nullptr;
+            tk = std::move(it->second);
+            prefetch_tickets_.erase(it);
+        }
+        for (int n = 0; !tk->done.load(std::memory_order_acquire); n++)
+            (n & 1023) == 1023 ? std::this_thread::yield() : CpuRelax();
+        return tk;
+    }
+    // Scans a freshly-recorded list for textures not yet created and starts them now, off-thread, so that
+    // by the time the (single-threaded, unchanged) execution pass actually reaches each one in CreateImage(),
+    // the slow part -- vkCreateImage/vkAllocateMemory/vkBindImageMemory -- is already done or in flight.
+    // Only sampled textures (BindTextures) are covered: render targets are few and mostly reused frame to
+    // frame, so they are not where a zone load's hundreds of brand-new textures show up.
+    void PrefetchNewTextures(const CmdList& cmds) {
+        std::unordered_set<uint64_t> seen;
+        for (const Cmd& c : cmds) {
+            if (c.type != CmdType::BindTextures) continue;
+            for (const BoundTexture& bt : Items<BoundTexture>(c)) {
+                const TexRef& t = bt.texture;
+                if (!t.valid || t.tex.width <= 0 || t.tex.height <= 0) continue;
+                if (!seen.insert(t.addr).second) continue;
+                if (images_.count(t.addr)) continue;  // already resident: nothing to do
+                PrefetchImage(t);
+            }
+        }
+    }
+    // Waits out and destroys any ticket this list's execution never claimed (a texture that was bound but
+    // whose draw never actually sampled it, or didn't run) -- tickets don't carry over to the next list.
+    void DropUnclaimedPrefetches() {
+        std::unordered_map<uint64_t, std::shared_ptr<PrefetchTicket>> leftover;
+        {
+            std::lock_guard<std::mutex> lk(prefetch_mutex_);
+            if (prefetch_tickets_.empty()) return;
+            leftover.swap(prefetch_tickets_);
+        }
+        for (auto& [addr, tk] : leftover) {
+            for (int n = 0; !tk->done.load(std::memory_order_acquire); n++)
+                (n & 1023) == 1023 ? std::this_thread::yield() : CpuRelax();
+            if (tk->ok) {
+                vkDestroyImage(device_, tk->image, nullptr);
+                vkFreeMemory(device_, tk->memory, nullptr);
+            }
+        }
     }
 
     // Background compilers: a few threads taking jobs in order.
@@ -4920,6 +5705,22 @@ private:
         gpu_busy_ms_ = 0;
         stat_lists_ = list_counter_;
         prehash_used_ = prehash_inline_ = 0;
+        if (astc_ctx_unorm_ || astc_ctx_srgb_) {
+            const uint64_t hits = astc_cache_hits_.exchange(0, std::memory_order_relaxed);
+            const uint64_t enc = astc_encoded_.exchange(0, std::memory_order_relaxed);
+            const uint64_t failed = astc_failed_.exchange(0, std::memory_order_relaxed);
+            const uint64_t us = astc_encode_us_.exchange(0, std::memory_order_relaxed);
+            const int64_t saved = astc_bytes_saved_.exchange(0, std::memory_order_relaxed);
+            const uint64_t not_ready = astc_not_ready_.exchange(0, std::memory_order_relaxed);
+            const uint64_t throttled = astc_throttled_.exchange(0, std::memory_order_relaxed);
+            if (hits || enc || failed || not_ready || throttled)
+                LOGI(kTag, "ASTC transcode (last 10 s): %llu from cache, %llu freshly encoded (%.1f ms total, %.2f ms "
+                     "each), %llu failed (uploaded blank), %llu not ready yet (retried next frame), %llu throttled "
+                     "(per-list cap, retried next list), %.2f MB saved vs. the RGBA8 fallback",
+                     (unsigned long long)hits, (unsigned long long)enc, us / 1000.0, enc ? us / 1000.0 / double(enc) : 0.0,
+                     (unsigned long long)failed, (unsigned long long)not_ready, (unsigned long long)throttled,
+                     saved / 1048576.0);
+        }
         if (geo_buf_) {
             LOGI(kTag, "geometry cache: %llu reused, %llu copied (%.1f MB), %llu volatile (streamed), %.0f of %llu MB used, "
                  "%llu resets", (unsigned long long)geo_hits_, (unsigned long long)geo_misses_, geo_bytes_ / 1048576.0,
@@ -5129,6 +5930,9 @@ private:
         VkBuffer stream = VK_NULL_HANDLE;
         VkDeviceMemory mem = VK_NULL_HANDLE;
         uint8_t* ptr = nullptr;
+        // Texture deswizzle/decode jobs farmed out to upload_workers_ that write into this slot's stream
+        // buffer (see Upload()): SubmitSlot() must not submit before every one of them has landed.
+        std::atomic<int> pending_uploads{0};
     };
     // Each frame makes two submissions (its command list, then the present): four slots let the next frame
     // record while the previous frame is still on the GPU (with two, it waited for the frame just submitted).
@@ -5174,7 +5978,8 @@ private:
         b2t_logged_ = 0, constants_logged_ = 0, handles_logged_ = 0;
     bool logged_first_image_ = false;
     std::map<std::string, uint64_t> skipped_;
-    std::set<int> unknown_formats_, program_binds_logged_;
+    std::set<int> unknown_formats_, program_binds_logged_, bc_decode_logged_, shadow_scaled_logged_, window_scaled_logged_,
+        mip_skipped_logged_, astc_transcode_logged_, astc_size_capped_logged_;
     std::map<int, Image*> fallbacks_;
     std::set<uint64_t> logged_clears_, logged_targets_;
     std::set<std::string> logged_once_, missing_ubo_logged_, ubo_binds_logged_;

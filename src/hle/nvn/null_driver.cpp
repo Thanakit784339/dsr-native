@@ -12,6 +12,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <thread>
 
@@ -462,6 +463,9 @@ bool QueueInitialize(void* q, const void* b) {
 // Queue position of each window texture's latest present (window acquire syncs wait for it).
 std::mutex g_present_seq_mutex;
 std::map<std::pair<const void*, int>, uint64_t> g_present_seqs;
+// On-screen FPS counter (GameActivity's overlay, polled from Java): a light exponential moving
+// average over present-to-present gaps, updated on the thread that calls nvnQueuePresentTexture.
+std::atomic<float> g_fps_ema{0.0f};
 void NoteWindowTexturePresent(const void* window, int index, uint64_t seq) {
     std::lock_guard<std::mutex> lk(g_present_seq_mutex);
     g_present_seqs[{window, index}] = seq;
@@ -493,6 +497,11 @@ void QueuePresentTexture(void* queue, void* window, int index) {
         ft_max = std::max(ft_max, ms);
         ft_n++;
         if (ms > 2.0 * 1000.0 / fps) ft_hitches++;
+        if (ms > 0.0) {
+            const float cur = float(1000.0 / ms);
+            const float prev = g_fps_ema.load(std::memory_order_relaxed);
+            g_fps_ema.store(prev <= 0.0f ? cur : prev * 0.9f + cur * 0.1f, std::memory_order_relaxed);
+        }
         step_sum += dsr::GameFrameTime();  // set by the game's frame limiter (60 fps mode)
     }
     static bool caller_logged = false;
@@ -553,6 +562,10 @@ size_t CmdPlenty(const void*) { return 16u << 20; }
 // ---- sync ------------------------------------------------------------------------------------------------------
 
 // ---- window ------------------------------------------------------------------------------------------------------
+// Storage addresses of every texture any window has registered (nvnWindowBuilderSetTextures): CreateImage()
+// checks this to find the game's actual presentable frame, as opposed to a same-sized G-buffer or copy.
+std::mutex g_window_tex_mutex;
+std::set<uint64_t> g_window_tex_addrs;
 void WindowBuilderSetDefaults(void* b) { g_window_builders.Reset(b); }
 void WindowBuilderSetTextures(void* b, int n, const void* const* textures) {
     auto& w = g_window_builders.Get(b);
@@ -573,6 +586,13 @@ bool WindowInitialize(void* w, const void* b) {
     g_windows.Get(w) = s;
     TextureState t = g_textures.Copy(s.textures[0]);
     LOGI(kTag, "nvnWindowInitialize: %d textures, %dx%d format %d", s.num_textures, t.width, t.height, t.format);
+    {
+        std::lock_guard<std::mutex> lk(g_window_tex_mutex);
+        for (int i = 0; i < s.num_textures; i++) {
+            TextureState wt = g_textures.Copy(s.textures[i]);
+            if (wt.pool) g_window_tex_addrs.insert(PoolBase(wt.pool) + uint64_t(wt.offset));
+        }
+    }
     return true;
 }
 void WindowFinalize(void* w) { g_windows.Erase(w); }
@@ -643,6 +663,11 @@ TexRef WindowTexture(const void* nvn_window, int index) {
     if (index < 0 || index >= w.num_textures) return {};
     return MakeTexRef(w.textures[index]);
 }
+bool IsWindowTextureAddr(uint64_t addr) {
+    std::lock_guard<std::mutex> lk(g_window_tex_mutex);
+    return g_window_tex_addrs.count(addr) != 0;
+}
+float CurrentFps() { return g_fps_ema.load(std::memory_order_relaxed); }
 
 namespace {
 struct Proc {

@@ -181,6 +181,12 @@ Backend* CreatePlatformBackend();       // Vulkan on Android, null elsewhere
 // Lookups provided by null_driver.cpp.
 TexRef MakeTexRef(const void* nvn_texture);
 TexRef WindowTexture(const void* nvn_window, int index);
+// True if `addr` is a texture the game has registered as one of a window's presentable textures
+// (nvnWindowBuilderSetTextures): the one CreateImage() may safely render at a lower internal
+// resolution, since Present() already blit-scales whatever size it is up to the real screen.
+bool IsWindowTextureAddr(uint64_t addr);
+// Smoothed presents-per-second (exponential moving average over recent present-to-present gaps).
+float CurrentFps();
 // True if [addr, addr+size) lies inside one registered NVN memory pool (safe to read).
 bool GuestRangeValid(uint64_t addr, size_t size);
 // Hands a linear RGBA8 picture (w x h, tightly packed) to the backend as the new contents of a texture:

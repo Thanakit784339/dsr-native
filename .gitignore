@@ -13,3 +13,8 @@ android/.idea/
 *.mp4
 exefs/
 game/
+
+# Local tooling (clangd indexing), not part of the project.
+compile_commands.json
+.cache/
+.serena/

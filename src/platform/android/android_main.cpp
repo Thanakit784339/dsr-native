@@ -24,6 +24,7 @@
 #include <cstring>
 #include <vector>
 #include <cmath>
+#include <mutex>
 #include <string>
 #include <cstdlib>
 #include <cstdio>
@@ -42,7 +43,30 @@ namespace {
 constexpr const char* kTag = "android";
 
 std::atomic<bool> g_game_started{false};
+std::mutex g_pad_mutex;  // guards g_pad: written by the input-event thread, read by the touch UI thread too
 dsr::input::PadState g_pad;
+
+// On-screen touch controls (TouchControls.java, over JNI): a separate input source, merged with the
+// physical pad below so either can drive the game regardless of which one last moved.
+std::atomic<uint64_t> g_touch_buttons{0};
+std::atomic<int32_t> g_touch_lx{0}, g_touch_ly{0}, g_touch_rx{0}, g_touch_ry{0};
+
+// Recomputes the combined state and pushes it to nn::hid. Touch sticks only override the physical ones
+// while actually being dragged (zero means "not touched"), so a connected gamepad still works normally.
+void PushMergedPad() {
+    using namespace dsr::input;
+    PadState s;
+    {
+        std::lock_guard<std::mutex> lk(g_pad_mutex);
+        s = g_pad;
+    }
+    s.buttons |= g_touch_buttons.load(std::memory_order_relaxed);
+    const int32_t tlx = g_touch_lx.load(std::memory_order_relaxed), tly = g_touch_ly.load(std::memory_order_relaxed);
+    const int32_t trx = g_touch_rx.load(std::memory_order_relaxed), try_ = g_touch_ry.load(std::memory_order_relaxed);
+    if (tlx || tly) { s.lx = tlx; s.ly = tly; }
+    if (trx || try_) { s.rx = trx; s.ry = try_; }
+    SetPad(s);
+}
 
 bool FileExists(const std::string& p) {
     struct stat st;
@@ -331,6 +355,10 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "# exposure: scales the scene's exposure before tone mapping (default 1.37; 1.0 = exactly as the\n"
                     "# game draws it; higher is brighter)\n"
                     "exposure = %.2f\n"
+                    "# max_anisotropy: caps anisotropic filtering regardless of what the game asks for (1.0-16.0).\n"
+                    "# Past ~4x the visual gain is marginal but GPU sampling cost keeps climbing -- lower trades\n"
+                    "# sharpness on textures at a grazing angle (floors, ground) for performance.\n"
+                    "max_anisotropy = %.1f\n"
                     "# pin_render_thread: 1 = keep the render thread on the fastest CPU core (was slower on an\n"
                     "# 8 Gen 2: the GPU then waited; 0 = let Android choose)\n"
                     "pin_render_thread = 0\n"
@@ -340,19 +368,41 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "fast_cores = 1\n"
                     "# audio_smooth: 1 = release audio buffers to the game at a smoothed pace (experimental)\n"
                     "audio_smooth = 0\n"
+                    "# mali_barriers: 1 = narrow layout-transition barriers to just the stages that actually read\n"
+                    "# the image, instead of always blocking everything (lets a tile-based GPU overlap more\n"
+                    "# between passes); 0 = the old maximally-conservative behavior\n"
+                    "mali_barriers = 1\n"
                     PRESENT_MODE_HELP
                     "present_mode = mailbox\n"
                     FACE_BUTTONS_HELP
-                    "face_buttons = label\n",
+                    "face_buttons = label\n"
+                    "# docked: nn::oe::GetOperationMode -- the same flag real hardware uses to tell a Switch\n"
+                    "# game it's docked vs handheld. Most games (including this one) render at a higher internal\n"
+                    "# resolution when docked. 0 = handheld (720p), 1 = docked (usually ~1080p, more demanding)\n"
+                    "docked = %d\n"
+                    "# render_scale: internal render resolution, as a fraction of the game's normal frame\n"
+                    "# (0.1-1.0). The result is still shown at full screen size (upscaled, same as Present()\n"
+                    "# always did for a mismatched size) -- lower trades sharpness for GPU headroom.\n"
+                    "render_scale = %.2f\n"
+                    "# texture_mip_skip: skip this many of a big game texture's own top mip levels (0 = off, full\n"
+                    "# quality; 1 = roughly 75%% less data to load per big texture -- softer up close, cuts\n"
+                    "# upload bandwidth hard during a zone load)\n"
+                    "texture_mip_skip = %d\n"
+                    "# astc_transcode: 1 = transcode BC textures to ASTC instead of RGBA8 when the GPU has no\n"
+                    "# native BC support (real upload bandwidth win); 0 = always use the RGBA8 fallback. Off by\n"
+                    "# default -- reproducibly crashes on some devices right now (see vk_backend.cpp)\n"
+                    "astc_transcode = %d\n",
                     cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0,
-                    cfg->gamma, cfg->exposure);
+                    cfg->gamma, cfg->exposure, cfg->max_anisotropy, cfg->docked ? 1 : 0, cfg->render_scale,
+                    cfg->texture_mip_skip, cfg->astc_transcode ? 1 : 0);
             fclose(w);
             LOGI(kTag, "settings: wrote defaults to %s", path.c_str());
         } else {
             LOGW(kTag, "settings: cannot create %s (%s): using defaults", path.c_str(), strerror(errno));
         }
     } else {
-        bool have_present_mode = false, have_face_buttons = false;
+        bool have_present_mode = false, have_face_buttons = false, have_docked = false, have_render_scale = false,
+             have_texture_mip_skip = false, have_astc_transcode = false;
         char line[256];
         while (fgets(line, sizeof(line), f)) {
             char key[64], value[64];
@@ -366,6 +416,11 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "record_thread")) cfg->record_thread = v != 0;
             else if (!strcmp(key, "fast_cores")) cfg->fast_cores = v != 0;
             else if (!strcmp(key, "audio_smooth")) cfg->audio_smooth = v != 0;
+            else if (!strcmp(key, "mali_barriers")) cfg->mali_barriers = v != 0;
+            else if (!strcmp(key, "docked")) {
+                cfg->docked = v != 0;
+                have_docked = true;
+            }
             else if (!strcmp(key, "face_buttons")) {
                 g_face_by_position = !strcmp(value, "position");
                 have_face_buttons = true;
@@ -379,6 +434,19 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             } else if (!strcmp(key, "exposure")) {
                 const float e = float(atof(value));
                 cfg->exposure = e >= 0.25f && e <= 4.0f ? e : dsr::RuntimeConfig{}.exposure;
+            } else if (!strcmp(key, "max_anisotropy")) {
+                const float a = float(atof(value));
+                cfg->max_anisotropy = a >= 1.0f && a <= 16.0f ? a : dsr::RuntimeConfig{}.max_anisotropy;
+            } else if (!strcmp(key, "render_scale")) {
+                const float rs = float(atof(value));
+                cfg->render_scale = rs >= 0.1f && rs <= 1.0f ? rs : 1.0f;
+                have_render_scale = true;
+            } else if (!strcmp(key, "texture_mip_skip")) {
+                cfg->texture_mip_skip = std::clamp(v, 0, 4);
+                have_texture_mip_skip = true;
+            } else if (!strcmp(key, "astc_transcode")) {
+                cfg->astc_transcode = v != 0;
+                have_astc_transcode = true;
             }
         }
         fclose(f);
@@ -389,18 +457,60 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                 fclose(w);
                 LOGI(kTag, "settings: added present_mode to %s", path.c_str());
             }
+        if (!have_docked)
+            if (FILE* w = fopen(path.c_str(), "a")) {
+                fputs("\n# docked: nn::oe::GetOperationMode -- the same flag real hardware uses to tell a Switch\n"
+                      "# game it's docked vs handheld. Most games (including this one) render at a higher internal\n"
+                      "# resolution when docked. 0 = handheld (720p), 1 = docked (usually ~1080p, more demanding)\n"
+                      "docked = 0\n",
+                      w);
+                fclose(w);
+                LOGI(kTag, "settings: added docked to %s", path.c_str());
+            }
         if (!have_face_buttons)
             if (FILE* w = fopen(path.c_str(), "a")) {
                 fputs("\n" FACE_BUTTONS_HELP "face_buttons = label\n", w);
                 fclose(w);
                 LOGI(kTag, "settings: added face_buttons to %s", path.c_str());
             }
+        if (!have_render_scale)
+            if (FILE* w = fopen(path.c_str(), "a")) {
+                fputs("\n# render_scale: internal render resolution, as a fraction of the game's normal frame\n"
+                      "# (0.1-1.0). The result is still shown at full screen size (upscaled, same as Present()\n"
+                      "# always did for a mismatched size) -- lower trades sharpness for GPU headroom.\n"
+                      "render_scale = 1.00\n",
+                      w);
+                fclose(w);
+                LOGI(kTag, "settings: added render_scale to %s", path.c_str());
+            }
+        if (!have_texture_mip_skip)
+            if (FILE* w = fopen(path.c_str(), "a")) {
+                fputs("\n# texture_mip_skip: skip this many of a big game texture's own top mip levels (0 = off,\n"
+                      "# full quality; 1 = roughly 75% less data to load per big texture -- softer up close, cuts\n"
+                      "# upload bandwidth hard during a zone load)\n"
+                      "texture_mip_skip = 1\n",
+                      w);
+                fclose(w);
+                LOGI(kTag, "settings: added texture_mip_skip to %s", path.c_str());
+            }
+        if (!have_astc_transcode)
+            if (FILE* w = fopen(path.c_str(), "a")) {
+                fputs("\n# astc_transcode: 1 = transcode BC textures to ASTC instead of RGBA8 when the GPU has\n"
+                      "# no native BC support; 0 = always use the RGBA8 fallback. Off by default -- see\n"
+                      "# vk_backend.cpp for why.\n"
+                      "astc_transcode = 0\n",
+                      w);
+                fclose(w);
+                LOGI(kTag, "settings: added astc_transcode to %s", path.c_str());
+            }
     }
     LOGI(kTag, "settings (%s): fps %d, async pipelines %s, auto capture %s, profile %s, gamma %.2f, exposure %.2f, "
-         "present mode %s, face buttons by %s",
+         "max anisotropy %.1fx, present mode %s, face buttons by %s, docked %s, render scale %.2f, texture mip "
+         "skip %d, astc transcode %s, mali barriers %s",
          path.c_str(), cfg->target_fps, cfg->async_pipelines ? "on" : "off", cfg->auto_capture ? "on" : "off",
-         cfg->profile ? "on" : "off", cfg->gamma, cfg->exposure, cfg->present_mode.c_str(),
-         g_face_by_position ? "position" : "label");
+         cfg->profile ? "on" : "off", cfg->gamma, cfg->exposure, cfg->max_anisotropy, cfg->present_mode.c_str(),
+         g_face_by_position ? "position" : "label", cfg->docked ? "on" : "off", cfg->render_scale,
+         cfg->texture_mip_skip, cfg->astc_transcode ? "on" : "off", cfg->mali_barriers ? "on" : "off");
     if (cfg->profile) dsr::profiler::Enable();
 }
 
@@ -600,44 +710,72 @@ int32_t OnInput(android_app*, AInputEvent* ev) {
                  b ? "mapped" : "not mapped");
         }
         if (!b) return 0;
-        const uint64_t before = g_pad.buttons;
-        if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_DOWN)
-            g_pad.buttons |= b;
-        else if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_UP)
-            g_pad.buttons &= ~b;
-        // Diagnostics: pressing both sticks in (L3 + R3) saves a frame capture (dsr_frame_*.bin) of the next frame.
         {
-            using namespace dsr::input;
+            std::lock_guard<std::mutex> lk(g_pad_mutex);
+            const uint64_t before = g_pad.buttons;
+            if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_DOWN)
+                g_pad.buttons |= b;
+            else if (AKeyEvent_getAction(ev) == AKEY_EVENT_ACTION_UP)
+                g_pad.buttons &= ~b;
+            // Diagnostics: pressing both sticks in (L3 + R3) saves a frame capture (dsr_frame_*.bin) of the next
+            // frame.
             const uint64_t both = kStickL | kStickR;
             if ((g_pad.buttons & both) == both && (before & both) != both) {
                 LOGI(kTag, "L3 + R3: frame capture requested");
                 dsr::hle::nvn::GetBackend().RequestCapture(0);
             }
         }
-        SetPad(g_pad);
+        PushMergedPad();
         return 1;
     }
     if (type == AINPUT_EVENT_TYPE_MOTION && (AInputEvent_getSource(ev) & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK) {
-        g_pad.lx = AxisToStick(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_X, 0));
-        g_pad.ly = -AxisToStick(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_Y, 0));
-        g_pad.rx = AxisToStick(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_Z, 0));
-        g_pad.ry = -AxisToStick(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_RZ, 0));
-        // Analog triggers and hat-switch d-pads.
-        auto set = [](uint64_t bit, bool on) { g_pad.buttons = on ? (g_pad.buttons | bit) : (g_pad.buttons & ~bit); };
-        set(kZL, AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_LTRIGGER, 0) > 0.5f ||
-                     AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_BRAKE, 0) > 0.5f);
-        set(kZR, AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_RTRIGGER, 0) > 0.5f ||
-                     AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_GAS, 0) > 0.5f);
-        float hx = AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_HAT_X, 0);
-        float hy = AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_HAT_Y, 0);
-        set(kLeft, hx < -0.5f);
-        set(kRight, hx > 0.5f);
-        set(kUp, hy < -0.5f);
-        set(kDown, hy > 0.5f);
-        SetPad(g_pad);
+        {
+            std::lock_guard<std::mutex> lk(g_pad_mutex);
+            g_pad.lx = AxisToStick(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_X, 0));
+            g_pad.ly = -AxisToStick(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_Y, 0));
+            g_pad.rx = AxisToStick(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_Z, 0));
+            g_pad.ry = -AxisToStick(AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_RZ, 0));
+            // Analog triggers and hat-switch d-pads.
+            auto set = [](uint64_t bit, bool on) { g_pad.buttons = on ? (g_pad.buttons | bit) : (g_pad.buttons & ~bit); };
+            set(kZL, AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_LTRIGGER, 0) > 0.5f ||
+                         AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_BRAKE, 0) > 0.5f);
+            set(kZR, AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_RTRIGGER, 0) > 0.5f ||
+                         AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_GAS, 0) > 0.5f);
+            float hx = AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_HAT_X, 0);
+            float hy = AMotionEvent_getAxisValue(ev, AMOTION_EVENT_AXIS_HAT_Y, 0);
+            set(kLeft, hx < -0.5f);
+            set(kRight, hx > 0.5f);
+            set(kUp, hy < -0.5f);
+            set(kDown, hy > 0.5f);
+        }
+        PushMergedPad();
         return 1;
     }
     return 0;
+}
+
+// ---- on-screen touch controls (TouchControls.java) ----------------------------------------------------
+extern "C" JNIEXPORT void JNICALL Java_com_dsrnative_app_TouchControls_nativeSetTouchButtons(JNIEnv*, jobject,
+                                                                                              jlong mask) {
+    g_touch_buttons.store(uint64_t(mask), std::memory_order_relaxed);
+    PushMergedPad();
+}
+extern "C" JNIEXPORT void JNICALL Java_com_dsrnative_app_TouchControls_nativeSetTouchStick(JNIEnv*, jobject,
+                                                                                            jint which, jint x,
+                                                                                            jint y) {
+    if (which == 0) {
+        g_touch_lx.store(x, std::memory_order_relaxed);
+        g_touch_ly.store(y, std::memory_order_relaxed);
+    } else {
+        g_touch_rx.store(x, std::memory_order_relaxed);
+        g_touch_ry.store(y, std::memory_order_relaxed);
+    }
+    PushMergedPad();
+}
+
+// ---- on-screen FPS counter (GameActivity's overlay) --------------------------------------------------
+extern "C" JNIEXPORT jfloat JNICALL Java_com_dsrnative_app_GameActivity_nativeGetFps(JNIEnv*, jobject) {
+    return dsr::hle::nvn::CurrentFps();
 }
 
 const char* CmdName(int32_t cmd) {

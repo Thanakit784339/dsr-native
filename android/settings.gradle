@@ -10,6 +10,9 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // virtual-joystick-android (TouchControls) has no Maven Central release, only JitPack builds
+        // of specific commits -- the repo itself has no version tags at all.
+        maven { url 'https://jitpack.io' }
     }
 }
 rootProject.name = "DSRNative"
