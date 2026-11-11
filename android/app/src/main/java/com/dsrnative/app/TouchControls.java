@@ -35,6 +35,8 @@ public final class TouchControls extends View implements InputManager.InputDevic
     static native void nativeVisible(boolean visible);
 
     private static TouchControls sView;
+    /** settings.txt touch_camera_recenter: a thumb resting on the camera stick brings it back to the centre. */
+    static volatile boolean sRecenter = true;
 
     /** Called by native code once the game starts. */
     public static void attach(final Activity activity, final float opacity, final float cameraSpeed,
@@ -151,7 +153,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
             float dt = mRLastFrameNs == 0 ? 0.016f : Math.min(0.05f, (frameNs - mRLastFrameNs) / 1e9f);
             mRLastFrameNs = frameNs;
             float still = (android.os.SystemClock.uptimeMillis() - mRLastMove) / 1000f;
-            float ramp = Math.max(0f, Math.min(1f, (still - REST_START_S) / REST_RAMP_S));
+            float ramp = sRecenter ? Math.max(0f, Math.min(1f, (still - REST_START_S) / REST_RAMP_S)) : 0f;
             ramp = ramp * ramp * (3f - 2f * ramp);  // smoothstep
             if (ramp > 0f && (mRX != mRBaseX || mRY != mRBaseY)) {
                 float k = 1f - (float) Math.exp(-dt * ramp / RECENTER_TIME_S);

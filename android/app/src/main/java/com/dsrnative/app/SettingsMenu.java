@@ -69,6 +69,7 @@ public final class SettingsMenu {
         sRunningDriver = runningDriver == null || runningDriver.isEmpty() ? "system" : runningDriver;
         sGameDir = gameDir;
         sDefaultGameDir = defaultGameDir;
+        TouchControls.sRecenter = !"0".equals(readSettings().get("touch_camera_recenter"));
     }
 
     /** Called by native code when - and + have been held for a second. */
@@ -427,7 +428,7 @@ public final class SettingsMenu {
         section("Display");
         choice("fps", "Frame rate cap", "Changes at once.", new String[] {"30", "45", "60"},
                 new String[] {"30 fps", "45 fps", "60 fps"}, "60");
-        choice("aspect_ratio", "Aspect ratio", "16:9 is the game's own. Fill screen widens (or narrows) the view "
+        choice("aspect_ratio", "Aspect ratio (experimental)", "16:9 is the game's own. Fill screen widens (or narrows) the view "
                 + "to the screen's shape. Changes at the next start.",
                 new String[] {"16:9", "auto", "4:3", "21:9"},
                 new String[] {"16:9 (default)", "Fill screen", "4:3", "21:9"}, "16:9");
@@ -437,16 +438,21 @@ public final class SettingsMenu {
                 new String[] {"mailbox", "fifo"}, new String[] {"Low latency (default)", "V-sync"}, "mailbox");
 
         section("Controls");
-        choice("face_buttons", "Controller button style",
-                "Xbox style: the bottom face button confirms (A on an Xbox pad). Nintendo style: the right face button "
-                        + "confirms, as on a Switch. Changes at once.",
-                new String[] {"label", "position"}, new String[] {"Xbox style", "Nintendo style"}, "label");
+        toggle("face_buttons", "Swap A / B and X / Y inputs",
+                "On: the controller's face buttons act by position, as on a Switch (the right button confirms). "
+                        + "Changes at once.",
+                "position", "label", "label");
         choice("touch_controls", "Touch controls", "Changes at once.", new String[] {"1", "0"},
                 new String[] {"On", "Off"}, "1");
         choice("touch_opacity", "Touch controls opacity", "Changes at once.",
                 new String[] {"0.3", "0.5", "0.7", "1.0"}, new String[] {"30%", "50%", "70%", "100%"}, "0.7");
         choice("touch_camera_speed", "Touch camera speed", "Changes at once.",
                 new String[] {"0.75", "1.0", "1.5", "2.0"}, new String[] {"Slow", "Normal", "Fast", "Faster"}, "1.0");
+        toggle("touch_camera_recenter", "Prevent right stick centre drift",
+                "On: the touch camera stick stays where it is while your thumb rests on it, so the camera keeps "
+                        + "turning until you move back. Off: it drifts back to the centre under a resting thumb and the "
+                        + "camera eases to a stop. Changes at once.",
+                "0", "1", "1");
         choice("touch_camera_invert", "Invert touch camera", "Changes at once.", new String[] {"0", "1"},
                 new String[] {"Off", "On"}, "0");
 
@@ -541,6 +547,61 @@ public final class SettingsMenu {
         mBody.addView(hs);
     }
 
+    /** An on / off switch for one settings.txt key. */
+    private void toggle(final String key, final String title, String noteText, final String onValue,
+            final String offValue, String def) {
+        String cur = mValues.containsKey(key) ? mValues.get(key) : def;
+        LinearLayout row = new LinearLayout(mA);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(14), dp(10), dp(14), dp(10));
+        row.setFocusable(true);
+        row.setClickable(true);
+        StateListDrawable bg = new StateListDrawable();
+        bg.addState(new int[] {android.R.attr.state_focused}, rounded(0xFF3A3A3A, 10, 0xFFFFFFFF));
+        bg.addState(new int[] {android.R.attr.state_pressed}, rounded(0xFF3A3A3A, 10, 0));
+        bg.addState(new int[] {}, rounded(CARD, 10, 0));
+        row.setBackground(bg);
+        LinearLayout texts = new LinearLayout(mA);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        texts.addView(text(title, 15, TEXT, true));
+        if (noteText != null) texts.addView(text(noteText, 12, DIM, false));
+        row.addView(texts, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        final TextView state = new TextView(mA);
+        state.setTextSize(14);
+        state.setTypeface(Typeface.DEFAULT_BOLD);
+        state.setGravity(Gravity.CENTER);
+        state.setMinWidth(dp(64));
+        state.setPadding(dp(12), dp(6), dp(12), dp(6));
+        state.setDuplicateParentStateEnabled(false);
+        final boolean[] on = {same(cur, onValue)};
+        final Runnable paint = () -> {
+            state.setText(on[0] ? "On" : "Off");
+            state.setTextColor(on[0] ? 0xFF151515 : TEXT);
+            state.setBackground(rounded(on[0] ? GOLD : 0xFF444444, 14, 0));
+        };
+        paint.run();
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        slp.leftMargin = dp(12);
+        row.addView(state, slp);
+        row.setOnClickListener(v -> {
+            String value = on[0] ? offValue : onValue;
+            if (!writeSetting(key, value)) {
+                popup("Could not save", "settings.txt could not be written:\n" + sSettingsPath);
+                return;
+            }
+            on[0] = !on[0];
+            paint.run();
+            mValues.put(key, value);
+            applyChoice(key, title, value);
+        });
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(10);
+        mBody.addView(row, lp);
+    }
+
     private void applyChoice(String key, String title, String value) {
         boolean now = false;
         try {
@@ -548,7 +609,10 @@ public final class SettingsMenu {
         } catch (Throwable e) {
             android.util.Log.w("DSRNative", "settings menu: nativeApply failed", e);
         }
-        if (key.startsWith("touch_") && !key.equals("touch_camera_invert")) {
+        if (key.equals("touch_camera_recenter")) {
+            TouchControls.sRecenter = !"0".equals(value);
+            now = true;
+        } else if (key.startsWith("touch_") && !key.equals("touch_camera_invert")) {
             boolean on = !"0".equals(mValues.get("touch_controls"));
             TouchControls.applySettings(mA, on, parse(mValues.get("touch_opacity"), 0.7f),
                     parse(mValues.get("touch_camera_speed"), 1.0f));
