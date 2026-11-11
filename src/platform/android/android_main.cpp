@@ -344,6 +344,17 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "# Past ~4x the visual gain is marginal but GPU sampling cost keeps climbing -- lower trades\n"
                     "# sharpness on textures at a grazing angle (floors, ground) for performance.\n"
                     "max_anisotropy = %.1f\n"
+                    "# screen_fit: how the rendered frame is fit onto the display -- \"aspect\" (default,\n"
+                    "# letterboxed/pillarboxed, no distortion), \"stretch\" (fills the screen, may distort), or\n"
+                    "# \"manual\" (aspect-fit then scaled by screen_zoom and panned by screen_offset_x/y)\n"
+                    "screen_fit = %s\n"
+                    "# screen_zoom_x/y and screen_offset_x/y: only used when screen_fit = manual. zoom 0.25-4.0\n"
+                    "# (1.0 = same size as aspect-fit on that axis; unequal x/y stretches or squashes the image);\n"
+                    "# offsets -1.0 to 1.0 (fraction of half-screen)\n"
+                    "screen_zoom_x = %.2f\n"
+                    "screen_zoom_y = %.2f\n"
+                    "screen_offset_x = %.2f\n"
+                    "screen_offset_y = %.2f\n"
                     "# pin_render_thread: 1 = keep the render thread on the fastest CPU core (was slower on an\n"
                     "# 8 Gen 2: the GPU then waited; 0 = let Android choose)\n"
                     "pin_render_thread = 0\n"
@@ -378,8 +389,9 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
                     "# default -- reproducibly crashes on some devices right now (see vk_backend.cpp)\n"
                     "astc_transcode = %d\n",
                     cfg->target_fps, cfg->async_pipelines ? 1 : 0, cfg->auto_capture ? 1 : 0, cfg->profile ? 1 : 0,
-                    cfg->gamma, cfg->exposure, cfg->max_anisotropy, cfg->docked ? 1 : 0, cfg->render_scale,
-                    cfg->texture_mip_skip, cfg->astc_transcode ? 1 : 0);
+                    cfg->gamma, cfg->exposure, cfg->max_anisotropy, cfg->screen_fit.c_str(), cfg->screen_zoom_x,
+                    cfg->screen_zoom_y, cfg->screen_offset_x, cfg->screen_offset_y, cfg->docked ? 1 : 0,
+                    cfg->render_scale, cfg->texture_mip_skip, cfg->astc_transcode ? 1 : 0);
             fclose(w);
             LOGI(kTag, "settings: wrote defaults to %s", path.c_str());
         } else {
@@ -435,6 +447,18 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             } else if (!strcmp(key, "max_anisotropy")) {
                 const float a = float(atof(value));
                 cfg->max_anisotropy = a >= 1.0f && a <= 16.0f ? a : dsr::RuntimeConfig{}.max_anisotropy;
+            } else if (!strcmp(key, "screen_fit")) {
+                cfg->screen_fit = value;
+            } else if (!strcmp(key, "screen_zoom_x")) {
+                const float z = float(atof(value));
+                cfg->screen_zoom_x = z >= 0.25f && z <= 4.0f ? z : 1.0f;
+            } else if (!strcmp(key, "screen_zoom_y")) {
+                const float z = float(atof(value));
+                cfg->screen_zoom_y = z >= 0.25f && z <= 4.0f ? z : 1.0f;
+            } else if (!strcmp(key, "screen_offset_x")) {
+                cfg->screen_offset_x = std::max(-1.0f, std::min(1.0f, float(atof(value))));
+            } else if (!strcmp(key, "screen_offset_y")) {
+                cfg->screen_offset_y = std::max(-1.0f, std::min(1.0f, float(atof(value))));
             } else if (!strcmp(key, "render_scale")) {
                 const float rs = float(atof(value));
                 cfg->render_scale = rs >= 0.1f && rs <= 1.0f ? rs : 1.0f;
@@ -503,12 +527,14 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             }
     }
     LOGI(kTag, "settings (%s): fps %d, async pipelines %s, auto capture %s, profile %s, gamma %.2f, exposure %.2f, "
-         "max anisotropy %.1fx, present mode %s, face buttons by %s, docked %s, render scale %.2f, texture mip "
-         "skip %d, astc transcode %s, mali barriers %s",
+         "max anisotropy %.1fx, screen fit %s (zoom %.2f,%.2f, offset %.2f,%.2f), present mode %s, face buttons "
+         "by %s, docked %s, render scale %.2f, texture mip skip %d, astc transcode %s, mali barriers %s",
          path.c_str(), cfg->target_fps, cfg->async_pipelines ? "on" : "off", cfg->auto_capture ? "on" : "off",
-         cfg->profile ? "on" : "off", cfg->gamma, cfg->exposure, cfg->max_anisotropy, cfg->present_mode.c_str(),
-         g_face_by_position ? "position" : "label", cfg->docked ? "on" : "off", cfg->render_scale,
-         cfg->texture_mip_skip, cfg->astc_transcode ? "on" : "off", cfg->mali_barriers ? "on" : "off");
+         cfg->profile ? "on" : "off", cfg->gamma, cfg->exposure, cfg->max_anisotropy, cfg->screen_fit.c_str(),
+         cfg->screen_zoom_x, cfg->screen_zoom_y, cfg->screen_offset_x, cfg->screen_offset_y,
+         cfg->present_mode.c_str(), g_face_by_position ? "position" : "label", cfg->docked ? "on" : "off",
+         cfg->render_scale, cfg->texture_mip_skip, cfg->astc_transcode ? "on" : "off",
+         cfg->mali_barriers ? "on" : "off");
     if (cfg->profile) dsr::profiler::Enable();
 }
 

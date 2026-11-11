@@ -2,6 +2,7 @@ package com.dsrnative.app;
 
 import android.app.Activity;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.PixelFormat;
@@ -16,7 +17,9 @@ import android.view.View;
 import android.view.WindowManager;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * On-screen controls drawn in a transparent panel window over the game. A fixed stick at the bottom left
@@ -172,6 +175,21 @@ public final class TouchControls extends View implements InputManager.InputDevic
     };
     private float mCameraSpeed;
 
+    // ---- layout editor: drag any button or the stick to reposition it ---------------------------------------
+    // Positions are stored as absolute (cx/u, cy/u) -- a multiple of the layout unit -- rather than an offset
+    // from the formula default, so the override alone fully determines the position and survives a screen-size
+    // change (layout() recomputes the unit, then applies whatever override exists) without extra bookkeeping.
+    private static final String PREFS = "touch_layout";
+    private final SharedPreferences mPrefs;
+    private final Map<Integer, float[]> mOverrides = new HashMap<>();  // bit -> {x/u, y/u}
+    private static final int STICK_KEY = -1;  // the left stick's base isn't a Button, reuses the same map
+    private boolean mEditMode = false;
+    private float mUnit = 1f;
+    // EDIT/DONE and RESET chips, top centre -- fixed positions (not draggable), RESET only tappable in edit mode.
+    private float mEditChipCx, mEditChipCy, mResetChipCx, mChipW, mChipH;
+    private static final int K_DRAG = 4, K_DRAG_STICK = 5;
+    private final float[] mDragGrabDx = new float[16], mDragGrabDy = new float[16];  // touch point -> centre, px
+
     // Double tap (to show the controls again).
     private long mLastTapTime;
     private float mLastTapX, mLastTapY;
@@ -186,6 +204,8 @@ public final class TouchControls extends View implements InputManager.InputDevic
         mActivity = activity;
         mCameraSpeed = Math.max(0.1f, Math.min(10f, cameraSpeed));
         mDensity = activity.getResources().getDisplayMetrics().density;
+        mPrefs = activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        loadOverrides();
         setAlpha(Math.max(0.1f, Math.min(1.0f, opacity)));
         mStroke.setStyle(Paint.Style.STROKE);
         mStroke.setColor(0xFFFFFFFF);
@@ -302,14 +322,41 @@ public final class TouchControls extends View implements InputManager.InputDevic
 
     private void place(int bit, float cx, float cy, float w, float h) {
         Button b = find(bit);
-        b.cx = cx;
-        b.cy = cy;
+        float[] o = mOverrides.get(bit);
+        b.cx = o != null ? o[0] * mUnit : cx;
+        b.cy = o != null ? o[1] * mUnit : cy;
         b.w = w;
         b.h = h;
     }
 
+    private void loadOverrides() {
+        for (String key : mPrefs.getAll().keySet()) {
+            if (!key.endsWith("_x")) continue;
+            String base = key.substring(0, key.length() - 2);
+            try {
+                int bit = Integer.parseInt(base);
+                float x = mPrefs.getFloat(base + "_x", Float.NaN), y = mPrefs.getFloat(base + "_y", Float.NaN);
+                if (!Float.isNaN(x) && !Float.isNaN(y)) mOverrides.put(bit, new float[] {x, y});
+            } catch (NumberFormatException ignored) {
+            }
+        }
+    }
+
+    private void saveOverride(int key, float ux, float uy) {
+        mOverrides.put(key, new float[] {ux, uy});
+        mPrefs.edit().putFloat(key + "_x", ux).putFloat(key + "_y", uy).apply();
+    }
+
+    private void resetLayout() {
+        mOverrides.clear();
+        mPrefs.edit().clear().apply();
+        layout(getWidth(), getHeight());
+        invalidate();
+    }
+
     private void layout(int w, int h) {
         final float u = Math.min(w, h) / 10f;  // layout unit: a tenth of the short side
+        mUnit = u;
         // Face buttons, Switch layout (X top, A right, B bottom, Y left).
         final float fcx = w - 3.0f * u, fcy = h - 3.0f * u, d = 1.45f * u, fb = 1.3f * u;
         place(A, fcx + d, fcy, fb, fb);
@@ -336,10 +383,20 @@ public final class TouchControls extends View implements InputManager.InputDevic
         // Stick: resting spot, and the area where a finger grabs it.
         mStickRadius = 1.6f * u;
         mRRadius = 1.05f * u;
-        mStickBaseX = 2.8f * u;
-        mStickBaseY = h - 3.0f * u;
+        float[] stickOverride = mOverrides.get(STICK_KEY);
+        mStickBaseX = stickOverride != null ? stickOverride[0] * u : 2.8f * u;
+        mStickBaseY = stickOverride != null ? stickOverride[1] * u : h - 3.0f * u;
         mText.setTextSize(0.45f * u);
         mStroke.setStrokeWidth(Math.max(2f, 0.05f * u));
+        mChipW = 2.2f * u;
+        mChipH = 0.9f * u;
+        mEditChipCx = w / 2f - 1.3f * u;
+        mEditChipCy = 0.6f * u;
+        mResetChipCx = w / 2f + 1.3f * u;
+    }
+
+    private boolean hitChip(float x, float y, float cx, float cy) {
+        return Math.abs(x - cx) <= mChipW / 2 && Math.abs(y - cy) <= mChipH / 2;
     }
 
     // ---- touch ----------------------------------------------------------------------------------------------
@@ -355,7 +412,17 @@ public final class TouchControls extends View implements InputManager.InputDevic
             case MotionEvent.ACTION_DOWN:
             case MotionEvent.ACTION_POINTER_DOWN: {
                 int i = e.getActionIndex();
-                down(e.getPointerId(i), e.getX(i), e.getY(i));
+                float x = e.getX(i), y = e.getY(i);
+                if (hitChip(x, y, mEditChipCx, mEditChipCy)) {
+                    mEditMode = !mEditMode;
+                    invalidate();
+                    break;
+                }
+                if (mEditMode && hitChip(x, y, mResetChipCx, mEditChipCy)) {
+                    resetLayout();
+                    break;
+                }
+                down(e.getPointerId(i), x, y);
                 break;
             }
             case MotionEvent.ACTION_MOVE:
@@ -373,7 +440,8 @@ public final class TouchControls extends View implements InputManager.InputDevic
             default:
                 break;
         }
-        sendState();
+        if (mEditMode) nativeState(0, 0, 0, 0, 0);  // never leak phantom presses to the game while editing
+        else sendState();
         invalidate();
         return true;
     }
@@ -410,6 +478,22 @@ public final class TouchControls extends View implements InputManager.InputDevic
         if (id < 0 || id >= 16) return;
         mLastX[id] = x;
         mLastY[id] = y;
+        if (mEditMode) {
+            Button eb = hit(x, y);
+            if (eb != null) {
+                mKind[id] = K_DRAG;
+                mOn[id] = eb;
+                mDragGrabDx[id] = x - eb.cx;
+                mDragGrabDy[id] = y - eb.cy;
+            } else if (onStick(x, y)) {
+                mKind[id] = K_DRAG_STICK;
+                mDragGrabDx[id] = x - mStickBaseX;
+                mDragGrabDy[id] = y - mStickBaseY;
+            } else {
+                mKind[id] = K_NONE;
+            }
+            return;
+        }
         Button b = hit(x, y);
         if (b != null) {
             mKind[id] = K_BUTTON;
@@ -442,6 +526,19 @@ public final class TouchControls extends View implements InputManager.InputDevic
     private void move(int id, float x, float y) {
         if (id < 0 || id >= 16) return;
         switch (mKind[id]) {
+            case K_DRAG: {
+                Button b = mOn[id];
+                b.cx = x - mDragGrabDx[id];
+                b.cy = y - mDragGrabDy[id];
+                saveOverride(b.bit, b.cx / mUnit, b.cy / mUnit);
+                break;
+            }
+            case K_DRAG_STICK: {
+                mStickBaseX = x - mDragGrabDx[id];
+                mStickBaseY = y - mDragGrabDy[id];
+                saveOverride(STICK_KEY, mStickBaseX / mUnit, mStickBaseY / mUnit);
+                break;
+            }
             case K_BUTTON: {  // slide between buttons (e.g. across the face buttons)
                 Button b = hit(x, y);
                 if (b != mOn[id]) {
@@ -514,11 +611,19 @@ public final class TouchControls extends View implements InputManager.InputDevic
     @Override
     protected void onDraw(Canvas c) {
         if (!mShown) return;
+        drawChip(c, mEditChipCx, mEditChipCy, mEditMode ? "DONE" : "EDIT", mEditMode ? 0xFF3A8F3A : 0xFF3A3A3A);
+        if (mEditMode) drawChip(c, mResetChipCx, mEditChipCy, "RESET", 0xFF8F3A3A);
         // Stick (the knob stays inside the ring).
         final float bx = mStickBaseX, by = mStickBaseY;
         mFill.setColor(0x40000000);
         c.drawCircle(bx, by, mStickRadius, mFill);
-        c.drawCircle(bx, by, mStickRadius, mStroke);
+        if (mEditMode) {
+            mStroke.setColor(0xFFFFD040);
+            c.drawCircle(bx, by, mStickRadius, mStroke);
+            mStroke.setColor(0xFFFFFFFF);
+        } else {
+            c.drawCircle(bx, by, mStickRadius, mStroke);
+        }
         float kx = bx, ky = by;
         if (mStickPointer >= 0) {
             float dx = mStickX - bx, dy = mStickY - by, len = (float) Math.sqrt(dx * dx + dy * dy);
@@ -548,6 +653,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
             c.drawCircle(mRBaseX + dx, mRBaseY + dy, mRRadius * 0.45f, mFill);
         }
         // Buttons.
+        if (mEditMode) mStroke.setColor(0xFFFFD040);
         for (Button b : mButtons) {
             boolean on = b.pressCount > 0;
             mFill.setColor(on ? 0x90FFFFFF : 0x50000000);
@@ -566,5 +672,19 @@ public final class TouchControls extends View implements InputManager.InputDevic
             c.drawText(b.label, b.cx, b.cy - (mText.descent() + mText.ascent()) / 2, mText);
             mText.setTextSize(size);
         }
+        if (mEditMode) mStroke.setColor(0xFFFFFFFF);
+    }
+
+    private void drawChip(Canvas c, float cx, float cy, String label, int color) {
+        mFill.setColor(color);
+        mRect.set(cx - mChipW / 2, cy - mChipH / 2, cx + mChipW / 2, cy + mChipH / 2);
+        float r = mChipH * 0.3f;
+        c.drawRoundRect(mRect, r, r, mFill);
+        c.drawRoundRect(mRect, r, r, mStroke);
+        mText.setColor(0xFFFFFFFF);
+        float size = mText.getTextSize();
+        mText.setTextSize(mChipH * 0.45f);
+        c.drawText(label, cx, cy - (mText.descent() + mText.ascent()) / 2, mText);
+        mText.setTextSize(size);
     }
 }

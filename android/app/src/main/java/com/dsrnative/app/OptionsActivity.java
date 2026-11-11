@@ -10,7 +10,12 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.provider.DocumentsContract;
 import android.provider.Settings;
+import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.util.DisplayMetrics;
 import android.view.Gravity;
+import android.view.View;
+import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
@@ -38,11 +43,12 @@ import java.util.regex.Pattern;
  * and comments for keys not shown here are left untouched -- then launches GameActivity.
  */
 public class OptionsActivity extends Activity {
-    private Spinner mFps, mPresentMode, mFaceButtons, mMipSkip, mMaxAnisotropy;
+    private Spinner mFps, mPresentMode, mFaceButtons, mMipSkip, mMaxAnisotropy, mScreenFit;
     private CheckBox mAsyncPipelines, mAutoCapture, mProfile, mTouchControls, mDocked, mFpsCounter;
     private CheckBox mAudioSmooth, mFastCores, mRecordThread, mPinRenderThread, mAstcTranscode, mMaliBarriers;
-    private FloatSlider mGamma, mExposure, mRenderScale;
+    private FloatSlider mGamma, mExposure, mRenderScale, mScreenZoomX, mScreenZoomY, mScreenOffsetX, mScreenOffsetY;
     private TextView mGameFolderStatus;
+    private ScreenFitPreview mPreview;
     // null until the player picks a new folder this session; the existing settings.txt line (if any) is
     // left untouched otherwise -- this screen doesn't know the default location well enough to show it,
     // so it should never overwrite a working custom folder just because the field wasn't touched.
@@ -134,6 +140,34 @@ public class OptionsActivity extends Activity {
                 + "screen (experimental). Lower = fewer pixels to draw, more fps, softer/blockier image. "
                 + "1.0 = full resolution, no upscale.");
 
+        mScreenFit = labeledSpinner(root, "Screen fit", new String[] {"aspect", "stretch", "manual"});
+        tip(root, "aspect: fits the game's frame to your screen with no distortion (black bars if your screen "
+                + "isn't 16:9). stretch: fills the whole screen, may distort the image. manual: aspect-fit, "
+                + "then use the zoom/pan below.");
+        mScreenFit.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> p, View v, int pos, long id) { refreshPreview(); }
+            @Override public void onNothingSelected(AdapterView<?> p) { }
+        });
+
+        mScreenZoomX = labeledSlider(root, "Screen zoom X (manual only): ", 0.25f, 4.0f, 0.05f, 1.00f);
+        mScreenZoomY = labeledSlider(root, "Screen zoom Y (manual only): ", 0.25f, 4.0f, 0.05f, 1.00f);
+        tip(root, "Only applies when Screen fit = manual. 1.0 = same size as the aspect-fit image on that axis. "
+                + "Higher zooms in (crops edges), lower zooms out (more black border). Set X and Y differently "
+                + "to stretch or squash the image instead of just resizing it.");
+
+        mScreenOffsetX = labeledSlider(root, "Screen pan X (manual only): ", -1.0f, 1.0f, 0.05f, 0.00f);
+        mScreenOffsetY = labeledSlider(root, "Screen pan Y (manual only): ", -1.0f, 1.0f, 0.05f, 0.00f);
+        tip(root, "Only applies when Screen fit = manual. Shifts the image left/right and up/down; 0 = centred.");
+
+        mPreview = new ScreenFitPreview(this);
+        LinearLayout.LayoutParams previewLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(140));
+        previewLp.topMargin = dp(8);
+        mPreview.setLayoutParams(previewLp);
+        root.addView(mPreview);
+        tip(root, "Live preview (not an actual game render) of where the game's picture will sit on your real "
+                + "screen once you start playing.");
+
         mMipSkip = labeledSpinner(root, "Texture mip levels to skip", new String[] {"0", "1", "2", "3", "4"});
         tip(root, "Skips this many of a big texture's own top (highest-detail) mip levels so they're never "
                 + "even loaded. 0 = full quality. Higher = softer textures up close but a lot less data to "
@@ -167,6 +201,7 @@ public class OptionsActivity extends Activity {
                 + "proven-stable RGBA8 fallback.");
 
         loadCurrentValues();
+        refreshPreview();
 
         Button start = new Button(this);
         start.setText("Start Game");
@@ -302,6 +337,11 @@ public class OptionsActivity extends Activity {
         mGamma.set(1.00f);
         mExposure.set(1.37f);
         setSpinner(mMaxAnisotropy, "4");
+        setSpinner(mScreenFit, "aspect");
+        mScreenZoomX.set(1.00f);
+        mScreenZoomY.set(1.00f);
+        mScreenOffsetX.set(0.00f);
+        mScreenOffsetY.set(0.00f);
         setSpinner(mPresentMode, "mailbox");
         setSpinner(mFaceButtons, "label");
         mTouchControls.setChecked(true);
@@ -341,6 +381,11 @@ public class OptionsActivity extends Activity {
                         case "gamma": mGamma.setFromText(value); break;
                         case "exposure": mExposure.setFromText(value); break;
                         case "max_anisotropy": setSpinner(mMaxAnisotropy, roundedIntString(value)); break;
+                        case "screen_fit": setSpinner(mScreenFit, value); break;
+                        case "screen_zoom_x": mScreenZoomX.setFromText(value); break;
+                        case "screen_zoom_y": mScreenZoomY.setFromText(value); break;
+                        case "screen_offset_x": mScreenOffsetX.setFromText(value); break;
+                        case "screen_offset_y": mScreenOffsetY.setFromText(value); break;
                         case "present_mode": setSpinner(mPresentMode, value); break;
                         case "face_buttons": setSpinner(mFaceButtons, value); break;
                         case "touch_controls": mTouchControls.setChecked(!"0".equals(value)); break;
@@ -391,6 +436,11 @@ public class OptionsActivity extends Activity {
         upsert(lines, "gamma", mGamma.text());
         upsert(lines, "exposure", mExposure.text());
         upsert(lines, "max_anisotropy", selected(mMaxAnisotropy));
+        upsert(lines, "screen_fit", selected(mScreenFit));
+        upsert(lines, "screen_zoom_x", mScreenZoomX.text());
+        upsert(lines, "screen_zoom_y", mScreenZoomY.text());
+        upsert(lines, "screen_offset_x", mScreenOffsetX.text());
+        upsert(lines, "screen_offset_y", mScreenOffsetY.text());
         upsert(lines, "present_mode", selected(mPresentMode));
         upsert(lines, "face_buttons", selected(mFaceButtons));
         upsert(lines, "touch_controls", mTouchControls.isChecked() ? "1" : "0");
@@ -472,6 +522,97 @@ public class OptionsActivity extends Activity {
         root.addView(t);
     }
 
+    private void refreshPreview() {
+        if (mPreview == null || mScreenFit == null) return;
+        mPreview.update(selected(mScreenFit), mScreenZoomX.get(), mScreenZoomY.get(), mScreenOffsetX.get(),
+                mScreenOffsetY.get());
+    }
+
+    /**
+     * Geometry-only preview of where the game's frame will land on the real screen for the current
+     * Screen fit settings -- not an actual game render (there is no running game in this process), just
+     * the same rectangle math PresentSlot() uses in vk_backend.cpp, mirrored here in Java.
+     */
+    private static class ScreenFitPreview extends View {
+        private String mFit = "aspect";
+        private float mZoomX = 1f, mZoomY = 1f, mOffX, mOffY;
+        private final Paint mScreenPaint = new Paint();
+        private final Paint mFramePaint = new Paint();
+        private final Paint mBorderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+        ScreenFitPreview(android.content.Context c) {
+            super(c);
+            mScreenPaint.setColor(0xFF101010);
+            mFramePaint.setColor(0xFF2E7CD6);
+            mBorderPaint.setStyle(Paint.Style.STROKE);
+            mBorderPaint.setColor(0xFFFFFFFF);
+            mBorderPaint.setStrokeWidth(2f);
+        }
+
+        void update(String fit, float zoomX, float zoomY, float offX, float offY) {
+            mFit = fit;
+            mZoomX = zoomX;
+            mZoomY = zoomY;
+            mOffX = offX;
+            mOffY = offY;
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas c) {
+            final int vw = getWidth(), vh = getHeight();
+            if (vw == 0 || vh == 0) return;
+            // The real device screen, scaled down to fit inside this preview box.
+            DisplayMetrics dm = getResources().getDisplayMetrics();
+            final float screenAspect = (float) dm.widthPixels / dm.heightPixels;
+            final float boxAspect = (float) vw / vh;
+            int sw, sh;
+            if (screenAspect > boxAspect) {
+                sw = vw;
+                sh = (int) (vw / screenAspect);
+            } else {
+                sh = vh;
+                sw = (int) (vh * screenAspect);
+            }
+            final int sx = (vw - sw) / 2, sy = (vh - sh) / 2;
+            c.drawRect(sx, sy, sx + sw, sy + sh, mScreenPaint);
+
+            // The game's frame, using the exact same fit logic as PresentSlot() (src 1280x720, the
+            // game's own handheld frame size).
+            final int pjw = 1280, pjh = 720;
+            int fw, fh, fx, fy;
+            if ("stretch".equals(mFit)) {
+                fw = sw;
+                fh = sh;
+                fx = sx;
+                fy = sy;
+            } else {
+                fw = sw;
+                fh = (int) ((long) sw * pjh / pjw);
+                if (fh > sh) {
+                    fh = sh;
+                    fw = (int) ((long) sh * pjw / pjh);
+                }
+                if ("manual".equals(mFit)) {
+                    fw = (int) (fw * clamp(mZoomX));
+                    fh = (int) (fh * clamp(mZoomY));
+                }
+                fx = sx + (sw - fw) / 2;
+                fy = sy + (sh - fh) / 2;
+                if ("manual".equals(mFit)) {
+                    fx += (int) (mOffX * sw / 2);
+                    fy += (int) (mOffY * sh / 2);
+                }
+            }
+            c.drawRect(fx, fy, fx + fw, fy + fh, mFramePaint);
+            c.drawRect(sx, sy, sx + sw, sy + sh, mBorderPaint);
+        }
+
+        private static float clamp(float z) {
+            return Math.max(0.25f, Math.min(4.0f, z));
+        }
+    }
+
     /** A float value picked via a SeekBar (integer progress) instead of hand-typed text. */
     private static class FloatSlider {
         SeekBar bar;
@@ -515,7 +656,10 @@ public class OptionsActivity extends Activity {
         SeekBar sb = new SeekBar(this);
         sb.setMax(Math.round((max - min) / step));
         sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) { fs.updateText(); }
+            @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                fs.updateText();
+                refreshPreview();
+            }
             @Override public void onStartTrackingTouch(SeekBar seekBar) { }
             @Override public void onStopTrackingTouch(SeekBar seekBar) { }
         });

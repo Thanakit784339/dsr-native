@@ -1206,14 +1206,35 @@ private:
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdClearColorImage(cmd_, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
         if (pj.src) {
-            // Fit the game's frame into the screen, keeping its aspect ratio.
+            // PPSSPP-style screen fit: where the already-rendered frame lands on the display, nothing to
+            // do with how the game itself renders (see RuntimeConfig::screen_fit).
             const int dw = int(sc_extent_.width), dh = int(sc_extent_.height);
-            int w = dw, h = int(int64_t(dw) * pj.sh / std::max(1, pj.sw));
-            if (h > dh) {
+            const std::string& fit = dsr::GetRuntime().config.screen_fit;
+            int w, h, x, y;
+            if (fit == "stretch") {
+                w = dw;
                 h = dh;
-                w = int(int64_t(dh) * pj.sw / std::max(1, pj.sh));
+                x = y = 0;
+            } else {
+                w = dw;
+                h = int(int64_t(dw) * pj.sh / std::max(1, pj.sw));
+                if (h > dh) {
+                    h = dh;
+                    w = int(int64_t(dh) * pj.sw / std::max(1, pj.sh));
+                }
+                if (fit == "manual") {
+                    const float zx = std::clamp(dsr::GetRuntime().config.screen_zoom_x, 0.25f, 4.0f);
+                    const float zy = std::clamp(dsr::GetRuntime().config.screen_zoom_y, 0.25f, 4.0f);
+                    w = int(w * zx);
+                    h = int(h * zy);
+                }
+                x = (dw - w) / 2;
+                y = (dh - h) / 2;
+                if (fit == "manual") {
+                    x += int(dsr::GetRuntime().config.screen_offset_x * dw / 2);
+                    y += int(dsr::GetRuntime().config.screen_offset_y * dh / 2);
+                }
             }
-            const int x = (dw - w) / 2, y = (dh - h) / 2;
             VkImageBlit blit{};
             blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             blit.srcOffsets[1] = {pj.sw, pj.sh, 1};

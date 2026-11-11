@@ -62,6 +62,17 @@ struct RuntimeConfig {
     // in. Kept togglable without a rebuild, not ripped out, since RGBA8 (this default) is unaffected and
     // proven stable for hours.
     bool astc_transcode = false;
+    // PPSSPP-style screen fit, applied where Present() blits the already-rendered frame onto the display
+    // (a pure final-composite rectangle choice -- no game-logic/memory patching involved, unlike upstream's
+    // aspect_ratio feature which changes the resolution the game itself renders at):
+    //   "aspect"  (default) -- fit the frame to the screen keeping its aspect ratio, letterboxed/pillarboxed
+    //   "stretch" -- fill the whole screen, distorting the image if the screen isn't the same aspect ratio
+    //   "manual"  -- aspect-fit, then scaled by screen_zoom and panned by screen_offset_x/y
+    std::string screen_fit = "aspect";
+    // manual mode only; independent horizontal/vertical scale (1.0 = same size as aspect-fit on that axis,
+    // so unequal values stretch/squash rather than just resizing uniformly like a single zoom would).
+    float screen_zoom_x = 1.0f, screen_zoom_y = 1.0f;
+    float screen_offset_x = 0.0f, screen_offset_y = 0.0f;  // manual mode only; fraction of half-screen, -1..1
 };
 
 struct Runtime {
