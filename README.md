@@ -17,7 +17,7 @@ Runs the game's original ARM64 code (`exefs/main`) directly on an ARM64 Android 
 
 Early development. Expect visual bugs and minor performance issues.
 
-Tested with an AYN Thor, a OnePlus 6T, and MoMoPlayer using a 4:3 aspect ratio. Snapdragon chips should be fully supported along with Adreno 6xx, 7xx, and 8xx gpus.
+Tested with an AYN Thor, a OnePlus 6T, and MuMuPlayer using a 4:3 aspect ratio. Snapdragon chips should be fully supported along with Adreno 6xx, 7xx, and 8xx gpus.
 
 Haven't tested the v1.0.3 update for the game yet.
 
