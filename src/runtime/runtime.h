@@ -45,6 +45,10 @@ struct RuntimeConfig {
     std::string gpu_driver_dir, gpu_driver_lib;
     std::string native_lib_dir;  // the app's native library folder (libadrenotools loads its hooks from there)
     bool bc_enabler = true;      // Adreno 6xx system drivers: patch in the BC texture formats (BCeNabler)
+    // The swapchain has the game's frame size and the system compositor scales it to the screen, instead of the
+    // GPU filling a screen-sized image each frame.
+    bool compositor_scaling = true;
+    int max_anisotropy = 0;  // limit on the game's anisotropic texture filtering (0 = the game's own level)
     bool fast_cores = true;  // keep the game's frame-critical threads off the efficiency cores
     bool record_thread = true;  // record Vulkan commands on a second thread (draw preparation stays on the render thread)
     bool pin_render_thread = false;  // keep the render thread on the fastest CPU core(s) (slower on 8 Gen 2: off)

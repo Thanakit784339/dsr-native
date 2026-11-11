@@ -1191,12 +1191,19 @@ public:
         std::lock_guard<std::mutex> lk(m_);
         if (!EnsureDevice()) return;
         ReportDraws();
+        Image* src = tex.valid ? FindImage(tex) : nullptr;
+        if (src && !(src->written && !IsDepthFormat(src->nvn_format))) src = nullptr;
+        // The swapchain is sized for the game's frame (see EnsureSwapchain): a frame of another size remakes it.
+        if (src && dsr::GetRuntime().config.compositor_scaling && (src->width != frame_w_ || src->height != frame_h_)) {
+            frame_w_ = src->width;
+            frame_h_ = src->height;
+            if (swapchain_) swapchain_dirty_ = true;
+        }
         if (!EnsureSwapchain()) return;
         // Acquire, copy and present run on the recorder after this frame's commands; the render thread goes on.
         BeginCommands();
         PresentJob pj;
-        Image* src = tex.valid ? FindImage(tex) : nullptr;
-        if (src && src->written && !IsDepthFormat(src->nvn_format)) {
+        if (src) {
             Transition(*src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             pj.src = src->image;
             pj.sw = src->width;
@@ -1254,15 +1261,21 @@ private:
         CmdImageBarrier(cmd_, sc, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         const VkClearColorValue black{};
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdClearColorImage(cmd_, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+        // Fit the game's frame into the screen, keeping its aspect ratio.
+        const int dw = int(sc_extent_.width), dh = int(sc_extent_.height);
+        int w = dw, h = pj.src ? int(int64_t(dw) * pj.sh / std::max(1, pj.sw)) : 0;
+        if (h > dh) {
+            h = dh;
+            w = int(int64_t(dh) * pj.sw / std::max(1, pj.sh));
+        }
+        // Within a pixel of the whole image: all of it (and then no clear: the frame covers everything).
+        if (pj.src && std::abs(w - dw) <= 1 && std::abs(h - dh) <= 1) {
+            w = dw;
+            h = dh;
+        } else {
+            vkCmdClearColorImage(cmd_, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+        }
         if (pj.src) {
-            // Fit the game's frame into the screen, keeping its aspect ratio.
-            const int dw = int(sc_extent_.width), dh = int(sc_extent_.height);
-            int w = dw, h = int(int64_t(dw) * pj.sh / std::max(1, pj.sw));
-            if (h > dh) {
-                h = dh;
-                w = int(int64_t(dh) * pj.sw / std::max(1, pj.sh));
-            }
             const int x = (dw - w) / 2, y = (dh - h) / 2;
             VkImageBlit blit{};
             blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -1271,7 +1284,7 @@ private:
             blit.dstOffsets[0] = {x, y, 0};
             blit.dstOffsets[1] = {x + w, y + h, 1};
             vkCmdBlitImage(cmd_, pj.src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                           &blit, VK_FILTER_LINEAR);
+                           &blit, w == pj.sw && h == pj.sh ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
         }
         CmdImageBarrier(cmd_, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         SubmitSlot(i, acquire_sem_, render_sem_);
@@ -1341,6 +1354,7 @@ private:
             if (bcn == ADRENOTOOLS_BCN_PATCH) {
                 const bool ok = adrenotools_patch_bcn(reinterpret_cast<void*>(vkGetPhysicalDeviceFormatProperties));
                 LOGI(kTag, "BC textures: driver patched by BCeNabler: %s", ok ? "ok" : "FAILED");
+                bc_patched_ = ok;
             }
         }
         vkGetPhysicalDeviceMemoryProperties(phys_, &mem_props_);
@@ -1422,6 +1436,7 @@ private:
             return false;
         }
         LoadDeviceFunctions(device_);
+        ProbePatchedBc();
         if (const int rw = dsr::GetRuntime().config.render_width; rw != 1280 && rw > 0 && dsr::GetRuntime().config.hud_box) {
             hud_box_w_ = std::min(rw, 1280);
             hud_box_h_ = hud_box_w_ * 9 / 16;
@@ -1745,6 +1760,20 @@ private:
             auto* aw = static_cast<ANativeWindow*>(window_);
             extent = {uint32_t(ANativeWindow_getWidth(aw)), uint32_t(ANativeWindow_getHeight(aw))};
         }
+        // The swapchain is made at the size of the game's frame instead of the screen's (same aspect ratio as the
+        // window, so that the frame fits it 1:1): the system compositor then scales it to the screen (in the
+        // display hardware, as a rule) instead of the GPU clearing and filling a screen-sized image every frame
+        // (2340x1080 from 1560x720 on the OnePlus 6T: twice the pixels of the game's own frame).
+        const VkExtent2D window_extent = extent;
+        if (dsr::GetRuntime().config.compositor_scaling && frame_w_ > 0 && frame_h_ > 0 && extent.width && extent.height) {
+            const double k = std::max(double(frame_w_) / extent.width, double(frame_h_) / extent.height);
+            if (k < 0.999) {
+                extent.width = std::clamp(uint32_t(std::lround(extent.width * k)), std::max(1u, caps.minImageExtent.width),
+                                          caps.maxImageExtent.width);
+                extent.height = std::clamp(uint32_t(std::lround(extent.height * k)), std::max(1u, caps.minImageExtent.height),
+                                           caps.maxImageExtent.height);
+            }
+        }
         // Identity transform: the compositor rotates for the panel (the AYN Thor reports 90 degrees);
         // such swapchains report SUBOPTIMAL every frame, which is expected.
         VkSurfaceTransformFlagBitsKHR transform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
@@ -1793,7 +1822,8 @@ private:
         sc_images_.resize(ni);
         vkGetSwapchainImagesKHR(device_, swapchain_, &ni, sc_images_.data());
         if (++swapchains_created_ <= 8)
-            LOGI(kTag, "swapchain %ux%u, format %d, %u images", extent.width, extent.height, fmt.format, ni);
+            LOGI(kTag, "swapchain %ux%u (window %ux%u, game frame %dx%d), format %d, %u images", extent.width, extent.height,
+                 window_extent.width, window_extent.height, frame_w_, frame_h_, fmt.format, ni);
         return true;
     }
 
@@ -1815,6 +1845,58 @@ private:
         return &img;
     }
 
+    // Adreno 6xx drivers patched by BCeNabler create and sample BC images, but their format query keeps reporting
+    // the formats as unsupported (so every BC texture was still decoded to RGBA8 on the CPU: 4 to 8 times the
+    // memory and the sampling bandwidth). Images of each BC format are created here as a test; if all work, BC
+    // textures are used as they are.
+    void ProbePatchedBc() {
+        if (!bc_patched_) return;
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(phys_, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, &fp);
+        static const VkFormat kFormats[] = {
+            VK_FORMAT_BC1_RGB_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK,
+            VK_FORMAT_BC2_UNORM_BLOCK,     VK_FORMAT_BC3_UNORM_BLOCK,      VK_FORMAT_BC3_SRGB_BLOCK,
+            VK_FORMAT_BC4_UNORM_BLOCK,     VK_FORMAT_BC5_UNORM_BLOCK,      VK_FORMAT_BC7_UNORM_BLOCK,
+            VK_FORMAT_BC6H_SFLOAT_BLOCK};
+        int failed = 0, first_failed = 0;
+        for (int mut = 0; mut < 2; mut++) {
+            for (VkFormat f : kFormats) {
+                if (mut && f != VK_FORMAT_BC1_RGBA_UNORM_BLOCK && f != VK_FORMAT_BC3_UNORM_BLOCK) continue;
+                VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+                ci.imageType = VK_IMAGE_TYPE_2D;
+                ci.format = f;
+                ci.extent = {256, 256, 1};
+                ci.mipLevels = 9;
+                ci.arrayLayers = 1;
+                ci.samples = VK_SAMPLE_COUNT_1_BIT;
+                ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+                ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                const VkFormat pair[2] = {f, f == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK
+                                                                                 : VK_FORMAT_BC3_SRGB_BLOCK};
+                VkImageFormatListCreateInfo fl{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+                if (mut) {  // viewed as sRGB or linear, as game textures are
+                    ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+                    fl.viewFormatCount = 2;
+                    fl.pViewFormats = pair;
+                    if (format_list_) ci.pNext = &fl;
+                }
+                VkImage image = VK_NULL_HANDLE;
+                const VkResult r = vkCreateImage(device_, &ci, nullptr, &image);
+                VkMemoryRequirements req{};
+                if (r == VK_SUCCESS) vkGetImageMemoryRequirements(device_, image, &req);
+                // BC1 256x256 with all its levels is 43.7 KB; an image stored uncompressed would need 350 KB.
+                const bool ok = r == VK_SUCCESS && req.size > 0 && req.size < 300 * 1024;
+                if (!ok && !failed++) first_failed = int(f);
+                if (image) vkDestroyImage(device_, image, nullptr);
+            }
+        }
+        bc_forced_ = failed == 0;
+        LOGI(kTag, "BC textures: patched driver reports features 0x%x for BC1; test images: %s (%d failed, first format %d)%s",
+             fp.optimalTilingFeatures, failed ? "FAILED" : "ok", failed, first_failed,
+             bc_forced_ ? " - BC textures used as they are (not decoded)" : " - BC textures stay decoded on upload");
+    }
+
     VkFormat PickFormat(int nvn_format, VkFormatFeatureFlags* features) {
         auto cached = format_cache_.find(nvn_format);
         if (cached != format_cache_.end()) {
@@ -1829,6 +1911,9 @@ private:
         for (VkFormat f : ImageCandidates(nvn_format)) {
             VkFormatProperties p;
             vkGetPhysicalDeviceFormatProperties(phys_, f, &p);
+            // Driver patched by BCeNabler: BC images work, though the format query still reports nothing.
+            if (bc_forced_ && BcKindOf(nvn_format) != BcKind::None)
+                p.optimalTilingFeatures |= need | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
             if ((p.optimalTilingFeatures & need) == need) {
                 chosen = f;
                 feats = p.optimalTilingFeatures;
@@ -2363,6 +2448,13 @@ private:
         if (filterable && features_.samplerAnisotropy && s.max_anisotropy > 1.0f) {
             ci.anisotropyEnable = VK_TRUE;
             ci.maxAnisotropy = std::min(s.max_anisotropy, props_.limits.maxSamplerAnisotropy);
+            // `max_anisotropy` (settings): a lower limit than the game's, for slower GPUs (0 = the game's).
+            const int cap = dsr::GetRuntime().config.max_anisotropy;
+            if (cap > 0) ci.maxAnisotropy = std::min(ci.maxAnisotropy, float(std::max(cap, 1)));
+            LogOnce(("aniso" + std::to_string(int(s.max_anisotropy))).c_str(),
+                    "sampler with anisotropic filtering: the game asks for %.0fx, used %.0fx", s.max_anisotropy,
+                    ci.maxAnisotropy);
+            if (ci.maxAnisotropy <= 1.0f) ci.anisotropyEnable = VK_FALSE;
         }
         if (shadow) {
             ci.compareEnable = VK_TRUE;
@@ -5832,6 +5924,7 @@ private:
         if (full) hud_full_screen_++;
         return !full;
     }
+    bool bc_patched_ = false, bc_forced_ = false;
     int hud_box_w_ = 0, hud_box_h_ = 0;
     std::unordered_set<uint64_t> hud_box_logged_;
     uint64_t hud_full_screen_ = 0;
@@ -5889,6 +5982,7 @@ private:
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     std::atomic<bool> swapchain_dirty_{false};  // set by the recorder (acquire/present), read by the render thread
     VkExtent2D sc_extent_{};
+    int frame_w_ = 0, frame_h_ = 0;  // the game's presented frame the swapchain is sized for (compositor_scaling)
     std::vector<VkImage> sc_images_;
 
     DrawState st_;
